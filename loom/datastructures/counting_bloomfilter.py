@@ -324,6 +324,24 @@ class CountingBloomFilter(DataStructure):
         p = (1 - math.exp(exponent)) ** self.num_hashes
         return p
 
+    # ---- Registry protocol ----
+
+    def _get_registry_params(self):
+        return {
+            "expected_items": self.expected_items,
+            "false_positive_rate": self.false_positive_rate,
+            "max_count": self.max_count,
+        }
+
+    @classmethod
+    def _from_registry_params(cls, name, db, params):
+        return cls(
+            name, db,
+            params["expected_items"],
+            params["false_positive_rate"],
+            params.get("max_count", 255),
+        )
+
     def __repr__(self):
         """String representation."""
         return (

@@ -65,7 +65,7 @@ class BTree(DataStructure):
         dataset_or_template=None,
         key_size: int = 50,
         cache_size: int = 100,
-        auto_save_interval: int = 1000,
+        auto_save_interval: int = None,
         _parent=None,
     ):
         """Initialize a BTree.
@@ -382,9 +382,9 @@ class BTree(DataStructure):
             template_config = metadata["template_config"]
             template_class_name = metadata.get("template_class", "Dict")
             template_class = _DS_REGISTRY[template_class_name]
-            template_dataset = self._get_dataset(metadata["template_dataset"])
-            self._template = DataStructureTemplate(
-                template_class, template_dataset, template_config
+            full_config = {**template_config, "_template_dataset": metadata.get("template_dataset")}
+            self._template = template_class._reconstruct_template(
+                self._db, full_config, template_class_name
             )
             self.item_schema = self._template.get_ref_schema()
 
@@ -1146,3 +1146,20 @@ class BTree(DataStructure):
     def close(self):
         """Close the BTree and save metadata."""
         self.save()
+
+    # ---- Registry protocol ----
+
+    def _get_registry_params(self):
+        return {
+            "schema": self.item_schema,
+            "key_size": self._key_size,
+            "cache_size": self.cache_size,
+        }
+
+    @classmethod
+    def _from_registry_params(cls, name, db, params):
+        return cls(
+            name, db, None,
+            key_size=params.get("key_size", 50),
+            cache_size=params.get("cache_size", 100),
+        )

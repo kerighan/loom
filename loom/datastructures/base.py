@@ -32,20 +32,25 @@ class DataStructure(ABC):
         super().__init_subclass__(**kwargs)
         _DS_REGISTRY[cls.__name__] = cls
 
-    def __init__(self, name, db, auto_save_interval=1000, _parent=None):
+    def __init__(self, name, db, auto_save_interval=None, _parent=None):
         """Initialize data structure.
 
         Args:
             name: Unique name for this data structure
             db: DB instance (not ByteFileDB - the high-level orchestrator)
-            auto_save_interval: Auto-save metadata every N operations (0 to disable)
+            auto_save_interval: Auto-save metadata every N operations.
+                If None (default), inherits from db.auto_save_interval.
+                Set to 0 to disable.
             _parent: Parent data structure if this is nested (internal use)
         """
         self.name = name
         self._db = db
         self._parent = _parent  # Parent structure if nested
         self._metadata_key = f"_ds_{name}_metadata"
-        self._auto_save_interval = auto_save_interval
+        if auto_save_interval is not None:
+            self._auto_save_interval = auto_save_interval
+        else:
+            self._auto_save_interval = getattr(db, "auto_save_interval", 100)
         self._ops_since_save = 0
         # For nested structures, metadata stored inline
         # Only set to None if not already set (e.g., by from_ref)
@@ -55,6 +60,61 @@ class DataStructure(ABC):
         # Auto-register for auto-save on DB close (only top-level structures)
         if _parent is None:
             db._datastructures[name] = self
+
+    # ---- Registry protocol (generic save/load for DB persistence) ----
+
+    def _get_registry_params(self):
+        """Return the params dict needed to reconstruct this structure.
+
+        Override in subclasses. The dict is stored in the DB header
+        registry and passed back to _from_registry_params on reload.
+
+        Returns:
+            Dict of picklable params, or None to skip registry.
+        """
+        return None
+
+    @classmethod
+    def _from_registry_params(cls, name, db, params):
+        """Reconstruct an instance from saved registry params.
+
+        Override in subclasses.  Called by DB._load_registry() to
+        recreate a data structure that was previously persisted.
+
+        Args:
+            name: Structure name
+            db: DB instance
+            params: The dict returned by _get_registry_params()
+
+        Returns:
+            DataStructure instance
+        """
+        raise NotImplementedError(
+            f"{cls.__name__} must implement _from_registry_params()"
+        )
+
+    # ---- Template reconstruction protocol ----
+
+    @classmethod
+    def _reconstruct_template(cls, db, template_config, template_class_name):
+        """Reconstruct a DataStructureTemplate from saved metadata.
+
+        Default implementation handles the common case where the template
+        wraps a real Dataset. Override in subclasses that use a custom
+        template class (e.g., Set uses SetTemplate with no real dataset).
+
+        Args:
+            db: DB instance
+            template_config: The config dict saved in metadata
+            template_class_name: Ignored (cls is already the right class)
+
+        Returns:
+            DataStructureTemplate instance
+        """
+        # Default: standard DataStructureTemplate with a dataset
+        template_dataset = db.get_dataset(template_config["_template_dataset"])
+        config = {k: v for k, v in template_config.items() if k != "_template_dataset"}
+        return DataStructureTemplate(cls, template_dataset, config)
 
     @abstractmethod
     def _initialize(self):

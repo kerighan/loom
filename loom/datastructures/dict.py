@@ -102,7 +102,7 @@ class Dict(DataStructure):
         dataset_or_template,
         cache_size=1000,
         use_bloom=True,
-        auto_save_interval=1000,
+        auto_save_interval=None,
         key_size=None,
         initial_capacity=None,
         _parent=None,
@@ -309,21 +309,11 @@ class Dict(DataStructure):
             # Get template class from registry (modular approach)
             template_class = _DS_REGISTRY.get(template_class_name, Dict)
 
-            # Handle Set specially - it uses SetTemplate which doesn't need a real dataset
-            if template_class_name == "Set":
-                from loom.datastructures.set import SetTemplate
-
-                self._template = SetTemplate(
-                    template_class,
-                    key_size=template_config.get("key_size", 50),
-                    use_bloom=template_config.get("use_bloom", False),
-                    cache_size=template_config.get("cache_size", 0),
-                )
-            else:
-                template_dataset = self._get_dataset(metadata["template_dataset"])
-                self._template = DataStructureTemplate(
-                    template_class, template_dataset, template_config
-                )
+            # Reconstruct template via class protocol (no per-type switch)
+            full_config = {**template_config, "_template_dataset": metadata.get("template_dataset")}
+            self._template = template_class._reconstruct_template(
+                self._db, full_config, template_class_name
+            )
             self.item_schema = self._template.get_ref_schema()
 
             # Load shared datasets (modular approach)
@@ -824,13 +814,14 @@ class Dict(DataStructure):
         p, table_addr, position, entry = slot
         entry_addr = table_addr + position * self._hash_table.record_size
         is_update = entry.get("valid", False) and entry.get("key") == key
+        expected_type = self._template.ds_class if self._is_nested else None
 
         if is_update:
             # Update existing item - single write to values dataset
             value_addr = int(entry["value_addr"])
             if self._is_nested:
-                if not isinstance(value, Dict):
-                    raise TypeError(f"Expected Dict, got {type(value)}")
+                if not isinstance(value, expected_type):
+                    raise TypeError(f"Expected {expected_type.__name__}, got {type(value)}")
                 ref_data = self._values_dataset._serialize(**value.to_ref())
             else:
                 ref_data = self._values_dataset._serialize(**value)
@@ -845,8 +836,8 @@ class Dict(DataStructure):
                     value = self._template.new(self._db, _parent=self)
                     value._parent_key = key
                     self._db._datastructures[value.name] = value
-                elif not isinstance(value, Dict):
-                    raise TypeError(f"Expected Dict, got {type(value)}")
+                elif not isinstance(value, expected_type):
+                    raise TypeError(f"Expected {expected_type.__name__}, got {type(value)}")
                 ref = value.to_ref()
                 value_addr = (
                     self.values_block_addr
@@ -1125,6 +1116,23 @@ class Dict(DataStructure):
 
     def __iter__(self):
         return self.keys()
+
+    # ---- Registry protocol ----
+
+    def _get_registry_params(self):
+        return {
+            "schema": self.item_schema,
+            "cache_size": self.cache_size,
+            "use_bloom": self.use_bloom,
+        }
+
+    @classmethod
+    def _from_registry_params(cls, name, db, params):
+        return cls(
+            name, db, params["schema"],
+            cache_size=params.get("cache_size", 1000),
+            use_bloom=params.get("use_bloom", True),
+        )
 
     def __repr__(self):
         return f"Dict('{self.name}', size={self.size}, tables={self.p_last - self.P_INIT + 1})"

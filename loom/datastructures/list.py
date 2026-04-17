@@ -168,7 +168,7 @@ class List(DataStructure):
         db,
         dataset_or_template,
         cache_size=10,
-        auto_save_interval=1000,
+        auto_save_interval=None,
         _parent=None,
     ):
         """Initialize a List.
@@ -296,7 +296,6 @@ class List(DataStructure):
 
     def _load(self):
         """Load existing list."""
-        from loom.datastructures.dict import Dict
         from loom.datastructures.base import _DS_REGISTRY
 
         metadata = self._load_metadata()
@@ -317,21 +316,11 @@ class List(DataStructure):
             # Get template class from registry (modular approach)
             template_class = _DS_REGISTRY.get(template_class_name, List)
 
-            # Handle Set specially - it uses SetTemplate which doesn't need a real dataset
-            if template_class_name == "Set":
-                from loom.datastructures.set import SetTemplate
-
-                self._template = SetTemplate(
-                    template_class,
-                    key_size=template_config.get("key_size", 50),
-                    use_bloom=template_config.get("use_bloom", False),
-                    cache_size=template_config.get("cache_size", 0),
-                )
-            else:
-                template_dataset = self._get_dataset(metadata["template_dataset"])
-                self._template = DataStructureTemplate(
-                    template_class, template_dataset, template_config
-                )
+            # Reconstruct template via class protocol (no per-type switch)
+            full_config = {**template_config, "_template_dataset": metadata.get("template_dataset")}
+            self._template = template_class._reconstruct_template(
+                self._db, full_config, template_class_name
+            )
             # Set item_schema from template
             self.item_schema = self._template.get_ref_schema()
 
@@ -474,8 +463,6 @@ class List(DataStructure):
         Performance: O(1)
         """
         if self._is_nested:
-            from loom.datastructures.dict import Dict
-
             # Nested list: append reference
             expected_type = self._template.ds_class
             if item is None:
@@ -1364,6 +1351,15 @@ class List(DataStructure):
 
         metadata = self._get_current_metadata()
         self._save_metadata(metadata)
+
+    # ---- Registry protocol ----
+
+    def _get_registry_params(self):
+        return {"schema": self.item_schema, "cache_size": self.cache_size}
+
+    @classmethod
+    def _from_registry_params(cls, name, db, params):
+        return cls(name, db, params["schema"], params.get("cache_size", 10))
 
     def __repr__(self):
         """String representation."""

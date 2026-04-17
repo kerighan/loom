@@ -516,6 +516,35 @@ class Set(DataStructure):
         self._dict.close()
         self.save()
 
+    # ---- Registry protocol ----
+
+    def _get_registry_params(self):
+        return {
+            "key_size": self._key_size,
+            "use_bloom": self._use_bloom,
+        }
+
+    @classmethod
+    def _from_registry_params(cls, name, db, params):
+        return cls(
+            name, db,
+            key_size=params.get("key_size", 50),
+            use_bloom=params.get("use_bloom", True),
+            _load_existing=True,
+        )
+
+    # ---- Template reconstruction protocol ----
+
+    @classmethod
+    def _reconstruct_template(cls, db, template_config, template_class_name):
+        """Set uses SetTemplate which doesn't need a real dataset."""
+        return SetTemplate(
+            cls,
+            key_size=template_config.get("key_size", 50),
+            use_bloom=template_config.get("use_bloom", False),
+            cache_size=template_config.get("cache_size", 0),
+        )
+
 
 class SetTemplate(DataStructureTemplate):
     """Template for creating nested Sets.

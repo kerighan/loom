@@ -52,6 +52,7 @@ class DB:
         header_size=4096,
         auto_open=True,
         blob_compression="brotli",
+        auto_save_interval=100,
     ):
         """Initialize database.
 
@@ -61,13 +62,16 @@ class DB:
             header_size: Header region size in bytes
             auto_open: Automatically open database (default: True)
             blob_compression: Compression for blobs ("brotli", "zlib", or None)
+            auto_save_interval: Auto-save metadata every N operations per
+                data structure.  Lower = safer (less data lost on crash),
+                higher = faster.  Use 0 to disable (manual save only).
+                Default: 100.
         """
         self.filename = filename
+        self.auto_save_interval = auto_save_interval
         self._db = ByteFileDB(filename, initial_size, header_size)
         self._datasets = {}  # name -> Dataset instance
-        self._datastructures = (
-            {}
-        )  # name -> DataStructure instance (for caching and auto-save)
+        self._datastructures = {}  # name -> DataStructure instance
         self._is_open = False
         self._loading_registry = False  # Flag to prevent saving during load
         self._blob_compression = blob_compression
@@ -178,42 +182,23 @@ class DB:
             dataset = Dataset(name, self._db, identifier, blob_store=blob_store, **schema)
             self._datasets[name] = dataset
 
-        # Load data structures registry
+        # Load data structures registry (generic — no per-type switch)
+        from loom.datastructures.base import _DS_REGISTRY
+
         ds_registry = self._db.get_header_field(self.DATASTRUCTURES_REGISTRY_KEY, {})
 
-        # Set flag to prevent saving during load
         self._loading_registry = True
         try:
             for name, info in ds_registry.items():
                 ds_type = info["type"]
                 params = info["params"]
 
-                # Recreate data structure based on type
-                if ds_type == "List":
-                    # For List, params contains the schema dict
-                    self.create_list(
-                        name, params["schema"], params.get("cache_size", 10)
-                    )
-                elif ds_type == "BloomFilter":
-                    self.create_bloomfilter(
-                        name, params["expected_items"], params["false_positive_rate"]
-                    )
-                elif ds_type == "CountingBloomFilter":
-                    self.create_counting_bloomfilter(
-                        name,
-                        params["expected_items"],
-                        params["false_positive_rate"],
-                        params.get("max_count", 255),
-                    )
-                elif ds_type == "Dict":
-                    from loom.datastructures.dict import Dict
+                ds_class = _DS_REGISTRY.get(ds_type)
+                if ds_class is None:
+                    continue  # Unknown type — skip gracefully
 
-                    self.create_dict(
-                        name,
-                        params["schema"],
-                        params.get("cache_size", 1000),
-                        params.get("use_bloom", True),
-                    )
+                if name not in self._datastructures:
+                    ds_class._from_registry_params(name, self, params)
         finally:
             self._loading_registry = False
 
@@ -239,47 +224,17 @@ class DB:
         self._db.set_header_field(self.REGISTRY_KEY, registry)
 
     def _save_datastructures_registry(self):
-        """Save data structures registry to header."""
-        # Don't save during registry loading
+        """Save data structures registry to header (generic — no per-type switch)."""
         if self._loading_registry:
             return
 
         ds_registry = {}
-
         for name, ds in self._datastructures.items():
-            ds_type = type(ds).__name__
-
-            # Extract parameters based on type
-            if ds_type == "List":
+            params = ds._get_registry_params()
+            if params is not None:
                 ds_registry[name] = {
-                    "type": "List",
-                    "params": {"schema": ds.item_schema, "cache_size": ds.cache_size},
-                }
-            elif ds_type == "BloomFilter":
-                ds_registry[name] = {
-                    "type": "BloomFilter",
-                    "params": {
-                        "expected_items": ds.expected_items,
-                        "false_positive_rate": ds.false_positive_rate,
-                    },
-                }
-            elif ds_type == "CountingBloomFilter":
-                ds_registry[name] = {
-                    "type": "CountingBloomFilter",
-                    "params": {
-                        "expected_items": ds.expected_items,
-                        "false_positive_rate": ds.false_positive_rate,
-                        "max_count": ds.max_count,
-                    },
-                }
-            elif ds_type == "Dict":
-                ds_registry[name] = {
-                    "type": "Dict",
-                    "params": {
-                        "schema": ds.item_schema,
-                        "cache_size": ds.cache_size,
-                        "use_bloom": ds.use_bloom,
-                    },
+                    "type": type(ds).__name__,
+                    "params": params,
                 }
 
         self._db.set_header_field(self.DATASTRUCTURES_REGISTRY_KEY, ds_registry)
