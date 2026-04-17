@@ -116,11 +116,12 @@ class CountingBloomFilter(DataStructure):
             dataset_name, count="uint8"  # 0-255 counter per bucket
         )
 
-        # Allocate counter array and initialize to zero
+        # Allocate counter array and bulk-init with valid prefix in one write
         self._counters_addr = self._counters_dataset.allocate_block(self.num_buckets)
-        for i in range(self.num_buckets):
-            addr = self._counters_addr + i * self._counters_dataset.record_size
-            self._counters_dataset[addr] = {"count": 0}
+        zero_record = self._counters_dataset._serialize(count=0)
+        self._counters_dataset.db.write(
+            self._counters_addr, zero_record * self.num_buckets
+        )
 
         # Save metadata
         self._save_metadata(
@@ -137,6 +138,12 @@ class CountingBloomFilter(DataStructure):
         )
 
         self.num_items = 0
+        self._cache_raw_fields()
+
+    def _cache_raw_fields(self):
+        """Cache record size and raw DB handle for direct mmap access."""
+        self._record_size = self._counters_dataset.record_size
+        self._db_raw = self._counters_dataset.db
 
     def _load(self):
         """Load existing Counting Bloom filter."""
@@ -151,6 +158,7 @@ class CountingBloomFilter(DataStructure):
 
         self._counters_dataset = self._get_dataset(metadata["counters_dataset"])
         self._counters_addr = metadata["counters_addr"]
+        self._cache_raw_fields()
 
     def _get_hashes(self, item):
         """Generate k hash values using double hashing."""
@@ -172,14 +180,15 @@ class CountingBloomFilter(DataStructure):
         return hashes
 
     def _get_counter(self, bucket_index):
-        """Get counter value for a bucket."""
-        addr = self._counters_addr + bucket_index * self._counters_dataset.record_size
-        return self._counters_dataset[addr]["count"]
+        """Get counter value for a bucket (raw mmap, no numpy)."""
+        # Record layout: [_prefix: 1 byte][count: 1 byte]
+        addr = self._counters_addr + bucket_index * self._record_size
+        return self._db_raw.read(addr + 1, 1)[0]
 
     def _set_counter(self, bucket_index, value):
-        """Set counter value for a bucket."""
-        addr = self._counters_addr + bucket_index * self._counters_dataset.record_size
-        self._counters_dataset[addr] = {"count": min(value, self.max_count)}
+        """Set counter value for a bucket (raw mmap, no numpy)."""
+        addr = self._counters_addr + bucket_index * self._record_size
+        self._db_raw.write(addr + 1, bytes([min(value, self.max_count)]))
 
     def _increment_counter(self, bucket_index):
         """Increment counter for a bucket.
@@ -187,14 +196,15 @@ class CountingBloomFilter(DataStructure):
         Raises:
             CounterOverflowError: If counter is already at max_count
         """
-        current = self._get_counter(bucket_index)
+        addr = self._counters_addr + bucket_index * self._record_size
+        current = self._db_raw.read(addr + 1, 1)[0]
         if current >= self.max_count:
             raise CounterOverflowError(
                 f"Bucket {bucket_index} counter at maximum ({self.max_count}). "
                 f"Too many hash collisions. Consider increasing expected_items "
                 f"or max_count parameter."
             )
-        self._set_counter(bucket_index, current + 1)
+        self._db_raw.write(addr + 1, bytes([current + 1]))
 
     def _decrement_counter(self, bucket_index):
         """Decrement counter for a bucket."""

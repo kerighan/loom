@@ -112,13 +112,9 @@ class DB:
             # Auto-save all data structures before closing
             for ds in self._datastructures.values():
                 if hasattr(ds, "save"):
-                    # Force save to ensure nested structures persist metadata
-                    if (
-                        hasattr(ds.save, "__code__")
-                        and "force" in ds.save.__code__.co_varnames
-                    ):
+                    try:
                         ds.save(force=True)
-                    else:
+                    except TypeError:
                         ds.save()
 
             # Save blob freelist before closing
@@ -174,8 +170,12 @@ class DB:
             identifier = info["identifier"]
             schema = info["schema"]
 
+            # Pass blob_store if the schema uses variable-length fields
+            needs_blobs = any(v in ("blob", "text") for v in schema.values())
+            blob_store = self.blob_store if needs_blobs else None
+
             # Recreate Dataset instance
-            dataset = Dataset(name, self._db, identifier, **schema)
+            dataset = Dataset(name, self._db, identifier, blob_store=blob_store, **schema)
             self._datasets[name] = dataset
 
         # Load data structures registry
@@ -221,11 +221,18 @@ class DB:
         """Save dataset registry to header."""
         registry = {}
         for name, dataset in self._datasets.items():
-            # Store schema as field_name -> dtype_string mapping
+            # Store schema as field_name -> dtype_string mapping.
+            # Preserve the original "blob"/"text" markers so they survive
+            # round-trips (numpy's .str would give '|V10' for BLOB_DTYPE).
             schema = {}
             for field_name in dataset.user_schema.names:
-                dtype = dataset.user_schema.fields[field_name][0]
-                schema[field_name] = dtype.str  # Use .str for proper numpy dtype string
+                if field_name in dataset._text_fields:
+                    schema[field_name] = "text"
+                elif field_name in dataset._blob_fields:
+                    schema[field_name] = "blob"
+                else:
+                    dtype = dataset.user_schema.fields[field_name][0]
+                    schema[field_name] = dtype.str
 
             registry[name] = {"identifier": dataset.identifier, "schema": schema}
 
@@ -286,6 +293,27 @@ class DB:
         self._db.set_header_field(self.NEXT_ID_KEY, next_id + 1)
         return next_id
 
+    @contextmanager
+    def batch(self):
+        """Batch mode: defer all header flushes until the block exits.
+
+        Use this for bulk inserts to avoid per-operation header writes.
+        Data is still written to mmap immediately, only the header
+        (allocation index, metadata) flush is deferred.
+
+        Example:
+            with db.batch():
+                for i in range(10000):
+                    dataset.insert({'id': i, 'content': 'hello'})
+        """
+        if not self._is_open:
+            raise RuntimeError("Database is not open. Call open() first.")
+        self._db.begin_batch()
+        try:
+            yield
+        finally:
+            self._db.end_batch()
+
     def apply_writes(self, writes):
         if not self._is_open:
             raise RuntimeError("Database is not open. Call open() first.")
@@ -333,8 +361,12 @@ class DB:
         # Get next identifier
         identifier = self._get_next_identifier()
 
+        # Pass blob_store if schema uses variable-length fields
+        needs_blobs = any(v in ("blob", "text") for v in schema.values())
+        blob_store = self.blob_store if needs_blobs else None
+
         # Create dataset
-        dataset = Dataset(dataset_name, self._db, identifier, **schema)
+        dataset = Dataset(dataset_name, self._db, identifier, blob_store=blob_store, **schema)
         self._datasets[dataset_name] = dataset
 
         # Save registry
@@ -557,7 +589,15 @@ class DB:
         self._save_datastructures_registry()  # Persist registry
         return lst
 
-    def create_dict(self, name, dataset_or_template, cache_size=1000, use_bloom=True):
+    def create_dict(
+        self,
+        name,
+        dataset_or_template,
+        cache_size=1000,
+        use_bloom=True,
+        key_size=None,
+        initial_capacity=None,
+    ):
         """Create a persistent Dict.
 
         Args:
@@ -590,7 +630,15 @@ class DB:
         if name in self._datastructures:
             return self._datastructures[name]
 
-        dct = Dict(name, self, dataset_or_template, cache_size, use_bloom)
+        dct = Dict(
+            name,
+            self,
+            dataset_or_template,
+            cache_size=cache_size,
+            use_bloom=use_bloom,
+            key_size=key_size,
+            initial_capacity=initial_capacity,
+        )
         self._datastructures[name] = dct  # Register for caching and auto-save
         self._save_datastructures_registry()  # Persist registry
         return dct
@@ -625,3 +673,47 @@ class DB:
         self._datastructures[name] = s  # Register for caching and auto-save
         self._save_datastructures_registry()  # Persist registry
         return s
+
+    def create_btree(self, name, dataset, key_size=50, cache_size=100):
+        """Create a persistent BTree with ordered keys.
+
+        BTree provides O(log n) operations with ordered iteration
+        and efficient range queries.
+
+        Args:
+            name: Unique name for this BTree
+            dataset: Dataset for storing values
+            key_size: Maximum length of string keys (default: 50)
+            cache_size: Number of nodes to cache (default: 100)
+
+        Returns:
+            BTree instance
+
+        Example:
+            user_ds = db.create_dataset('users', id='uint32', name='U50')
+            users = db.create_btree('users_btree', user_ds)
+
+            users['alice'] = {'id': 1, 'name': 'Alice'}
+            users['bob'] = {'id': 2, 'name': 'Bob'}
+
+            # Ordered iteration
+            for key in users.keys():
+                print(key)  # alice, bob (sorted)
+
+            # Range queries
+            for key, value in users.range('a', 'm'):
+                print(key, value)
+        """
+        if not self._is_open:
+            raise RuntimeError("Database is not open. Call open() first.")
+
+        from loom.datastructures.btree import BTree
+
+        # Return existing if already loaded
+        if name in self._datastructures:
+            return self._datastructures[name]
+
+        btree = BTree(name, self, dataset, key_size=key_size, cache_size=cache_size)
+        self._datastructures[name] = btree  # Register for caching and auto-save
+        self._save_datastructures_registry()  # Persist registry
+        return btree

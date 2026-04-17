@@ -7,6 +7,8 @@ Uses lru-dict (C implementation) for maximum performance.
 from lru import LRU
 from typing import Any
 
+_SENTINEL = object()
+
 
 class LRUCache:
     """Fast LRU cache wrapping lru-dict C implementation.
@@ -62,11 +64,11 @@ class LRUCache:
         Returns:
             Value if found, else default
         """
-        result = self._cache.get(key, default)
-        if result is default and key not in self._cache:
+        result = self._cache.get(key, _SENTINEL)
+        if result is _SENTINEL:
             self.misses += 1
-        else:
-            self.hits += 1
+            return default
+        self.hits += 1
         return result
 
     def set(self, key: Any, value: Any) -> None:
@@ -101,12 +103,12 @@ class LRUCache:
 
     def __getitem__(self, key: Any) -> Any:
         """Get item using cache[key] syntax."""
-        if key in self._cache:
-            self.hits += 1
-            return self._cache[key]
-        else:
+        result = self._cache.get(key, _SENTINEL)
+        if result is _SENTINEL:
             self.misses += 1
             raise KeyError(key)
+        self.hits += 1
+        return result
 
     def __setitem__(self, key: Any, value: Any) -> None:
         """Set item using cache[key] = value syntax."""
@@ -123,6 +125,15 @@ class LRUCache:
     def __len__(self) -> int:
         """Get number of items in cache."""
         return len(self._cache)
+
+    def __bool__(self) -> bool:
+        """Treat an LRUCache instance as truthy even when empty.
+
+        Many call sites use `if cache:` to mean "is caching enabled?".
+        Since LRUCache implements __len__, an empty cache would otherwise be
+        falsy and caching would never warm up.
+        """
+        return True
 
     def __repr__(self) -> str:
         """String representation."""
@@ -171,6 +182,9 @@ class NullCache:
 
     def __len__(self) -> int:
         return 0
+
+    def __bool__(self) -> bool:
+        return False
 
     @property
     def hit_rate(self) -> float:

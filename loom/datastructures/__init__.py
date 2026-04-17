@@ -14,6 +14,7 @@ from loom.datastructures.counting_bloomfilter import (
 from loom.datastructures.list import List
 from loom.datastructures.dict import Dict
 from loom.datastructures.set import Set
+from loom.datastructures.btree import BTree
 
 __all__ = [
     "DataStructure",
@@ -23,4 +24,5 @@ __all__ = [
     "List",
     "Dict",
     "Set",
+    "BTree",
 ]

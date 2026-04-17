@@ -311,16 +311,27 @@ class List(DataStructure):
 
         # Reconstruct template if nested
         if self._is_nested:
-            template_dataset = self._get_dataset(metadata["template_dataset"])
             template_config = metadata["template_config"]
             template_class_name = metadata.get("template_class", "List")
 
             # Get template class from registry (modular approach)
             template_class = _DS_REGISTRY.get(template_class_name, List)
 
-            self._template = DataStructureTemplate(
-                template_class, template_dataset, template_config
-            )
+            # Handle Set specially - it uses SetTemplate which doesn't need a real dataset
+            if template_class_name == "Set":
+                from loom.datastructures.set import SetTemplate
+
+                self._template = SetTemplate(
+                    template_class,
+                    key_size=template_config.get("key_size", 50),
+                    use_bloom=template_config.get("use_bloom", False),
+                    cache_size=template_config.get("cache_size", 0),
+                )
+            else:
+                template_dataset = self._get_dataset(metadata["template_dataset"])
+                self._template = DataStructureTemplate(
+                    template_class, template_dataset, template_config
+                )
             # Set item_schema from template
             self.item_schema = self._template.get_ref_schema()
 
@@ -686,7 +697,7 @@ class List(DataStructure):
                     if valid_count == n:
                         return item_addr
                     valid_count += 1
-            except:
+            except Exception:
                 # Uninitialized slot
                 break
 

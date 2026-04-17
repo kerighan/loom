@@ -68,6 +68,7 @@ class BlobStore:
         # Freelist: list of (offset, n_slots) tuples
         # Sorted by n_slots ascending for best-fit allocation
         self._freelist = []
+        self._freelist_dirty = False
 
         # Load freelist from header if exists
         self._load_freelist()
@@ -100,8 +101,11 @@ class BlobStore:
             self._freelist = freelist_data
 
     def _save_freelist(self):
-        """Save freelist to database header."""
+        """Save freelist to database header (only if changed)."""
+        if not self._freelist_dirty:
+            return
         self._db.set_header_field("_blob_freelist", self._freelist)
+        self._freelist_dirty = False
 
     def _alloc_from_freelist(self, n_slots: int) -> int | None:
         """Find best-fit slot in freelist.
@@ -123,6 +127,7 @@ class BlobStore:
 
         if best_idx is not None:
             offset, slots = self._freelist.pop(best_idx)
+            self._freelist_dirty = True
             # Return excess slots to freelist
             excess = slots - n_slots
             if excess > 0:
@@ -136,6 +141,7 @@ class BlobStore:
         """Add slots to freelist, merging adjacent regions."""
         # Add to list
         self._freelist.append((offset, n_slots))
+        self._freelist_dirty = True
 
         # Sort by offset for merging
         self._freelist.sort(key=lambda x: x[0])

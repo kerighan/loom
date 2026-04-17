@@ -309,8 +309,10 @@ class TestBackwardCompatibility:
             db.set_header_field("test_key", "test_value")
 
             address = db.header_size + 100
-            db.log_write(address, b"pending_data")
-            db.log_commit()
+            # Write a committed WAL entry using the internal API
+            with open(db.log_filename, "ab") as log:
+                db.log_write(log, address, b"pending_data")
+                db.log_commit(log)
 
             # Simulate crash (don't apply writes, just close)
             db.close()

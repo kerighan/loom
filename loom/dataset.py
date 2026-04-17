@@ -1,8 +1,13 @@
 import numpy as np
 
+from loom.ref import Ref
+
 # Blob reference dtype: (offset: uint64, n_slots: uint16)
 # Total 10 bytes per blob field
 BLOB_DTYPE = np.dtype([("offset", "uint64"), ("n_slots", "uint16")])
+
+# Sentinel for null/empty blob references
+_NULL_BLOB = (0, 0)
 
 
 class Dataset:
@@ -21,16 +26,19 @@ class Dataset:
         dataset.exists(address)            # Check if valid
     """
 
-    def __init__(self, dataset_name, db, identifier, **schema):
+    def __init__(self, dataset_name, db, identifier, blob_store=None, **schema):
         """
         Args:
             dataset_name: Dataset name (string)
             db: ByteFileDB instance
             identifier: Unique ID (1-127, positive int8)
-            **schema: Field definitions as numpy dtypes
+            blob_store: BlobStore instance (required for "blob" or "text" fields)
+            **schema: Field definitions as numpy dtypes.
+                      Use "blob" for raw variable-length bytes,
+                      "text" for variable-length UTF-8 strings.
 
         Example:
-            Dataset('users', db, 1, id='uint64', name='U50', age='int32')
+            Dataset('messages', db, 1, id='uint64', content='text')
         """
         if not (1 <= identifier <= 127):
             raise ValueError(f"Identifier must be 1-127, got {identifier}")
@@ -38,15 +46,20 @@ class Dataset:
         self.name = dataset_name
         self.db = db
         self.identifier = identifier
+        self.blob_store = blob_store
 
-        # Track blob fields (special handling)
-        self._blob_fields = set()
+        # Track special variable-length fields
+        self._blob_fields = set()   # raw bytes via BlobStore
+        self._text_fields = set()   # UTF-8 strings via BlobStore (transparent)
 
-        # Convert "blob" string to actual blob dtype
+        # Convert "blob"/"text" strings to actual blob dtype
         processed_schema = []
         for field, dtype in schema.items():
             if dtype == "blob":
                 self._blob_fields.add(field)
+                processed_schema.append((field, BLOB_DTYPE))
+            elif dtype == "text":
+                self._text_fields.add(field)
                 processed_schema.append((field, BLOB_DTYPE))
             else:
                 processed_schema.append((field, dtype))
@@ -76,25 +89,34 @@ class Dataset:
         """Convert record dict to bytes with prefix.
 
         For blob fields, expects (offset, n_slots) tuple.
+        For text fields, expects a str — stored transparently via BlobStore.
         """
         # Build full record with prefix
         values = [self.identifier]
         for field in self.user_schema.names:
             if field in record:
                 value = record[field]
-                # Blob fields store (offset, n_slots) tuple
-                if field in self._blob_fields:
+                if field in self._text_fields:
+                    # Encode string and store in BlobStore
+                    if value is None or value == "":
+                        values.append(_NULL_BLOB)
+                    else:
+                        encoded = value.encode("utf-8") if isinstance(value, str) else value
+                        offset, n_slots = self.blob_store.write(encoded)
+                        values.append((offset, n_slots))
+                elif field in self._blob_fields:
                     if value is None:
-                        value = (0, 0)  # Null blob
-                    # value should be (offset, n_slots) tuple
-                values.append(value)
+                        value = _NULL_BLOB
+                    values.append(value)
+                else:
+                    values.append(value)
             else:
                 # Use proper default for field type
                 dtype = self.user_schema.fields[field][0]
                 if dtype.kind == "U":  # Unicode string
                     values.append("")
-                elif field in self._blob_fields:
-                    values.append((0, 0))  # Null blob reference
+                elif field in self._blob_fields or field in self._text_fields:
+                    values.append(_NULL_BLOB)
                 else:
                     values.append(0)
         arr = np.array(tuple(values), dtype=self.schema)
@@ -104,13 +126,21 @@ class Dataset:
         """Convert bytes to record dict (without prefix).
 
         For blob fields, returns (offset, n_slots) tuple.
+        For text fields, returns the decoded UTF-8 string transparently.
         Actual blob data must be fetched separately via BlobStore.
         """
         arr = np.frombuffer(data, dtype=self.schema)[0]
         result = {}
         for field in self.user_schema.names:
             value = arr[field]
-            if field in self._blob_fields:
+            if field in self._text_fields:
+                offset = int(value["offset"])
+                n_slots = int(value["n_slots"])
+                if offset == 0 and n_slots == 0:
+                    result[field] = ""
+                else:
+                    result[field] = self.blob_store.read(offset).decode("utf-8")
+            elif field in self._blob_fields:
                 # Convert structured array to tuple
                 offset = int(value["offset"])
                 n_slots = int(value["n_slots"])
@@ -147,8 +177,9 @@ class Dataset:
         Raises:
             ValueError: If record is deleted or wrong type
         """
-        # Read prefix first
-        prefix = self.db.read(address, 1)
+        # Single read for both prefix check and data
+        data = self.db.read(address, self.record_size)
+        prefix = data[0:1]
 
         if prefix == self._deleted_prefix:
             raise ValueError(f"Record at {address} is deleted")
@@ -159,8 +190,6 @@ class Dataset:
                 f"Wrong dataset at {address}: expected {self.identifier}, got {prefix_val}"
             )
 
-        # Read full record
-        data = self.db.read(address, self.record_size)
         return self._deserialize(data)
 
     def read_many(self, address, count, as_array=False):
@@ -200,13 +229,23 @@ class Dataset:
         results = []
         for rec in arr:
             prefix = rec["_prefix"]
-            if prefix == self.identifier:
-                # Valid record
-                results.append({field: rec[field] for field in self.user_schema.names})
-            elif prefix == -self.identifier:
-                # Deleted record - still include but mark as invalid
-                d = {field: rec[field] for field in self.user_schema.names}
-                d["valid"] = False
+            if prefix == self.identifier or prefix == -self.identifier:
+                d = {}
+                for field in self.user_schema.names:
+                    if field in self._text_fields:
+                        value = rec[field]
+                        offset = int(value["offset"])
+                        n_slots = int(value["n_slots"])
+                        d[field] = "" if (offset == 0 and n_slots == 0) else self.blob_store.read(offset).decode("utf-8")
+                    elif field in self._blob_fields:
+                        value = rec[field]
+                        offset = int(value["offset"])
+                        n_slots = int(value["n_slots"])
+                        d[field] = None if (offset == 0 and n_slots == 0) else (offset, n_slots)
+                    else:
+                        d[field] = rec[field]
+                if prefix == -self.identifier:
+                    d["valid"] = False
                 results.append(d)
             else:
                 # Uninitialized or wrong type - stop here
@@ -217,30 +256,60 @@ class Dataset:
     def delete(self, address):
         """Soft delete a record by flipping its prefix.
 
+        For text fields, the associated blobs are freed before deletion.
+
         Args:
             address: Address of record to delete
         """
+        if self._text_fields:
+            data = self.db.read(address, self.record_size)
+            arr = np.frombuffer(data, dtype=self.schema)[0]
+            for field in self._text_fields:
+                value = arr[field]
+                offset = int(value["offset"])
+                n_slots = int(value["n_slots"])
+                if offset != 0 or n_slots != 0:
+                    self.blob_store.delete(offset, n_slots)
         self.db.write(address, self._deleted_prefix)
 
     def write_field(self, address, field_name, value):
         """Update a single field in a record.
 
+        For text fields, the old blob is freed and a new one is written.
+
         Args:
             address: Record address
             field_name: Field to update
-            value: New value
+            value: New value (str for text fields)
         """
         if field_name not in self.user_schema.names:
             raise ValueError(f"Field '{field_name}' not in schema")
 
-        # Get field offset from schema
-        field_offset = self.schema.fields[field_name][1]  # (dtype, offset)
+        field_offset = self.schema.fields[field_name][1]
+
+        if field_name in self._text_fields:
+            # Free old blob
+            old_data = self.db.read(address + field_offset, BLOB_DTYPE.itemsize)
+            old_ref = np.frombuffer(old_data, dtype=BLOB_DTYPE)[0]
+            old_offset = int(old_ref["offset"])
+            old_n_slots = int(old_ref["n_slots"])
+            if old_offset != 0 or old_n_slots != 0:
+                self.blob_store.delete(old_offset, old_n_slots)
+
+            # Write new blob
+            if value is None or value == "":
+                new_ref = np.array([_NULL_BLOB], dtype=BLOB_DTYPE)
+            else:
+                encoded = value.encode("utf-8") if isinstance(value, str) else value
+                new_offset, new_n_slots = self.blob_store.write(encoded)
+                new_ref = np.array([(new_offset, new_n_slots)], dtype=BLOB_DTYPE)
+
+            self.db.write(address + field_offset, new_ref.tobytes())
+            return
+
+        # Standard field update
         field_dtype = self.user_schema.fields[field_name][0]
-
-        # Serialize value
         data = np.array([value], dtype=field_dtype).tobytes()
-
-        # Write at field location
         self.db.write(address + field_offset, data)
 
     def read_field(self, address, field_name):
@@ -306,6 +375,8 @@ class Dataset:
         Example:
             record = dataset[addr]
         """
+        if isinstance(address, Ref):
+            address = address.addr
         return self.read(address)
 
     def __setitem__(self, address, record):
@@ -318,9 +389,18 @@ class Dataset:
         Example:
             dataset[addr] = {'id': 1, 'name': 'Alice'}
         """
+        if isinstance(address, Ref):
+            address = address.addr
         if not isinstance(record, dict):
             raise TypeError(f"Record must be a dict, got {type(record).__name__}")
         self.write(address, **record)
+
+    def insert(self, record):
+        if not isinstance(record, dict):
+            raise TypeError(f"Record must be a dict, got {type(record).__name__}")
+        addr = self.allocate_block(1)
+        self[addr] = record
+        return Ref(self, int(addr))
 
     def __delitem__(self, address):
         """Delete a record using dict-like syntax.

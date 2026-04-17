@@ -36,7 +36,7 @@ class DB:
         self.commit = True
 
         # blob management variables
-        self._block_size = 4096*4
+        self._block_size = 4096 * 4
         self._slot_size = 32
         self._n_slots_per_block = self._block_size // self._slot_size
 
@@ -74,14 +74,21 @@ class DB:
     def _get_encoder_and_decoder(self, blob_protocol, blob_compression):
         # available compressions
         if blob_compression is None:
-            def compress(x): return x
-            def decompress(x): return x
+
+            def compress(x):
+                return x
+
+            def decompress(x):
+                return x
+
         elif blob_compression == "zlib":
             import zlib
+
             compress = zlib.compress
             decompress = zlib.decompress
         elif blob_compression == "brotli":
             import brotli
+
             compress = brotli.compress
             decompress = brotli.decompress
         else:
@@ -89,20 +96,26 @@ class DB:
 
         # available protocols to transform python objects to bytes
         if blob_protocol == "pickle":
-            def dumps(x): return pickle.dumps(x,
-                                              protocol=pickle.HIGHEST_PROTOCOL)
 
-            def loads(x): return pickle.loads(x)
+            def dumps(x):
+                return pickle.dumps(x, protocol=pickle.HIGHEST_PROTOCOL)
+
+            def loads(x):
+                return pickle.loads(x)
+
         elif blob_protocol == "orjson":
             import orjson
+
             dumps = orjson.dumps
             loads = orjson.loads
         elif blob_protocol == "ujson":
             import ujson
+
             dumps = ujson.dumps
             loads = ujson.loads
         elif blob_protocol == "cbor":
             import cbor2
+
             dumps = cbor2.dumps
             loads = cbor2.loads
 
@@ -139,7 +152,7 @@ class DB:
     def _n_empty_slots(self):
         fs = os.stat(self.filename).st_size
         return fs - self.index
-    
+
     @property
     def _blocks_list(self):
         return self.datastructures["_blocks_list"]
@@ -173,17 +186,20 @@ class DB:
         self._compile_datastructures()
 
         # build header
-        self.header = Dataset(1, self, "header",
-                              list(self._header_fields.items()))
+        self.header = Dataset(1, self, "header", list(self._header_fields.items()))
 
         # remove database reference in datasets for pickle
         self._remove_database_reference()
 
         # dump header and datasets data
-        data_bytes = pickle.dumps({"header": self.header,
-                                   "datasets": self.datasets,
-                                   "datastructures": self.datastructures},
-                                  protocol=pickle.HIGHEST_PROTOCOL)
+        data_bytes = pickle.dumps(
+            {
+                "header": self.header,
+                "datasets": self.datasets,
+                "datastructures": self.datastructures,
+            },
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
         data_len_bytes = array(len(data_bytes), dtype=uint32).tobytes()
         pickle_bytes = data_len_bytes + data_bytes
         pickle_bytes_len = len(pickle_bytes)
@@ -224,13 +240,11 @@ class DB:
         for dstruct in self.datastructures.values():
             dstruct._load()
 
-        self._slots = [self._blocks_list[i]
-                       for i in range(len(self._blocks_list))]
+        self._slots = [self._blocks_list[i] for i in range(len(self._blocks_list))]
 
     def create_dataset(self, name, **kwargs):
         if name in self.datasets:
-            raise DatasetExistsError(
-                f"A dataset named '{name}' already exists")
+            raise DatasetExistsError(f"A dataset named '{name}' already exists")
 
         identifier = len(self.datasets) + 3
         dtypes = []
@@ -248,8 +262,7 @@ class DB:
 
     def create_group(self, name, dataset, **kwargs):
         if name in self.datasets:
-            raise DatasetExistsError(
-                f"A dataset named '{name}' already exists")
+            raise DatasetExistsError(f"A dataset named '{name}' already exists")
 
         identifier = len(self.datasets) + 3
         dtypes = []
@@ -267,8 +280,7 @@ class DB:
 
     def create_array(self, name, dt):
         if name in self.datasets:
-            raise DatasetExistsError(
-                f"A dataset named '{name}' already exists")
+            raise DatasetExistsError(f"A dataset named '{name}' already exists")
 
         identifier = len(self.datasets) + 3
         if dt == "bool":
@@ -312,8 +324,7 @@ class DB:
 
     def compile(self):
         # create block list for blob management
-        _blocks = self.create_dataset(
-            "blocks", position="uint64", slots_taken="uint8")
+        _blocks = self.create_dataset("blocks", position="uint64", slots_taken="uint8")
         self.create_datastructure("_blocks_list", List(_blocks))
 
         self._dump()
@@ -364,11 +375,13 @@ class DB:
         blob_bytes = self.encode(blob)
         blob_size = len(blob_bytes)
 
-        data_bytes = b''.join((
-            self._blob_identifier,  # 1 is blob identifier
-            uint32(blob_size).tobytes(),  # blob size in uint32
-            blob_bytes  # actual content of the blob
-        ))
+        data_bytes = b"".join(
+            (
+                self._blob_identifier,  # 1 is blob identifier
+                uint32(blob_size).tobytes(),  # blob size in uint32
+                blob_bytes,  # actual content of the blob
+            )
+        )
         return self._append(data_bytes)
 
     def get_blob(self, index):
@@ -413,7 +426,8 @@ class DB:
 
 class Dict:
     def __init__(
-        self, filename,
+        self,
+        filename,
         flag="w",
         dtype="blob",
         use_hash=True,
@@ -423,35 +437,46 @@ class Dict:
         cache_len=100000,
         lru_cache=10000,
         p_init=16,
-        probe_factor=.4
+        probe_factor=0.4,
     ):
         from .datastructure import Hashmap
+
         if not os.path.exists(filename) or flag == "n":
-            self.db = DB(filename, flag=flag,
-                         blob_compression=blob_compression,
-                         blob_protocol=blob_protocol)
+            self.db = DB(
+                filename,
+                flag=flag,
+                blob_compression=blob_compression,
+                blob_protocol=blob_protocol,
+            )
             self.db.create_header(max_key_len="uint8", use_hash="bool")
             if use_hash:
-                self.data = self.db.create_dataset(
-                    "data", key="uint64", value=dtype)
+                self.data = self.db.create_dataset("data", key="uint64", value=dtype)
             else:
                 self.data = self.db.create_dataset(
-                    "data", key=f"U{max_key_len}", value=dtype)
+                    "data", key=f"U{max_key_len}", value=dtype
+                )
             self.table = self.db.create_datastructure(
-                "table", Hashmap(
-                    self.data, "key",
+                "table",
+                Hashmap(
+                    self.data,
+                    "key",
                     cache_len=cache_len,
                     p_init=p_init,
-                    probe_factor=probe_factor))
+                    probe_factor=probe_factor,
+                ),
+            )
             self.db.compile()
 
             # initialize values
             self.db.header["max_key_len"] = max_key_len
             self.db.header["use_hash"] = use_hash
         else:
-            self.db = DB(filename, flag=flag,
-                         blob_compression=blob_compression,
-                         blob_protocol=blob_protocol)
+            self.db = DB(
+                filename,
+                flag=flag,
+                blob_compression=blob_compression,
+                blob_protocol=blob_protocol,
+            )
             self.data = self.db["data"]
             self.table = self.db["table"]
             max_key_len = self.db.header["max_key_len"]
@@ -462,10 +487,12 @@ class Dict:
         self.lru_cache = lru_cache
         if lru_cache > 0:
             from lru import LRU
+
             self.lru = LRU(lru_cache)
 
     def _hash(self, key, seed=0):
         import mmh3
+
         if not isinstance(key, str):
             key = str(key)
         return mmh3.hash(key, seed=seed, signed=False)

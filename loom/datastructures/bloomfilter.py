@@ -114,11 +114,10 @@ class BloomFilter(DataStructure):
             dataset_name, bit="uint8"  # 8 bits per bucket (same as bool in numpy)
         )
 
-        # Allocate bit array and initialize to zero
+        # Allocate bit array and bulk-init with valid prefix in one write
         self._bits_addr = self._bits_dataset.allocate_block(num_buckets)
-        for i in range(num_buckets):
-            addr = self._bits_addr + i * self._bits_dataset.record_size
-            self._bits_dataset[addr] = {"bit": 0}
+        zero_record = self._bits_dataset._serialize(bit=0)
+        self._bits_dataset.db.write(self._bits_addr, zero_record * num_buckets)
 
         # Save metadata
         self._save_metadata(
@@ -134,6 +133,12 @@ class BloomFilter(DataStructure):
         )
 
         self.num_items = 0
+        self._cache_raw_fields()
+
+    def _cache_raw_fields(self):
+        """Cache record size and raw DB handle for direct mmap access."""
+        self._record_size = self._bits_dataset.record_size
+        self._db_raw = self._bits_dataset.db
 
     def _load(self):
         """Load existing Bloom filter."""
@@ -147,6 +152,7 @@ class BloomFilter(DataStructure):
 
         self._bits_dataset = self._get_dataset(metadata["bits_dataset"])
         self._bits_addr = metadata["bits_addr"]
+        self._cache_raw_fields()
 
     def _get_hashes(self, item):
         """Generate k hash values using double hashing.
@@ -180,27 +186,14 @@ class BloomFilter(DataStructure):
         return hashes
 
     def _get_bit(self, bit_index):
-        """Get value of a specific bit.
-
-        Args:
-            bit_index: Index of bit to get
-
-        Returns:
-            1 if bit is set, 0 otherwise
-        """
-        addr = self._bits_addr + bit_index * self._bits_dataset.record_size
-        bit_val = self._bits_dataset[addr]["bit"]
-
-        return 1 if bit_val > 0 else 0
+        """Get value of a specific bit (raw mmap, no numpy)."""
+        addr = self._bits_addr + bit_index * self._record_size
+        return self._db_raw.read(addr + 1, 1)[0]
 
     def _set_bit(self, bit_index):
-        """Set a specific bit to 1.
-
-        Args:
-            bit_index: Index of bit to set
-        """
-        addr = self._bits_addr + bit_index * self._bits_dataset.record_size
-        self._bits_dataset[addr] = {"bit": 1}
+        """Set a specific bit to 1 (raw mmap, no numpy)."""
+        addr = self._bits_addr + bit_index * self._record_size
+        self._db_raw.write(addr + 1, b"\x01")
 
     def add(self, item):
         """Add an item to the Bloom filter.

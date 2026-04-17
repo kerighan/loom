@@ -6,6 +6,7 @@ from loom.datastructures.base import DataStructure
 from loom.datastructures.template import DataStructureTemplate
 from loom.datastructures.counting_bloomfilter import CountingBloomFilter
 from loom.cache import LRUCache
+from loom.ref import Ref
 
 
 class Dict(DataStructure):
@@ -302,16 +303,27 @@ class Dict(DataStructure):
         if self._is_nested:
             from loom.datastructures.base import _DS_REGISTRY
 
-            template_dataset = self._get_dataset(metadata["template_dataset"])
             template_config = metadata["template_config"]
             template_class_name = metadata.get("template_class", "Dict")
 
             # Get template class from registry (modular approach)
             template_class = _DS_REGISTRY.get(template_class_name, Dict)
 
-            self._template = DataStructureTemplate(
-                template_class, template_dataset, template_config
-            )
+            # Handle Set specially - it uses SetTemplate which doesn't need a real dataset
+            if template_class_name == "Set":
+                from loom.datastructures.set import SetTemplate
+
+                self._template = SetTemplate(
+                    template_class,
+                    key_size=template_config.get("key_size", 50),
+                    use_bloom=template_config.get("use_bloom", False),
+                    cache_size=template_config.get("cache_size", 0),
+                )
+            else:
+                template_dataset = self._get_dataset(metadata["template_dataset"])
+                self._template = DataStructureTemplate(
+                    template_class, template_dataset, template_config
+                )
             self.item_schema = self._template.get_ref_schema()
 
             # Load shared datasets (modular approach)
@@ -609,7 +621,7 @@ class Dict(DataStructure):
                     entry_data = chunk_data[offset : offset + record_size]
                     try:
                         entry = self._hash_table._deserialize(entry_data)
-                    except:
+                    except Exception:
                         continue
 
                     if entry["key"] == key:
@@ -627,7 +639,7 @@ class Dict(DataStructure):
 
                 try:
                     entry = self._hash_table[entry_addr]
-                except:
+                except Exception:
                     if for_insert and first_free is None:
                         first_free = (p, table_addr, position, {})
                     continue
@@ -689,6 +701,14 @@ class Dict(DataStructure):
         entry_addr = table_addr + position * self._hash_table.record_size
         is_update = entry.get("valid", False) and entry.get("key") == key
 
+        is_ref_value = isinstance(value, Ref)
+        if is_ref_value and self._is_nested:
+            raise TypeError("Cannot store Ref values in nested Dict")
+        if is_ref_value and value.dataset is not self._values_dataset:
+            raise TypeError(
+                "Ref dataset mismatch: Ref must point to this Dict's values dataset"
+            )
+
         if is_update:
             # Update existing item
             value_addr = int(entry["value_addr"])
@@ -701,8 +721,14 @@ class Dict(DataStructure):
                     )
                 self._values_dataset[value_addr] = value.to_ref()
             else:
-                # Update in place in user's dataset
-                self._values_dataset[value_addr] = value
+                if is_ref_value:
+                    # Re-point existing entry to Ref address (no copy)
+                    value_addr = int(value.addr)
+                    entry["value_addr"] = value_addr
+                    self._hash_table[entry_addr] = entry
+                else:
+                    # Update in place in user's dataset
+                    self._values_dataset[value_addr] = value
         else:
             # Insert new item - use append() to get next free address
             if self._is_nested:
@@ -725,13 +751,17 @@ class Dict(DataStructure):
                 self._values_dataset[value_addr] = ref
                 self.next_data_offset += 1
             else:
-                # Compact: append to user's dataset block!
-                value_addr = (
-                    self.values_block_addr
-                    + self.next_data_offset * self._values_dataset.record_size
-                )
-                self._values_dataset[value_addr] = value
-                self.next_data_offset += 1
+                if is_ref_value:
+                    # Store pointer directly (no allocation/copy)
+                    value_addr = int(value.addr)
+                else:
+                    # Compact: append to user's dataset block!
+                    value_addr = (
+                        self.values_block_addr
+                        + self.next_data_offset * self._values_dataset.record_size
+                    )
+                    self._values_dataset[value_addr] = value
+                    self.next_data_offset += 1
 
             self._hash_table[entry_addr] = {
                 "hash": key_hash,
@@ -748,7 +778,7 @@ class Dict(DataStructure):
 
         # Cache the actual value (not the address!)
         if self._cache:
-            self._cache[key] = value
+            self._cache[key] = value if self._is_nested else int(value_addr)
 
         self._auto_save_check()
 
@@ -761,6 +791,21 @@ class Dict(DataStructure):
             self._parent.update_nested_ref(self._parent_key, self)
 
         return value if self._is_nested else None
+
+    def get_ref(self, key):
+        """Return a Ref handle to the underlying record for a key.
+
+        Only supported for non-nested dicts.
+        """
+        if self._is_nested:
+            raise TypeError("get_ref is not supported for nested Dict")
+
+        key_hash = self._hash(key)
+        p, table_addr, position, entry = self._find_slot(
+            key, key_hash, for_insert=False
+        )
+        value_addr = int(entry["value_addr"])
+        return Ref(self._values_dataset, value_addr)
 
     def _setitem_atomic(self, key, value):
         """Atomic insert/update using WAL for crash safety.
@@ -840,7 +885,7 @@ class Dict(DataStructure):
 
         # Cache the actual value (not the address!)
         if self._cache:
-            self._cache[key] = value
+            self._cache[key] = value if self._is_nested else int(value_addr)
 
         self._auto_save_check()
 
@@ -893,7 +938,9 @@ class Dict(DataStructure):
         if self._cache:
             cached_value = self._cache.get(key)
             if cached_value is not None:
-                return cached_value
+                if self._is_nested:
+                    return cached_value
+                return self._values_dataset[int(cached_value)]
 
         # Cache miss - do full lookup
         key_hash = self._hash(key)
@@ -913,13 +960,17 @@ class Dict(DataStructure):
                 # Set shared datasets if needed (modular approach)
                 if result.needs_shared_datasets():
                     result.set_shared_datasets(self._shared_datasets)
+
+                # Set parent reference so nested structure can update us
+                result._parent = self
+                result._parent_key = key
             else:
                 # Return data directly from user's dataset
                 result = value_data
 
             # Cache the actual value for next time!
             if self._cache:
-                self._cache[key] = result
+                self._cache[key] = result if self._is_nested else int(value_addr)
 
             return result
         except KeyError:
@@ -961,8 +1012,14 @@ class Dict(DataStructure):
         self._auto_save_check()
 
     def __contains__(self, key):
+        # Check cache first
+        if self._cache and self._cache.get(key) is not None:
+            return True
+        # Direct hash table probe — avoids reading the value and avoids
+        # auto-creating entries in nested dicts (which __getitem__ does).
+        key_hash = self._hash(key)
         try:
-            self[key]
+            self._find_slot(key, key_hash, for_insert=False)
             return True
         except KeyError:
             return False
@@ -985,26 +1042,40 @@ class Dict(DataStructure):
         except KeyError:
             return default
 
+    def _read_table_entries(self, table_addr, capacity):
+        """Bulk-read a hash table and yield valid (key, value_addr) pairs.
+
+        Unlike read_many(), this does NOT stop at the first uninitialized
+        slot — hash tables are sparse and may have gaps.
+        """
+        import numpy as np
+
+        record_size = self._hash_table.record_size
+        total_size = capacity * record_size
+        raw_data = self._hash_table.db.read(table_addr, total_size)
+        arr = np.frombuffer(raw_data, dtype=self._hash_table.schema)
+
+        identifier = self._hash_table.identifier
+        mask = (arr["_prefix"] == identifier) & (arr["valid"])
+        for rec in arr[mask]:
+            yield str(rec["key"]), int(rec["value_addr"])
+
     def keys(self):
         """Iterate over all keys in dict.
 
         Yields:
             Keys in arbitrary order
         """
-        # Use instance _p_init for nested dict compatibility
         p_init = getattr(self, "_p_init", self.P_INIT)
         for p in range(p_init, self.p_last + 1):
             table_idx = p - p_init
             table_addr = self.table_addrs[table_idx]
             capacity = self._get_capacity(p)
-            for i in range(capacity):
-                entry_addr = table_addr + i * self._hash_table.record_size
-                try:
-                    entry = self._hash_table[entry_addr]
-                    if entry.get("valid", False):
-                        yield entry["key"]
-                except:
-                    pass
+            try:
+                for key, _ in self._read_table_entries(table_addr, capacity):
+                    yield key
+            except Exception:
+                pass
 
     def values(self):
         """Iterate over all values in dict.
@@ -1012,8 +1083,8 @@ class Dict(DataStructure):
         Yields:
             Values in arbitrary order
         """
-        for key in self.keys():
-            yield self[key]
+        for _, value in self._iter_entries():
+            yield value
 
     def items(self):
         """Iterate over all (key, value) pairs in dict.
@@ -1021,8 +1092,36 @@ class Dict(DataStructure):
         Yields:
             Tuples of (key, value) in arbitrary order
         """
-        for key in self.keys():
-            yield (key, self[key])
+        yield from self._iter_entries()
+
+    def _iter_entries(self):
+        """Iterate over all (key, value) pairs efficiently.
+
+        Reads hash tables in bulk and resolves values directly
+        from stored addresses, avoiding redundant key lookups.
+        """
+        p_init = getattr(self, "_p_init", self.P_INIT)
+        for p in range(p_init, self.p_last + 1):
+            table_idx = p - p_init
+            table_addr = self.table_addrs[table_idx]
+            capacity = self._get_capacity(p)
+
+            try:
+                for key, value_addr in self._read_table_entries(table_addr, capacity):
+                    value_data = self._values_dataset[value_addr]
+
+                    if self._is_nested:
+                        inner_class = self._template.ds_class
+                        result = inner_class.from_ref(self._db, value_data)
+                        if result.needs_shared_datasets():
+                            result.set_shared_datasets(self._shared_datasets)
+                        result._parent = self
+                        result._parent_key = key
+                        yield key, result
+                    else:
+                        yield key, value_data
+            except Exception:
+                pass
 
     def __iter__(self):
         return self.keys()

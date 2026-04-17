@@ -16,8 +16,16 @@ class ByteFileDB:
 
         # Header metadata dictionary (in-memory cache)
         self._header_data = {}
+        self._header_dirty = False
+        self._batch_mode = False
         self._allocation_index_key = "_allocation_index"
         self._is_initialized_key = "_is_initialized"
+
+    def _grow_file_size(self, min_size):
+        """Grow the file to at least min_size using exponential growth."""
+        current = os.path.getsize(self.filename) if os.path.exists(self.filename) else 0
+        target = max(min_size, current * 2)
+        self.ensure_file_size(target)
 
     def ensure_file_size(self, size):
         if not os.path.exists(self.filename) or os.path.getsize(self.filename) < size:
@@ -39,43 +47,48 @@ class ByteFileDB:
             self.file_handle.close()
             self.file_handle = None
 
+    def _remap(self, min_size):
+        """Grow file and re-create mmap. Flushes dirty header first."""
+        if self._header_dirty:
+            self._save_header()
+        self.close()
+        self._grow_file_size(min_size)
+        self.open()
+
     def write(self, address, data):
         assert self.mapped_file, "DB is not open. Call open() first."
-        if address + len(data) > len(self.mapped_file):
-            self.close()
-            self.ensure_file_size(address + len(data) + self.initial_size)
-            self.open()
-        self.mapped_file[address : address + len(data)] = data
+        end = address + len(data)
+        if end > len(self.mapped_file):
+            self._remap(end)
+        self.mapped_file[address : end] = data
 
     def read(self, address, size):
         assert self.mapped_file, "DB is not open. Call open() first."
         return self.mapped_file[address : address + size]
 
-    def log_write(self, address, data):
-        with open(self.log_filename, "ab") as log:
-            log.write((address).to_bytes(4, "big"))
-            log.write((len(data)).to_bytes(4, "big"))
-            log.write(data)
+    def log_write(self, log_handle, address, data):
+        log_handle.write((address).to_bytes(8, "big"))
+        log_handle.write((len(data)).to_bytes(4, "big"))
+        log_handle.write(data)
 
-    def log_commit(self):
-        with open(self.log_filename, "ab") as log:
-            log.write(b"COMMIT")
+    def log_commit(self, log_handle):
+        log_handle.write(b"COMMIT\x00\x00")
+        log_handle.flush()
+        os.fsync(log_handle.fileno())
 
     def recover_from_log(self):
         if os.path.exists(self.log_filename):
             with open(self.log_filename, "rb") as log:
                 writes = []
                 while True:
-                    address_data = log.read(4)
+                    address_data = log.read(8)
                     if not address_data:
                         break
                     # Check if this is the COMMIT marker
-                    if address_data == b"COMM":
-                        # Read the remaining 'IT' part
-                        if log.read(2) == b"IT":
-                            # Transaction was committed, apply writes
-                            for address, data in writes:
-                                self.write(address, data)
+                    if address_data == b"COMMIT\x00\x00":
+                        # Transaction was committed, apply writes
+                        for address, data in writes:
+                            self.write(address, data)
                         break
 
                     address = int.from_bytes(address_data, "big")
@@ -86,32 +99,19 @@ class ByteFileDB:
             self.clear_log()
 
     def transaction(self, writes):
-        # First, log all the writes.
-        for address, data in writes:
-            self.log_write(address, data)
+        with open(self.log_filename, "ab") as log:
+            for address, data in writes:
+                self.log_write(log, address, data)
+            self.log_commit(log)
 
-        # Commit the transaction.
-        self.log_commit()
-
-        # Now apply the logged writes to the database.
         for address, data in writes:
             self.write(address, data)
 
         self.clear_log()
 
     def clear_log(self):
-        # Ensure parent directory exists
-        log_dir = os.path.dirname(self.log_filename)
-        if log_dir and not os.path.exists(log_dir):
-            os.makedirs(log_dir, exist_ok=True)
-        
-        # Clear or create log file
-        try:
-            with open(self.log_filename, "wb") as log:
-                log.truncate(0)
-        except OSError:
-            # If file doesn't exist, just create it
-            open(self.log_filename, "wb").close()
+        with open(self.log_filename, "wb") as log:
+            pass
 
     # -------------------------------------------------------------------------
     # Header management methods (Phase 1)
@@ -141,6 +141,8 @@ class ByteFileDB:
             # No header, initialize
             self._initialize_header()
 
+        self._header_dirty = False
+
     def _initialize_header(self):
         """Initialize a fresh header."""
         self._header_data = {
@@ -150,7 +152,7 @@ class ByteFileDB:
         self._save_header()
 
     def _save_header(self):
-        """Persist header metadata to file."""
+        """Persist header metadata to file (direct mmap write, no WAL)."""
         assert self.mapped_file, "DB is not open. Call open() first."
 
         # Serialize header data
@@ -162,18 +164,18 @@ class ByteFileDB:
                 f"Header data too large: {data_size} bytes (max {self.header_size - 8})"
             )
 
-        # Write magic number, size, and data
+        # Write magic number, size, and data — direct mmap (no WAL overhead)
         header_bytes = b"LOOM" + np.uint32(data_size).tobytes() + pickled_data
-
-        # Pad to header_size
         header_bytes += b"\x00" * (self.header_size - len(header_bytes))
-
-        self.transaction([(0, header_bytes)])
-        if self.mapped_file:
-            self.mapped_file.flush()
+        self.mapped_file[0 : self.header_size] = header_bytes
+        self.mapped_file.flush()
+        self._header_dirty = False
 
     def set_header_field(self, name, value):
         """Set a metadata field in the header.
+
+        Persists immediately unless batch mode is active, in which case
+        the write is deferred until end_batch().
 
         Args:
             name: Field name (string)
@@ -181,7 +183,25 @@ class ByteFileDB:
         """
         assert self.mapped_file, "DB is not open. Call open() first."
         self._header_data[name] = value
-        self._save_header()
+        if self._batch_mode:
+            self._header_dirty = True
+        else:
+            self._save_header()
+
+    def begin_batch(self):
+        """Enter batch mode: defer header writes until end_batch()."""
+        self._batch_mode = True
+
+    def end_batch(self):
+        """Exit batch mode and flush any pending header writes."""
+        self._batch_mode = False
+        if self._header_dirty:
+            self._save_header()
+
+    def flush_header(self):
+        """Flush pending header changes to disk."""
+        if self._header_dirty:
+            self._save_header()
 
     def get_header_field(self, name, default=None):
         """Get a metadata field from the header.
@@ -228,13 +248,10 @@ class ByteFileDB:
         # Ensure file is large enough
         required_size = current_index + size
         if required_size > len(self.mapped_file):
-            self.close()
-            self.ensure_file_size(required_size)
-            self.open()
+            self._remap(required_size)
 
-        # Update allocation index
-        self._header_data[self._allocation_index_key] = current_index + size
-        self._save_header()
+        # Update allocation index (set_header_field persists immediately)
+        self.set_header_field(self._allocation_index_key, current_index + size)
 
         return current_index
 
