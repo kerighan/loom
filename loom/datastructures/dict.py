@@ -1125,6 +1125,9 @@ class Dict(DataStructure):
     # ---- Registry protocol ----
 
     def _get_registry_params(self):
+        # Nested child Dicts are managed by their parent, not the registry
+        if self._parent is not None:
+            return None
         return {
             "schema": self.item_schema,
             "cache_size": self.cache_size,
@@ -1138,6 +1141,75 @@ class Dict(DataStructure):
             cache_size=params.get("cache_size", 1000),
             use_bloom=params.get("use_bloom", True),
         )
+
+    def to_dict(self):
+        """Bulk-export all entries as a plain Python dict.
+
+        Reads the entire values block in one mmap slice, then resolves
+        each entry — much faster than iterating via items() for large dicts.
+
+        Returns:
+            dict mapping keys to value dicts
+        """
+        import numpy as np
+
+        # 1) Collect all (key, value_addr) from hash tables
+        entries = []
+        p_init = getattr(self, "_p_init", self.P_INIT)
+        for p in range(p_init, self.p_last + 1):
+            table_idx = p - p_init
+            table_addr = self.table_addrs[table_idx]
+            capacity = self._get_capacity(p)
+            try:
+                for key, value_addr in self._read_table_entries(table_addr, capacity):
+                    entries.append((key, value_addr))
+            except Exception:
+                pass
+
+        if not entries:
+            return {}
+
+        # 2) Bulk-read the values block if all addresses are in it
+        record_size = self._values_dataset.record_size
+        block_start = self.values_block_addr
+        block_end = block_start + self.next_data_offset * record_size
+
+        # Check if all value addrs fall in the contiguous block
+        all_contiguous = all(
+            block_start <= addr < block_end for _, addr in entries
+        )
+
+        if all_contiguous and self.next_data_offset > 0 and not self._is_nested:
+            # Single bulk read of the entire values block
+            total = self.next_data_offset * record_size
+            raw = self._values_dataset.db.read(block_start, total)
+            arr = np.frombuffer(raw, dtype=self._values_dataset.schema)
+
+            result = {}
+            ds = self._values_dataset
+            has_text = bool(ds._text_fields)
+            has_blob = bool(ds._blob_fields)
+
+            for key, addr in entries:
+                idx = (addr - block_start) // record_size
+                rec = arr[idx]
+                d = {}
+                for field in ds.user_schema.names:
+                    if field in ds._text_fields:
+                        val = rec[field]
+                        off, ns = int(val["offset"]), int(val["n_slots"])
+                        d[field] = "" if (off == 0 and ns == 0) else ds.blob_store.read(off).decode("utf-8")
+                    elif field in ds._blob_fields:
+                        val = rec[field]
+                        off, ns = int(val["offset"]), int(val["n_slots"])
+                        d[field] = None if (off == 0 and ns == 0) else (off, ns)
+                    else:
+                        d[field] = rec[field]
+                result[key] = d
+            return result
+
+        # 3) Fallback: individual reads (nested dicts, or scattered addresses)
+        return dict(self._iter_entries())
 
     def __repr__(self):
         return f"Dict('{self.name}', size={self.size}, tables={self.p_last - self.P_INIT + 1})"

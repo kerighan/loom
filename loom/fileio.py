@@ -11,7 +11,7 @@ class ByteFileDB:
     #   [slot_size+1 : header_size]  slot B  — same layout
     # If crash during write to inactive slot, active slot is still intact.
 
-    def __init__(self, filename, initial_size=1024, header_size=8192):
+    def __init__(self, filename, initial_size=1024, header_size=32768):
         self.filename = filename
         self.log_filename = self.filename + ".log"
         self.initial_size = initial_size

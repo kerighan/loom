@@ -49,7 +49,7 @@ class DB:
         self,
         filename,
         initial_size=1024,
-        header_size=8192,
+        header_size=32768,
         auto_open=True,
         blob_compression="brotli",
         auto_save_interval=100,
@@ -291,24 +291,36 @@ class DB:
         finally:
             pass
 
-    def create_dataset(self, dataset_name, **schema):
+    def create_dataset(self, dataset_name, model=None, **schema):
         """Create a new dataset with automatic identifier assignment.
 
         Args:
             dataset_name: Dataset name (must be unique)
-            **schema: Field definitions as numpy dtypes
+            model: Optional Pydantic BaseModel class — schema is derived
+                   from its fields (int→int64, float→float64, str→text, etc.)
+            **schema: Field definitions as numpy dtypes (ignored if model given)
 
         Returns:
             Dataset instance
 
-        Raises:
-            ValueError: If dataset name already exists
-
-        Example:
+        Examples:
+            # Classic kwargs
             users = db.create_dataset('users', id='uint64', name='U50', age='int32')
+
+            # Pydantic model
+            class User(BaseModel):
+                id: int
+                name: str
+                score: float
+            users = db.create_dataset('users', User)
         """
         if not self._is_open:
             raise RuntimeError("Database is not open. Call open() first.")
+
+        # Accept Pydantic model as positional arg
+        if model is not None and not schema:
+            from loom.schema import schema_from_model
+            schema = schema_from_model(model)
 
         if dataset_name in self._datasets:
             raise ValueError(f"Dataset '{dataset_name}' already exists")
@@ -672,3 +684,42 @@ class DB:
         self._datastructures[name] = btree  # Register for caching and auto-save
         self._save_datastructures_registry()  # Persist registry
         return btree
+
+    def create_graph(self, name, node_schema, edge_schema, directed=True):
+        """Create a persistent Graph.
+
+        Args:
+            name: Unique name for this graph
+            node_schema: Pydantic BaseModel or dict for node attributes
+            edge_schema: Pydantic BaseModel or dict for edge attributes
+            directed: If True (default), edges are directed
+
+        Returns:
+            Graph instance
+
+        Example:
+            from pydantic import BaseModel
+
+            class Person(BaseModel):
+                name: str
+                age: int
+
+            class Knows(BaseModel):
+                weight: float
+
+            g = db.create_graph("social", Person, Knows)
+            g.add_node("alice", name="Alice", age=30)
+            g.add_edge("alice", "bob", weight=0.9)
+        """
+        if not self._is_open:
+            raise RuntimeError("Database is not open. Call open() first.")
+
+        from loom.datastructures.graph import Graph
+
+        if name in self._datastructures:
+            return self._datastructures[name]
+
+        g = Graph(name, self, node_schema, edge_schema, directed=directed)
+        self._datastructures[name] = g
+        self._save_datastructures_registry()
+        return g
