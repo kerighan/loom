@@ -49,7 +49,7 @@ class DB:
         self,
         filename,
         initial_size=1024,
-        header_size=4096,
+        header_size=8192,
         auto_open=True,
         blob_compression="brotli",
         auto_save_interval=100,

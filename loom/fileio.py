@@ -5,11 +5,18 @@ import numpy as np
 
 
 class ByteFileDB:
-    def __init__(self, filename, initial_size=1024, header_size=4096):
+    # Double-buffer header layout:
+    #   [0]            active slot indicator (0=A, 1=B)
+    #   [1 : slot_size+1]   slot A  — [LOOM 4B][size 4B][pickle NB]
+    #   [slot_size+1 : header_size]  slot B  — same layout
+    # If crash during write to inactive slot, active slot is still intact.
+
+    def __init__(self, filename, initial_size=1024, header_size=8192):
         self.filename = filename
         self.log_filename = self.filename + ".log"
         self.initial_size = initial_size
         self.header_size = header_size
+        self._slot_size = (header_size - 1) // 2  # usable bytes per slot
         self.ensure_file_size(max(self.initial_size, self.header_size))
         self.mapped_file = None
         self.file_handle = None
@@ -123,30 +130,43 @@ class ByteFileDB:
     # Header management methods (Phase 1)
     # -------------------------------------------------------------------------
 
+    def _slot_offset(self, slot):
+        """Get the mmap offset of a header slot (0=A, 1=B)."""
+        return 1 + slot * self._slot_size
+
+    def _read_slot(self, slot):
+        """Try to deserialize header data from a slot. Returns dict or None."""
+        offset = self._slot_offset(slot)
+        slot_bytes = self.mapped_file[offset : offset + self._slot_size]
+        if slot_bytes[0:4] != b"LOOM":
+            return None
+        try:
+            data_size = np.frombuffer(slot_bytes[4:8], dtype="uint32")[0]
+            if data_size > 0 and data_size < self._slot_size - 8:
+                return pickle.loads(slot_bytes[8 : 8 + data_size])
+        except Exception:
+            pass
+        return None
+
     def _load_header(self):
-        """Load header metadata from file into memory."""
+        """Load header metadata from the active slot, fallback to other."""
         if len(self.mapped_file) < self.header_size:
             return
 
-        header_bytes = self.mapped_file[0 : self.header_size]
+        # Read active slot indicator
+        active = self.mapped_file[0]
+        if active not in (0, 1):
+            active = 0  # Default to slot A
 
-        # Check if header is initialized (first 4 bytes should be magic number)
-        magic = header_bytes[0:4]
-        if magic == b"LOOM":
-            # Header exists, deserialize it
-            try:
-                # Read size of pickled data (next 4 bytes)
-                data_size = np.frombuffer(header_bytes[4:8], dtype="uint32")[0]
-                if data_size > 0 and data_size < self.header_size - 8:
-                    pickled_data = header_bytes[8 : 8 + data_size]
-                    self._header_data = pickle.loads(pickled_data)
-            except Exception:
-                # Corrupted header, initialize fresh
-                self._initialize_header()
-        else:
-            # No header, initialize
+        # Try active slot first, fallback to other
+        data = self._read_slot(active)
+        if data is None:
+            data = self._read_slot(1 - active)
+        if data is None:
             self._initialize_header()
+            return
 
+        self._header_data = data
         self._header_dirty = False
         self._load_freelist()
 
@@ -154,28 +174,54 @@ class ByteFileDB:
         """Initialize a fresh header."""
         self._header_data = {
             self._is_initialized_key: True,
-            self._allocation_index_key: self.header_size,  # Start allocating after header
+            self._allocation_index_key: self.header_size,
         }
-        self._save_header()
+        # Write to both slots for a clean start
+        self.mapped_file[0] = 0  # Slot A active
+        self._write_slot(0)
+        self._write_slot(1)
+        self.mapped_file.flush()
+        self._header_dirty = False
 
-    def _save_header(self):
-        """Persist header metadata to file (direct mmap write, no WAL)."""
-        assert self.mapped_file, "DB is not open. Call open() first."
-
-        # Serialize header data
+    def _write_slot(self, slot):
+        """Serialize current header data into a slot."""
         pickled_data = pickle.dumps(self._header_data)
         data_size = len(pickled_data)
+        max_data = self._slot_size - 8
 
-        if data_size > self.header_size - 8:
+        if data_size > max_data:
             raise ValueError(
-                f"Header data too large: {data_size} bytes (max {self.header_size - 8})"
+                f"Header data too large: {data_size} bytes (max {max_data})"
             )
 
-        # Write magic number, size, and data — direct mmap (no WAL overhead)
-        header_bytes = b"LOOM" + np.uint32(data_size).tobytes() + pickled_data
-        header_bytes += b"\x00" * (self.header_size - len(header_bytes))
-        self.mapped_file[0 : self.header_size] = header_bytes
+        slot_bytes = b"LOOM" + np.uint32(data_size).tobytes() + pickled_data
+        slot_bytes += b"\x00" * (self._slot_size - len(slot_bytes))
+
+        offset = self._slot_offset(slot)
+        self.mapped_file[offset : offset + self._slot_size] = slot_bytes
+
+    def _save_header(self):
+        """Persist header via double-buffer: write inactive slot, flip, flush.
+
+        If crash happens during the write, the active slot is untouched.
+        If crash happens during the flip, both slots are valid (the inactive
+        one has the new data, the active one has the old data).
+        """
+        assert self.mapped_file, "DB is not open. Call open() first."
+
+        active = self.mapped_file[0]
+        if active not in (0, 1):
+            active = 0
+        inactive = 1 - active
+
+        # Step 1: write to inactive slot
+        self._write_slot(inactive)
         self.mapped_file.flush()
+
+        # Step 2: flip indicator (single byte — atomic on any filesystem)
+        self.mapped_file[0] = inactive
+        self.mapped_file.flush()
+
         self._header_dirty = False
 
     def set_header_field(self, name, value):

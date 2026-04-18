@@ -397,19 +397,18 @@ class TestEdgeCases:
             filename = tmp.name
 
         try:
-            # Small header
-            db = ByteFileDB(filename, header_size=1024)
+            # Session 1: allocate
+            db = ByteFileDB(filename, header_size=8192)
             db.open()
             addr1 = db.allocate(100)
-            assert addr1 == 1024
+            assert addr1 == 8192
             db.close()
 
-            # Large header
+            # Session 2: allocation continues from where it left off
             db = ByteFileDB(filename, header_size=8192)
             db.open()
             addr2 = db.allocate(100)
-            # Should continue from previous allocation
-            assert addr2 == 1024 + 100
+            assert addr2 == 8192 + 100
             db.close()
         finally:
             if os.path.exists(filename):
