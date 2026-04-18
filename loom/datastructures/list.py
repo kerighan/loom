@@ -1146,7 +1146,17 @@ class List(DataStructure):
         # Re-append all valid items atomically to ensure crash-safe rebuild
         self.append_many(valid_items, atomic=True)
 
-        # TODO: Free old blocks (need dataset.free() method)
+        # Free old blocks back to the file-level freelist
+        record_size = self._items_dataset.record_size
+        for block_idx, block_addr in enumerate(old_blocks):
+            if block_addr == 0:
+                continue
+            # Skip blocks that are reused by the new layout
+            if block_addr in self.blocks:
+                continue
+            p = self.P_INIT + block_idx
+            capacity = self._get_capacity(p)
+            self._items_dataset.db.free(block_addr, capacity * record_size)
 
         self.save()
 

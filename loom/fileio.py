@@ -18,6 +18,8 @@ class ByteFileDB:
         self._header_data = {}
         self._header_dirty = False
         self._batch_mode = False
+        self._freelist = []
+        self._freelist_dirty = False
         self._allocation_index_key = "_allocation_index"
         self._is_initialized_key = "_is_initialized"
 
@@ -41,6 +43,10 @@ class ByteFileDB:
 
     def close(self):
         if self.mapped_file:
+            # Persist freelist if dirty
+            if self._freelist_dirty:
+                self._save_freelist()
+                self._save_header()
             self.mapped_file.close()
             self.mapped_file = None
         if self.file_handle:
@@ -142,6 +148,7 @@ class ByteFileDB:
             self._initialize_header()
 
         self._header_dirty = False
+        self._load_freelist()
 
     def _initialize_header(self):
         """Initialize a fresh header."""
@@ -226,11 +233,82 @@ class ByteFileDB:
             self._save_header()
 
     # -------------------------------------------------------------------------
-    # Allocation management methods (Phase 1)
+    # Allocation management with freelist
     # -------------------------------------------------------------------------
+
+    _FREELIST_KEY = "_file_freelist"
+
+    def _load_freelist(self):
+        """Load file-level freelist from header."""
+        self._freelist = self._header_data.get(self._FREELIST_KEY, [])
+        self._freelist_dirty = False
+
+    def _save_freelist(self):
+        """Persist freelist to header (only if changed)."""
+        if not self._freelist_dirty:
+            return
+        self._header_data[self._FREELIST_KEY] = self._freelist
+        self._freelist_dirty = False
+        # The header will be flushed by set_header_field or end_batch
+
+    def free(self, address, size):
+        """Return a previously allocated block to the freelist.
+
+        The block can be reused by future allocate() calls.
+        Adjacent freed regions are merged automatically.
+
+        Args:
+            address: Start address of the block
+            size: Size in bytes
+        """
+        if size <= 0:
+            return
+
+        # Insert and merge with adjacent regions
+        self._freelist.append((address, size))
+        self._freelist.sort(key=lambda x: x[0])
+
+        # Merge adjacent
+        merged = []
+        for offset, sz in self._freelist:
+            if merged and merged[-1][0] + merged[-1][1] == offset:
+                merged[-1] = (merged[-1][0], merged[-1][1] + sz)
+            else:
+                merged.append((offset, sz))
+        self._freelist = merged
+        self._freelist_dirty = True
+
+    def _alloc_from_freelist(self, size):
+        """Try to allocate from freelist (best-fit).
+
+        Returns address if found, None otherwise.
+        """
+        best_idx = None
+        best_size = None
+
+        for i, (offset, sz) in enumerate(self._freelist):
+            if sz >= size:
+                if best_idx is None or sz < best_size:
+                    best_idx = i
+                    best_size = sz
+
+        if best_idx is not None:
+            offset, sz = self._freelist.pop(best_idx)
+            excess = sz - size
+            if excess > 0:
+                self._freelist.append((offset + size, excess))
+                self._freelist.sort(key=lambda x: x[0])
+            self._freelist_dirty = True
+            # Zero-fill to prevent stale data from being read
+            self.write(offset, b"\x00" * size)
+            return offset
+
+        return None
 
     def allocate(self, size):
         """Allocate a block of memory and return its address.
+
+        Tries the freelist first (best-fit), then bump-allocates.
 
         Args:
             size: Number of bytes to allocate
@@ -240,18 +318,31 @@ class ByteFileDB:
         """
         assert self.mapped_file, "DB is not open. Call open() first."
 
-        # Get current allocation index
+        # Try freelist first
+        addr = self._alloc_from_freelist(size)
+        if addr is not None:
+            # Persist freelist change with header
+            self._save_freelist()
+            if self._batch_mode:
+                self._header_dirty = True
+            else:
+                self._save_header()
+            return addr
+
+        # Bump-allocate
         current_index = self._header_data.get(
             self._allocation_index_key, self.header_size
         )
 
-        # Ensure file is large enough
         required_size = current_index + size
         if required_size > len(self.mapped_file):
             self._remap(required_size)
 
-        # Update allocation index (set_header_field persists immediately)
-        self.set_header_field(self._allocation_index_key, current_index + size)
+        self._header_data[self._allocation_index_key] = current_index + size
+        if self._batch_mode:
+            self._header_dirty = True
+        else:
+            self._save_header()
 
         return current_index
 

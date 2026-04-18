@@ -143,6 +143,17 @@ class Dict(DataStructure):
 
         self._cache = LRUCache(cache_size) if cache_size > 0 else None
 
+    def _alloc_value_addr(self):
+        """Allocate a value address, reusing freed slots first."""
+        if hasattr(self, "_value_freelist") and self._value_freelist:
+            return self._value_freelist.pop()
+        addr = (
+            self.values_block_addr
+            + self.next_data_offset * self._values_dataset.record_size
+        )
+        self.next_data_offset += 1
+        return addr
+
     def _get_capacity(self, p):
         return self.GROWTH_FACTOR**p
 
@@ -239,6 +250,7 @@ class Dict(DataStructure):
 
         # Track next free slot within the block
         self.next_data_offset = 0
+        self._value_freelist = []
 
         self.p_last = self._p_init
         self.size = 0
@@ -269,6 +281,7 @@ class Dict(DataStructure):
         self.values_block_addr = metadata.get("values_block_addr", 0)
         self.values_capacity = metadata.get("values_capacity", 0)
         self.next_data_offset = metadata.get("next_data_offset", 0)
+        self._value_freelist = metadata.get("value_freelist", [])
         self.use_bloom = metadata["use_bloom"]
         self._is_nested = metadata.get("is_nested", False)
         self._key_size = metadata.get("key_size", self.DEFAULT_KEY_SIZE)
@@ -480,6 +493,7 @@ class Dict(DataStructure):
             "is_nested": self._is_nested,
             "key_size": self._key_size,
             "initial_capacity": self._initial_capacity,
+            "value_freelist": getattr(self, "_value_freelist", []),
         }
         # Save per-table bloom filter names
         if self.use_bloom and self._blooms:
@@ -552,8 +566,12 @@ class Dict(DataStructure):
 
         # Key not found in any table
         if for_insert:
-            # Find a free slot in the LAST table (newest, where we insert)
-            return self._find_slot_in_table(key, key_hash, self.p_last, for_insert=True)
+            # Try all tables from newest to oldest — reuse deleted slots
+            for p in range(self.p_last, p_init - 1, -1):
+                result = self._find_slot_in_table(key, key_hash, p, for_insert=True)
+                if result is not None:
+                    return result
+            return None  # All tables full → caller creates a new table
         else:
             raise KeyError(key)
 
@@ -733,25 +751,15 @@ class Dict(DataStructure):
                         f"Expected {expected_type.__name__}, got {type(value)}"
                     )
                 ref = value.to_ref()
-                # Append to values dataset block, get address
-                value_addr = (
-                    self.values_block_addr
-                    + self.next_data_offset * self._values_dataset.record_size
-                )
+                value_addr = self._alloc_value_addr()
                 self._values_dataset[value_addr] = ref
-                self.next_data_offset += 1
             else:
                 if is_ref_value:
                     # Store pointer directly (no allocation/copy)
                     value_addr = int(value.addr)
                 else:
-                    # Compact: append to user's dataset block!
-                    value_addr = (
-                        self.values_block_addr
-                        + self.next_data_offset * self._values_dataset.record_size
-                    )
+                    value_addr = self._alloc_value_addr()
                     self._values_dataset[value_addr] = value
-                    self.next_data_offset += 1
 
             self._hash_table[entry_addr] = {
                 "hash": key_hash,
@@ -839,16 +847,10 @@ class Dict(DataStructure):
                 elif not isinstance(value, expected_type):
                     raise TypeError(f"Expected {expected_type.__name__}, got {type(value)}")
                 ref = value.to_ref()
-                value_addr = (
-                    self.values_block_addr
-                    + self.next_data_offset * self._values_dataset.record_size
-                )
+                value_addr = self._alloc_value_addr()
                 value_data = self._values_dataset._serialize(**ref)
             else:
-                value_addr = (
-                    self.values_block_addr
-                    + self.next_data_offset * self._values_dataset.record_size
-                )
+                value_addr = self._alloc_value_addr()
                 value_data = self._values_dataset._serialize(**value)
 
             # Hash table entry
@@ -866,7 +868,6 @@ class Dict(DataStructure):
                 writes.append((entry_addr, hash_data))
 
             # Update in-memory state after successful transaction
-            self.next_data_offset += 1
             self.size += 1
             # Add to the correct table's bloom filter
             p_init = getattr(self, "_p_init", self.P_INIT)
@@ -995,8 +996,12 @@ class Dict(DataStructure):
         if self._blooms and table_idx < len(self._blooms):
             self._blooms[table_idx].remove(key)
 
-        # Note: We don't delete from values_dataset (soft delete in hash table only)
-        # The data remains in the dataset but is inaccessible
+        # Return value slot to internal freelist for reuse
+        value_addr = int(entry["value_addr"])
+        if not hasattr(self, "_value_freelist"):
+            self._value_freelist = []
+        self._value_freelist.append(value_addr)
+
         self.size -= 1
         if self._cache and key in self._cache:
             del self._cache[key]
