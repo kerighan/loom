@@ -745,7 +745,8 @@ class Dict(DataStructure):
                 if value is None:
                     value = self._template.new(self._db, _parent=self)
                     value._parent_key = key  # Track key for update_nested_ref
-                    self._db._datastructures[value.name] = value
+                    # NOT registered in _datastructures — nested structures
+                    # are managed by their parent, cached in LRU
                 elif not isinstance(value, expected_type):
                     raise TypeError(
                         f"Expected {expected_type.__name__}, got {type(value)}"
@@ -843,7 +844,6 @@ class Dict(DataStructure):
                 if value is None:
                     value = self._template.new(self._db, _parent=self)
                     value._parent_key = key
-                    self._db._datastructures[value.name] = value
                 elif not isinstance(value, expected_type):
                     raise TypeError(f"Expected {expected_type.__name__}, got {type(value)}")
                 ref = value.to_ref()
