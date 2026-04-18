@@ -78,7 +78,7 @@ class List(DataStructure):
         }
 
     @classmethod
-    def get_shared_dataset_specs(cls, parent_name, inner_schema):
+    def get_shared_dataset_specs(cls, parent_name, inner_schema, **kwargs):
         """Get specifications for shared datasets needed when List is nested.
 
         When List is used as inner type (e.g., Dict[List] or List[List]),

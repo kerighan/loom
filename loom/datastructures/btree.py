@@ -165,7 +165,7 @@ class BTree(DataStructure):
         return int(value_addr)
 
     @classmethod
-    def get_shared_dataset_specs(cls, parent_name, inner_schema):
+    def get_shared_dataset_specs(cls, parent_name, inner_schema, **kwargs):
         node_schema = {
             "is_leaf": "bool",
             "num_keys": "uint16",

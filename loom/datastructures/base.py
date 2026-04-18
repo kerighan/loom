@@ -271,7 +271,7 @@ class DataStructure(ABC):
         }
 
     @classmethod
-    def get_shared_dataset_specs(cls, parent_name, inner_schema):
+    def get_shared_dataset_specs(cls, parent_name, inner_schema, **kwargs):
         """Get specifications for shared datasets needed when this type is nested.
 
         When a data structure is used as the inner type of a container

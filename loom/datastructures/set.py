@@ -104,7 +104,7 @@ class Set(DataStructure):
         }
 
     @classmethod
-    def get_shared_dataset_specs(cls, parent_name, inner_schema=None):
+    def get_shared_dataset_specs(cls, parent_name, inner_schema=None, **kwargs):
         """Get specifications for shared datasets needed when Set is nested.
 
         Set uses a Dict internally, which needs hash table and values datasets.

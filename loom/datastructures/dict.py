@@ -23,7 +23,7 @@ class Dict(DataStructure):
         return {"cache_size": "uint32", "use_bloom": "bool", "p_init": "uint32"}
 
     @classmethod
-    def get_shared_dataset_specs(cls, parent_name, inner_schema):
+    def get_shared_dataset_specs(cls, parent_name, inner_schema, key_size=50):
         """Get specifications for shared datasets needed when Dict is nested.
 
         When Dict is used as inner type (e.g., List[Dict] or Dict[Dict]),
@@ -32,6 +32,7 @@ class Dict(DataStructure):
         Args:
             parent_name: Name of the parent container
             inner_schema: Schema dict for dict values
+            key_size: Max key length for inner dict keys (default 50)
 
         Returns:
             Dict with shared dataset specifications
@@ -41,7 +42,7 @@ class Dict(DataStructure):
                 "name": f"_{parent_name}_shared_hash",
                 "schema": {
                     "hash": "uint64",
-                    "key": "U100",
+                    "key": f"U{key_size}",
                     "value_addr": "uint64",
                     "valid": "bool",
                 },
@@ -180,15 +181,15 @@ class Dict(DataStructure):
             self._values_dataset = self._parent._shared_values_dataset
             self.item_schema = self._extract_schema(self._values_dataset)
 
-            # Allocate our own block in the shared hash table
-            # Use smaller initial capacity for nested dicts (256 entries)
-            self._p_init = 8  # 2^8 = 256 entries (instance var, not class P_INIT)
+            # Allocate our own block in the shared hash table.
+            # Start very small (8 slots, 2^3) — most nodes in real-world graphs
+            # have low degree (power-law). Grows on demand via _create_new_table.
+            self._p_init = 3  # 2^3 = 8 slots
             capacity = self._get_capacity(self._p_init)
             first_table_addr = self._hash_table.allocate_block(capacity)
 
-            # Allocate our own block in the shared values dataset
-            # Use smaller capacity for nested dicts (256 entries)
-            initial_values_capacity = 256
+            # Same for the values block: start small, grow on demand
+            initial_values_capacity = 8
             self.values_block_addr = self._values_dataset.allocate_block(
                 initial_values_capacity
             )
@@ -223,7 +224,8 @@ class Dict(DataStructure):
                 inner_schema = self._extract_schema(self._template.dataset)
                 inner_class = self._template.ds_class
                 shared_specs = inner_class.get_shared_dataset_specs(
-                    f"dict_{self.name}", inner_schema
+                    f"dict_{self.name}", inner_schema,
+                    key_size=self._key_size,
                 )
 
                 # Create the shared datasets

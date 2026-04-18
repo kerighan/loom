@@ -685,7 +685,7 @@ class DB:
         self._save_datastructures_registry()  # Persist registry
         return btree
 
-    def create_graph(self, name, node_schema, edge_schema, directed=True):
+    def create_graph(self, name, node_schema, edge_schema, directed=True, node_id_max_len=50):
         """Create a persistent Graph.
 
         Args:
@@ -719,7 +719,7 @@ class DB:
         if name in self._datastructures:
             return self._datastructures[name]
 
-        g = Graph(name, self, node_schema, edge_schema, directed=directed)
+        g = Graph(name, self, node_schema, edge_schema, directed=directed, node_id_max_len=node_id_max_len)
         self._datastructures[name] = g
         self._save_datastructures_registry()
         return g

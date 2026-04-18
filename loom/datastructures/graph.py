@@ -51,8 +51,16 @@ class Graph(DataStructure):
         - remove_node:  O(degree)
     """
 
-    def __init__(self, name, db, node_schema, edge_schema, directed=True, _parent=None):
+    def __init__(self, name, db, node_schema, edge_schema, directed=True,
+                 node_id_max_len=50, _parent=None):
+        """
+        Args:
+            node_id_max_len: Max character length of node IDs (default 50).
+                Use a smaller value to save disk space when IDs are short
+                (e.g., 10 for numeric IDs "0"–"999999").
+        """
         self._directed = directed
+        self._node_id_max_len = node_id_max_len
         self._node_schema_input = node_schema
         self._edge_schema_input = edge_schema
         self.item_schema = None  # set after init
@@ -87,18 +95,20 @@ class Graph(DataStructure):
         # Edge datasets (shared by nested dicts)
         edge_ds = self._db.create_dataset(f"_graph_{self.name}_edges", **edge_dict)
 
+        key_size = self._node_id_max_len
+
         # Outgoing adjacency: src -> {dst -> edge_attrs}
         out_template = Dict.template(edge_ds, cache_size=0)
         self._out = Dict(
             f"_graph_{self.name}_out", self._db, out_template,
-            cache_size=1000, use_bloom=False,
+            cache_size=1000, use_bloom=False, key_size=key_size,
         )
 
         # Incoming adjacency: dst -> {src -> edge_attrs}
         in_template = Dict.template(edge_ds, cache_size=0)
         self._in = Dict(
             f"_graph_{self.name}_in", self._db, in_template,
-            cache_size=1000, use_bloom=False,
+            cache_size=1000, use_bloom=False, key_size=key_size,
         )
 
         self._node_schema = node_dict
@@ -114,6 +124,7 @@ class Graph(DataStructure):
         self._node_schema = metadata["node_schema"]
         self._edge_schema = metadata["edge_schema"]
         self._directed = metadata["directed"]
+        self._node_id_max_len = metadata.get("node_id_max_len", 50)
         # Inner structures are loaded lazily — they may not be in
         # _datastructures yet if the registry loop hasn't reached them.
         self._nodes = None
@@ -133,6 +144,7 @@ class Graph(DataStructure):
             "node_schema": self._node_schema,
             "edge_schema": self._edge_schema,
             "directed": self._directed,
+            "node_id_max_len": self._node_id_max_len,
         })
 
     # ---- Registry protocol ----
@@ -142,6 +154,7 @@ class Graph(DataStructure):
             "node_schema": self._node_schema,
             "edge_schema": self._edge_schema,
             "directed": self._directed,
+            "node_id_max_len": self._node_id_max_len,
         }
 
     @classmethod
@@ -151,6 +164,7 @@ class Graph(DataStructure):
             params["node_schema"],
             params["edge_schema"],
             directed=params.get("directed", True),
+            node_id_max_len=params.get("node_id_max_len", 50),
         )
 
     # ---- Node API ----
