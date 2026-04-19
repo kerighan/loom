@@ -15,6 +15,11 @@ from loom.fileio import ByteFileDB
 from loom.dataset import Dataset
 from loom.datastructures import BloomFilter, CountingBloomFilter, List, Set
 from loom.blob import BlobStore
+from loom.errors import (
+    DatabaseNotOpenError,
+    DuplicateNameError,
+    StructureNotFoundError,
+)
 
 
 class DB:
@@ -277,7 +282,7 @@ class DB:
                     dataset.insert({'id': i, 'content': 'hello'})
         """
         if not self._is_open:
-            raise RuntimeError("Database is not open. Call open() first.")
+            raise DatabaseNotOpenError()
         self._db.begin_batch()
         try:
             yield
@@ -286,7 +291,7 @@ class DB:
 
     def apply_writes(self, writes):
         if not self._is_open:
-            raise RuntimeError("Database is not open. Call open() first.")
+            raise DatabaseNotOpenError()
 
         if not writes:
             return
@@ -296,7 +301,7 @@ class DB:
     @contextmanager
     def write_batch(self):
         if not self._is_open:
-            raise RuntimeError("Database is not open. Call open() first.")
+            raise DatabaseNotOpenError()
 
         writes = []
         try:
@@ -330,7 +335,7 @@ class DB:
             users = db.create_dataset('users', User)
         """
         if not self._is_open:
-            raise RuntimeError("Database is not open. Call open() first.")
+            raise DatabaseNotOpenError()
 
         # Accept Pydantic model as positional arg
         if model is not None and not schema:
@@ -338,7 +343,7 @@ class DB:
             schema = schema_from_model(model)
 
         if dataset_name in self._datasets:
-            raise ValueError(f"Dataset '{dataset_name}' already exists")
+            raise DuplicateNameError(dataset_name)
 
         # Get next identifier
         identifier = self._get_next_identifier()
@@ -369,10 +374,10 @@ class DB:
             KeyError: If dataset doesn't exist
         """
         if not self._is_open:
-            raise RuntimeError("Database is not open. Call open() first.")
+            raise DatabaseNotOpenError()
 
         if name not in self._datasets:
-            raise KeyError(f"Dataset '{name}' not found")
+            raise StructureNotFoundError(name)
 
         return self._datasets[name]
 
@@ -392,7 +397,7 @@ class DB:
             users = db["users"]  # Get existing list/dataset by name
         """
         if not self._is_open:
-            raise RuntimeError("Database is not open. Call open() first.")
+            raise DatabaseNotOpenError()
 
         # Check data structures first (List, BloomFilter, etc.)
         if name in self._datastructures:
@@ -402,7 +407,7 @@ class DB:
         if name in self._datasets:
             return self._datasets[name]
 
-        raise KeyError(f"'{name}' not found in datasets or data structures")
+        raise StructureNotFoundError(name)
 
     def __contains__(self, name):
         """Check if a name exists in datasets or data structures."""
@@ -440,10 +445,10 @@ class DB:
             KeyError: If dataset doesn't exist
         """
         if not self._is_open:
-            raise RuntimeError("Database is not open. Call open() first.")
+            raise DatabaseNotOpenError()
 
         if name not in self._datasets:
-            raise KeyError(f"Dataset '{name}' not found")
+            raise StructureNotFoundError(name)
 
         del self._datasets[name]
         self._save_registry()
@@ -492,7 +497,7 @@ class DB:
                 print("Seen before")
         """
         if not self._is_open:
-            raise RuntimeError("Database is not open. Call open() first.")
+            raise DatabaseNotOpenError()
 
         # Return existing if already loaded
         if name in self._datastructures:
@@ -523,7 +528,7 @@ class DB:
             cbf.remove("item")  # Can remove!
         """
         if not self._is_open:
-            raise RuntimeError("Database is not open. Call open() first.")
+            raise DatabaseNotOpenError()
 
         # Return existing if already loaded
         if name in self._datastructures:
@@ -560,7 +565,7 @@ class DB:
             eng.append({'id': 1, 'name': 'Alice'})
         """
         if not self._is_open:
-            raise RuntimeError("Database is not open. Call open() first.")
+            raise DatabaseNotOpenError()
 
         # Return existing if already loaded
         if name in self._datastructures:
@@ -604,7 +609,7 @@ class DB:
             eng['alice'] = {'id': 1, 'name': 'Alice'}
         """
         if not self._is_open:
-            raise RuntimeError("Database is not open. Call open() first.")
+            raise DatabaseNotOpenError()
 
         from loom.datastructures.dict import Dict
 
@@ -645,7 +650,7 @@ class DB:
                 print("Alice is active")
         """
         if not self._is_open:
-            raise RuntimeError("Database is not open. Call open() first.")
+            raise DatabaseNotOpenError()
 
         # Return existing if already loaded
         if name in self._datastructures:
@@ -687,7 +692,7 @@ class DB:
                 print(key, value)
         """
         if not self._is_open:
-            raise RuntimeError("Database is not open. Call open() first.")
+            raise DatabaseNotOpenError()
 
         from loom.datastructures.btree import BTree
 
@@ -727,7 +732,7 @@ class DB:
             g.add_edge("alice", "bob", weight=0.9)
         """
         if not self._is_open:
-            raise RuntimeError("Database is not open. Call open() first.")
+            raise DatabaseNotOpenError()
 
         from loom.datastructures.graph import Graph
 

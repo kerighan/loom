@@ -190,9 +190,8 @@ class ByteFileDB:
         max_data = self._slot_size - 8
 
         if data_size > max_data:
-            raise ValueError(
-                f"Header data too large: {data_size} bytes (max {max_data})"
-            )
+            from loom.errors import HeaderTooLargeError
+            raise HeaderTooLargeError(data_size, max_data)
 
         slot_bytes = b"LOOM" + np.uint32(data_size).tobytes() + pickled_data
         slot_bytes += b"\x00" * (self._slot_size - len(slot_bytes))

@@ -13,6 +13,7 @@ import os
 import tempfile
 import pytest
 from loom.database import DB
+from loom.errors import DuplicateNameError, StructureNotFoundError, DatabaseNotOpenError
 
 
 class TestDatabaseBasics:
@@ -107,7 +108,7 @@ class TestDatasetCreation:
             with DB(filename) as db:
                 db.create_dataset("users", id="uint64", name="U50")
 
-                with pytest.raises(ValueError, match="already exists"):
+                with pytest.raises(DuplicateNameError):
                     db.create_dataset("users", id="uint64", email="U100")
         finally:
             if os.path.exists(filename):
@@ -240,7 +241,7 @@ class TestDatasetRetrieval:
 
         try:
             with DB(filename) as db:
-                with pytest.raises(KeyError, match="not found"):
+                with pytest.raises(StructureNotFoundError):
                     db.get_dataset("nonexistent")
         finally:
             if os.path.exists(filename):
@@ -371,7 +372,7 @@ class TestDatasetDeletion:
 
         try:
             with DB(filename) as db:
-                with pytest.raises(KeyError, match="not found"):
+                with pytest.raises(StructureNotFoundError):
                     db.delete_dataset("nonexistent")
         finally:
             if os.path.exists(filename):

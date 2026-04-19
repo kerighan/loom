@@ -200,7 +200,9 @@ class DataStructure(ABC):
         if shared is not None:
             if hint_size <= 0:
                 return NullCache()
-            ns = f"{type(self).__name__}:{self.name}:{suffix}"
+            # Use id(self) — unique per Python object, no collision
+            # even if two structures share the same name.
+            ns = f"{id(self)}:{suffix}"
             return NamespacedCache(shared, ns)
 
         # Standalone fallback (no shared cache configured)

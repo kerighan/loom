@@ -1,6 +1,11 @@
 import numpy as np
 
 from loom.ref import Ref
+from loom.errors import (
+    InvalidIdentifierError,
+    DeletedRecordError,
+    WrongDatasetError,
+)
 
 # Blob reference dtype: (offset: uint64, n_slots: uint16)
 # Total 10 bytes per blob field
@@ -41,7 +46,7 @@ class Dataset:
             Dataset('messages', db, 1, id='uint64', content='text')
         """
         if not (1 <= identifier <= 127):
-            raise ValueError(f"Identifier must be 1-127, got {identifier}")
+            raise InvalidIdentifierError(identifier)
 
         self.name = dataset_name
         self.db = db
@@ -182,13 +187,11 @@ class Dataset:
         prefix = data[0:1]
 
         if prefix == self._deleted_prefix:
-            raise ValueError(f"Record at {address} is deleted")
+            raise DeletedRecordError(address)
 
         if prefix != self._valid_prefix:
-            prefix_val = np.frombuffer(prefix, dtype="int8")[0]
-            raise ValueError(
-                f"Wrong dataset at {address}: expected {self.identifier}, got {prefix_val}"
-            )
+            prefix_val = int(np.frombuffer(prefix, dtype="int8")[0])
+            raise WrongDatasetError(address, self.identifier, prefix_val)
 
         return self._deserialize(data)
 

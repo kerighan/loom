@@ -16,6 +16,11 @@ import pytest
 import numpy as np
 from loom.fileio import ByteFileDB
 from loom.dataset import Dataset
+from loom.errors import (
+    InvalidIdentifierError,
+    DeletedRecordError,
+    WrongDatasetError,
+)
 
 
 class TestDatasetBasics:
@@ -58,13 +63,13 @@ class TestDatasetBasics:
             Dataset("test127", db, 127, field="int32")
 
             # Invalid identifiers
-            with pytest.raises(ValueError):
+            with pytest.raises(InvalidIdentifierError):
                 Dataset("test0", db, 0, field="int32")
 
-            with pytest.raises(ValueError):
+            with pytest.raises(InvalidIdentifierError):
                 Dataset("test128", db, 128, field="int32")
 
-            with pytest.raises(ValueError):
+            with pytest.raises(InvalidIdentifierError):
                 Dataset("test_neg", db, -1, field="int32")
 
             db.close()
@@ -216,7 +221,7 @@ class TestMultipleDatasets:
             users.write(addr, id=1, name="Alice")
 
             # Try to read with wrong dataset
-            with pytest.raises(ValueError, match="Wrong dataset"):
+            with pytest.raises(WrongDatasetError):
                 posts.read(addr)
 
             db.close()
@@ -284,7 +289,7 @@ class TestSoftDeletes:
             assert users.is_deleted(addr)
 
             # Reading deleted record should fail
-            with pytest.raises(ValueError, match="deleted"):
+            with pytest.raises(DeletedRecordError):
                 users.read(addr)
 
             db.close()
