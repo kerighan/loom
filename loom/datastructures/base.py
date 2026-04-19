@@ -225,11 +225,17 @@ class DataStructure(ABC):
             Schema dict mapping field names to dtype strings
         """
         if hasattr(dataset_or_dict, "user_schema"):
-            # It's a Dataset object - extract schema
-            return {
-                name: str(dataset_or_dict.user_schema.fields[name][0])
-                for name in dataset_or_dict.user_schema.names
-            }
+            # It's a Dataset object — extract schema, preserving "text"/"blob" markers
+            ds = dataset_or_dict
+            result = {}
+            for name in ds.user_schema.names:
+                if hasattr(ds, "_text_fields") and name in ds._text_fields:
+                    result[name] = "text"
+                elif hasattr(ds, "_blob_fields") and name in ds._blob_fields:
+                    result[name] = "blob"
+                else:
+                    result[name] = str(ds.user_schema.fields[name][0])
+            return result
         else:
             # Already a dict
             return dataset_or_dict

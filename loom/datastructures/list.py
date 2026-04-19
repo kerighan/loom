@@ -856,8 +856,30 @@ class List(DataStructure):
                 if take <= 0:
                     break
 
-                # Read directly as NumPy array (fast!)
                 item_addr = block_addr + offset * self._items_dataset.record_size
+
+                # If dataset has text/blob fields, use slow path so _deserialize
+                # resolves blob references → actual strings.
+                # Otherwise use the fast numpy bulk-read path.
+                has_variable = bool(
+                    getattr(self._items_dataset, "_text_fields", None) or
+                    getattr(self._items_dataset, "_blob_fields", None)
+                )
+
+                if has_variable:
+                    raw_items = self._items_dataset.read_many(item_addr, take)
+                    for item in raw_items:
+                        d = {k: v for k, v in item.items() if k != "valid"}
+                        if self._is_nested:
+                            items.append(self._resolve_nested_ref(d))
+                        else:
+                            items.append(d)
+                    remaining -= len(raw_items)
+                    block_idx += 1
+                    offset = 0
+                    continue
+
+                # Fast numpy path (no text/blob fields)
                 arr = self._items_dataset.read_many(item_addr, take, as_array=True)
 
                 # Convert to dicts only at the end
