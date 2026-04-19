@@ -2,11 +2,32 @@
 Pydantic model → loom schema conversion.
 
 Maps Python/Pydantic types to numpy dtypes used by Dataset:
-    int       → int64
-    float     → float64
-    bool      → bool
-    str       → text   (variable-length via BlobStore)
-    str(max_length=N) → U{N}  (fixed-length numpy unicode)
+    int                         → int64
+    float                       → float64
+    bool                        → bool
+    str                         → text   (variable-length via BlobStore)
+    str with max_length         → U{N}   (fixed-length numpy unicode)
+
+Three equivalent ways to declare a fixed-length string field:
+
+    # 1. Field(max_length=N)  — most concise, standard Pydantic v2
+    from pydantic import Field
+    class M(BaseModel):
+        name: str = Field(max_length=20)
+
+    # 2. Annotated + StringConstraints
+    from pydantic import StringConstraints
+    from typing import Annotated
+    class M(BaseModel):
+        name: Annotated[str, StringConstraints(max_length=20)]
+
+    # 3. FixedStr(N) helper — shortest
+    from loom.schema import FixedStr
+    class M(BaseModel):
+        name: FixedStr(20)
+
+All three produce U20 (80 bytes per record, fast lookups).
+Use plain `str` for variable-length content (→ text, compressed BlobStore).
 
 Usage:
     from pydantic import BaseModel
@@ -90,3 +111,23 @@ def schema_from_model(model_class) -> dict[str, str]:
     for name, field_info in model_class.model_fields.items():
         schema[name] = _resolve_type(field_info.annotation, field_info)
     return schema
+
+
+def FixedStr(max_length: int):
+    """Shorthand for a fixed-length string field (→ U{max_length}).
+
+    Use inside Pydantic models for fields that need fast lookups or
+    are used as keys, where a fixed max length is known upfront.
+    Plain `str` gives variable-length text instead.
+
+    Example:
+        from loom.schema import FixedStr
+
+        class User(BaseModel):
+            username: FixedStr(50)   # → U50, fast dict key
+            email:    FixedStr(100)  # → U100
+            bio:      str            # → text, variable-length
+    """
+    from pydantic import StringConstraints
+    from typing import Annotated
+    return Annotated[str, StringConstraints(max_length=max_length)]
