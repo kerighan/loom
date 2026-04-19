@@ -1187,10 +1187,23 @@ class Dict(DataStructure):
             raw = self._values_dataset.db.read(block_start, total)
             arr = np.frombuffer(raw, dtype=self._values_dataset.schema)
 
-            result = {}
             ds = self._values_dataset
-            has_text = bool(ds._text_fields)
-            has_blob = bool(ds._blob_fields)
+            has_variable = bool(ds._text_fields or ds._blob_fields)
+
+            if not has_variable:
+                # Pure fast path: all fields are fixed-size numpy, no blobs
+                result = {}
+                for key, addr in entries:
+                    idx = (addr - block_start) // record_size
+                    rec = arr[idx]
+                    result[key] = {f: rec[f] for f in ds.user_schema.names}
+                return result
+
+            # Pass 1 — extract fixed fields from numpy, collect blob refs
+            # pending_blobs: list of (file_offset, key, field_name, is_text)
+            #   sorted by file_offset in pass 2 for sequential I/O
+            result = {}
+            pending_blobs = []
 
             for key, addr in entries:
                 idx = (addr - block_start) // record_size
@@ -1200,14 +1213,31 @@ class Dict(DataStructure):
                     if field in ds._text_fields:
                         val = rec[field]
                         off, ns = int(val["offset"]), int(val["n_slots"])
-                        d[field] = "" if (off == 0 and ns == 0) else ds.blob_store.read(off).decode("utf-8")
+                        if off == 0 and ns == 0:
+                            d[field] = ""
+                        else:
+                            d[field] = None          # placeholder
+                            pending_blobs.append((off, key, field, True))
                     elif field in ds._blob_fields:
                         val = rec[field]
                         off, ns = int(val["offset"]), int(val["n_slots"])
-                        d[field] = None if (off == 0 and ns == 0) else (off, ns)
+                        if off == 0 and ns == 0:
+                            d[field] = None
+                        else:
+                            d[field] = None          # placeholder
+                            pending_blobs.append((off, key, field, False))
                     else:
                         d[field] = rec[field]
                 result[key] = d
+
+            # Pass 2 — resolve blobs in file-offset order (sequential I/O,
+            # better page-cache and TLB behaviour on large datasets)
+            if pending_blobs:
+                pending_blobs.sort(key=lambda x: x[0])
+                for off, key, field, is_text in pending_blobs:
+                    raw_blob = ds.blob_store.read(off)
+                    result[key][field] = raw_blob.decode("utf-8") if is_text else raw_blob
+
             return result
 
         # 3) Fallback: individual reads (nested dicts, or scattered addresses)
