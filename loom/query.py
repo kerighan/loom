@@ -351,6 +351,41 @@ def parse_limit(query_str: str) -> tuple[str, int | None]:
 
 
 # ---------------------------------------------------------------------------
+# Seed extraction — skip full-scan when WHERE pins the starting node
+# ---------------------------------------------------------------------------
+
+def _extract_src_seeds(where_str: str | None, src_var: str) -> list[str] | None:
+    """Return explicit source node IDs from WHERE, or None for full scan.
+
+    Detects:
+        WHERE id(src_var) == "X"        → ["X"]
+        WHERE id(src_var) IN ["X","Y"]  → ["X","Y"]
+    Other conditions require a full scan and return None.
+    """
+    if not where_str:
+        return None
+
+    # id(var) == "value" — single node
+    m = re.search(
+        rf'id\({re.escape(src_var)}\)\s*==\s*["\']([^"\']+)["\']',
+        where_str, re.IGNORECASE
+    )
+    if m:
+        return [m.group(1)]
+
+    # id(var) IN ["a","b",...]
+    m2 = re.search(
+        rf'id\({re.escape(src_var)}\)\s+IN\s+(\[[^\]]+\])',
+        where_str, re.IGNORECASE
+    )
+    if m2:
+        return [_parse_value(x) for x in
+                re.findall(r'["\']([^"\']+)["\']', m2.group(1))]
+
+    return None   # no seed → full scan
+
+
+# ---------------------------------------------------------------------------
 # Execution helpers
 # ---------------------------------------------------------------------------
 
@@ -396,34 +431,60 @@ def _iter_neighbors(graph, node_id: str, direction: str):
 # Query executor
 # ---------------------------------------------------------------------------
 
+def _node_iter(graph, seeds: list[str] | None):
+    """Yield (node_id, node_attrs) — seeded or full bulk scan."""
+    nodes = graph._nodes
+    if seeds is not None:
+        # Fast path: direct lookups for specific IDs
+        for nid in seeds:
+            try:
+                yield nid, nodes[nid]
+            except KeyError:
+                pass
+    else:
+        # Full scan: bulk-load all node attrs in one mmap read
+        yield from nodes.to_dict().items()
+
+
 def _execute_1hop(graph, pat: dict, where_func, return_str: str | None,
-                  inline_where) -> Iterator[dict]:
-    """Fast path for single-hop (min=max=1) patterns."""
+                  inline_where, src_seeds: list[str] | None = None) -> Iterator[dict]:
+    """Fast path for single-hop (min=max=1) patterns.
+
+    If src_seeds is provided (from seed extraction), only those nodes
+    are iterated instead of the full node set.
+    """
     src_var = pat["src_var"]
     dst_var = pat["dst_var"]
     edge_var = pat["edge_var"]
     direction = pat["direction"]
+    inline_src = (inline_where or {}).get(src_var, {})
+    inline_dst = (inline_where or {}).get(dst_var, {})
 
     nodes = graph._nodes
 
-    for src_id in list(nodes.keys()):
-        src_data = nodes[src_id]
+    # If no seeds and no inline src props: bulk-load all node attrs once
+    # to avoid N separate Dict lookups during the scan.
+    if src_seeds is None and not inline_src:
+        all_nodes = nodes.to_dict()
+    else:
+        all_nodes = None
 
+    for src_id, src_data in _node_iter(graph, src_seeds):
         # Apply inline src props
-        if inline_where and not all(src_data.get(k) == v for k, v in inline_where.get(src_var, {}).items()):
+        if inline_src and not all(src_data.get(k) == v for k, v in inline_src.items()):
             continue
 
-        if src_id not in graph._out and direction in ("out", "both"):
-            if direction == "out":
-                continue
-        if src_id not in graph._in and direction == "in":
+        if direction == "out" and src_id not in graph._out:
+            continue
+        if direction == "in" and src_id not in graph._in:
             continue
 
         for dst_id, edge_data in _iter_neighbors(graph, src_id, direction):
-            dst_data = nodes.get(dst_id, {})
+            dst_data = (all_nodes.get(dst_id) if all_nodes is not None
+                        else nodes.get(dst_id, {})) or {}
 
             # Apply inline dst props
-            if inline_where and not all(dst_data.get(k) == v for k, v in inline_where.get(dst_var, {}).items()):
+            if inline_dst and not all(dst_data.get(k) == v for k, v in inline_dst.items()):
                 continue
 
             bindings = {src_var: src_data, dst_var: dst_data}
@@ -436,7 +497,7 @@ def _execute_1hop(graph, pat: dict, where_func, return_str: str | None,
 
 
 def _execute_nhop(graph, pat: dict, where_func, return_str: str | None,
-                  inline_where) -> Iterator[dict]:
+                  inline_where, src_seeds: list[str] | None = None) -> Iterator[dict]:
     """BFS for variable-length paths (min_hops..max_hops)."""
     src_var = pat["src_var"]
     dst_var = pat["dst_var"]
@@ -451,9 +512,7 @@ def _execute_nhop(graph, pat: dict, where_func, return_str: str | None,
     inline_src = (inline_where or {}).get(src_var, {})
     inline_dst = (inline_where or {}).get(dst_var, {})
 
-    for src_id in list(nodes.keys()):
-        src_data = nodes[src_id]
-
+    for src_id, src_data in _node_iter(graph, src_seeds):
         if inline_src and not all(src_data.get(k) == v for k, v in inline_src.items()):
             continue
 
@@ -527,23 +586,30 @@ def execute_query(graph, query_str: str) -> Iterator[dict]:
 
     where_func = parse_where(where_str)
 
+    # Seed extraction: if WHERE pins id(src_var), skip full node scan
+    src_seeds = _extract_src_seeds(where_str, pat["src_var"])
+
     is_1hop = (pat["min_hops"] == 1 and pat["max_hops"] == 1)
     is_optional = (pat["min_hops"] == 0 and pat["max_hops"] == 1)
 
     if is_1hop:
-        gen = _execute_1hop(graph, pat, where_func, return_str, inline_where)
+        gen = _execute_1hop(graph, pat, where_func, return_str, inline_where,
+                            src_seeds=src_seeds)
     elif is_optional:
         # 0..1 hop: include both self-match and 1-hop matches
         pat0 = {**pat, "min_hops": 0, "max_hops": 0}
         pat1 = {**pat, "min_hops": 1, "max_hops": 1}
         gen = (
             r for g in (
-                _execute_nhop(graph, pat0, where_func, return_str, inline_where),
-                _execute_1hop(graph, pat1, where_func, return_str, inline_where),
+                _execute_nhop(graph, pat0, where_func, return_str, inline_where,
+                              src_seeds=src_seeds),
+                _execute_1hop(graph, pat1, where_func, return_str, inline_where,
+                              src_seeds=src_seeds),
             ) for r in g
         )
     else:
-        gen = _execute_nhop(graph, pat, where_func, return_str, inline_where)
+        gen = _execute_nhop(graph, pat, where_func, return_str, inline_where,
+                            src_seeds=src_seeds)
 
     count = 0
     for result in gen:
