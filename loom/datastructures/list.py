@@ -215,7 +215,7 @@ class List(DataStructure):
             self._initialize()
 
         # Initialize block cache
-        self._block_cache = LRUCache(cache_size) if cache_size > 0 else None
+        self._block_cache = self._make_cache("blocks", cache_size)
 
     def _initialize(self):
         """Initialize new list."""
@@ -1275,9 +1275,7 @@ class List(DataStructure):
             instance._template = None
             instance._shared_items_dataset = None
             instance.cache_size = int(ref["cache_size"])
-            instance._block_cache = (
-                LRUCache(instance.cache_size) if instance.cache_size > 0 else None
-            )
+            instance._block_cache = instance._make_cache("blocks", instance.cache_size)
             instance._auto_save_interval = 0  # Don't auto-save nested lists
             instance._ops_since_save = 0
             instance._inline_metadata = None

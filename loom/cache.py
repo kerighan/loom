@@ -140,6 +140,77 @@ class LRUCache:
         return f"LRUCache(capacity={self.capacity}, size={len(self)})"
 
 
+class NamespacedCache:
+    """Prefixed view into a shared LRUCache.
+
+    Multiple data structures share one LRU cache. Each structure gets
+    its own namespace so keys can't collide. A generation counter lets
+    clear() logically invalidate all entries without scanning the cache
+    (old entries are simply never matched again and get evicted by LRU).
+
+    Key format: (namespace, generation, item_key)
+
+    Usage:
+        shared = LRUCache(capacity=50_000)
+        cache_a = NamespacedCache(shared, "dict_users")
+        cache_b = NamespacedCache(shared, "dict_posts")
+
+        cache_a["alice"] = 42
+        cache_b["hello"] = 99
+        cache_a.clear()          # only invalidates cache_a entries
+    """
+
+    def __init__(self, shared: LRUCache, namespace: str):
+        self._shared = shared
+        self._ns = namespace
+        self._gen = 0
+
+    def _k(self, key: Any):
+        return (self._ns, self._gen, key)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        return self._shared.get(self._k(key), default)
+
+    def set(self, key: Any, value: Any) -> None:
+        self._shared[self._k(key)] = value
+
+    def invalidate(self, key: Any) -> None:
+        self._shared.invalidate(self._k(key))
+
+    def clear(self) -> None:
+        """Logically invalidate all entries by bumping the generation.
+
+        Old entries remain in the shared cache until evicted by LRU
+        pressure — no O(n) scan needed.
+        """
+        self._gen += 1
+
+    @property
+    def hit_rate(self) -> float:
+        return self._shared.hit_rate
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        self._shared[self._k(key)] = value
+
+    def __getitem__(self, key: Any) -> Any:
+        return self._shared[self._k(key)]
+
+    def __delitem__(self, key: Any) -> None:
+        del self._shared[self._k(key)]
+
+    def __contains__(self, key: Any) -> bool:
+        return self._k(key) in self._shared
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __len__(self) -> int:
+        return 0  # accurate count per-namespace would require a scan
+
+    def __repr__(self) -> str:
+        return f"NamespacedCache(ns={self._ns!r}, gen={self._gen}, shared={self._shared!r})"
+
+
 class NullCache:
     """Null object pattern - cache that does nothing.
 

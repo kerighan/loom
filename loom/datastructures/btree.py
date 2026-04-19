@@ -113,7 +113,7 @@ class BTree(DataStructure):
             self._initialize()
 
         # Node cache for performance
-        self._node_cache = LRUCache(cache_size) if cache_size > 0 else None
+        self._node_cache = self._make_cache("nodes", cache_size)
 
     @classmethod
     def _get_nested_ref_schema(cls):
@@ -522,9 +522,7 @@ class BTree(DataStructure):
                 instance._legacy_values_block_addrs = None
 
             instance._initial_capacity = 0
-            instance._node_cache = (
-                LRUCache(instance.cache_size) if instance.cache_size > 0 else None
-            )
+            instance._node_cache = instance._make_cache("nodes", instance.cache_size)
 
             return instance
 

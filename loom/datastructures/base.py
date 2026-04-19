@@ -180,6 +180,34 @@ class DataStructure(ABC):
         """
         return self._db.get_dataset(dataset_name)
 
+    def _make_cache(self, suffix: str, hint_size: int):
+        """Create a cache for this structure.
+
+        If the DB has a shared cache, returns a NamespacedCache (shared
+        budget, one LRU for the whole DB).  Otherwise falls back to a
+        standalone LRUCache of hint_size — backward-compatible behaviour
+        when DB was created without cache_size.
+
+        Args:
+            suffix:    Short label appended to the namespace key,
+                       e.g. "values", "nodes", "blocks".
+            hint_size: Desired standalone capacity (used only if no
+                       shared cache exists). 0 → NullCache.
+        """
+        from loom.cache import LRUCache, NamespacedCache, NullCache
+
+        shared = getattr(self._db, "_shared_cache", None)
+        if shared is not None:
+            if hint_size <= 0:
+                return NullCache()
+            ns = f"{type(self).__name__}:{self.name}:{suffix}"
+            return NamespacedCache(shared, ns)
+
+        # Standalone fallback (no shared cache configured)
+        if hint_size > 0:
+            return LRUCache(hint_size)
+        return NullCache()
+
     def _auto_save_check(self):
         """Check if auto-save should trigger and save if needed.
 

@@ -53,6 +53,7 @@ class DB:
         auto_open=True,
         blob_compression="brotli",
         auto_save_interval=100,
+        cache_size=0,
     ):
         """Initialize database.
 
@@ -66,9 +67,23 @@ class DB:
                 data structure.  Lower = safer (less data lost on crash),
                 higher = faster.  Use 0 to disable (manual save only).
                 Default: 100.
+            cache_size: Total number of entries shared across ALL data
+                structures in this DB.  0 (default) = per-structure caches
+                with their own individual sizes (backward-compatible).
+                Set to a positive integer to activate the shared cache:
+                    DB(path, cache_size=50_000)  # 50K entries total
+                This lets hot structures grow their share naturally via LRU
+                without pre-allocating per-structure budgets.
         """
         self.filename = filename
         self.auto_save_interval = auto_save_interval
+
+        # Shared cache: one LRU for the entire DB, namespaced per-structure
+        if cache_size > 0:
+            from loom.cache import LRUCache
+            self._shared_cache = LRUCache(cache_size)
+        else:
+            self._shared_cache = None
         self._db = ByteFileDB(filename, initial_size, header_size)
         self._datasets = {}  # name -> Dataset instance
         self._datastructures = {}  # name -> DataStructure instance

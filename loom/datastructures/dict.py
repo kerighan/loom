@@ -5,7 +5,7 @@ import mmh3
 from loom.datastructures.base import DataStructure
 from loom.datastructures.template import DataStructureTemplate
 from loom.datastructures.counting_bloomfilter import CountingBloomFilter
-from loom.cache import LRUCache
+from loom.cache import LRUCache  # kept for Set.template usage in this module
 from loom.ref import Ref
 
 
@@ -142,7 +142,7 @@ class Dict(DataStructure):
         else:
             self._initialize()
 
-        self._cache = LRUCache(cache_size) if cache_size > 0 else None
+        self._cache = self._make_cache("values", cache_size)
 
     def _alloc_value_addr(self):
         """Allocate a value address, reusing freed slots first."""
@@ -439,9 +439,7 @@ class Dict(DataStructure):
             instance._shared_hash_table = None
             instance._shared_values_dataset = None
             instance.cache_size = int(ref["cache_size"])
-            instance._cache = (
-                LRUCache(instance.cache_size) if instance.cache_size > 0 else None
-            )
+            instance._cache = instance._make_cache("values", instance.cache_size)
             instance._blooms = []
             instance.use_bloom = False
             instance._auto_save_interval = 0
