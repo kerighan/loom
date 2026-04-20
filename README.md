@@ -82,18 +82,23 @@ db.create_dataset("events", id="uint32", ts="int64", kind="U20")
 # Open (creates if not exists)
 db = DB("mydata.db")
 
-# Context manager (recommended — auto-saves on exit)
+# Context manager (recommended — auto-saves and flushes on exit)
 with DB("mydata.db",
         blob_compression="brotli",   # "brotli" | "zlib" | None
-        auto_save_interval=100,       # metadata flush frequency (default 100)
+        auto_save_interval=100,       # metadata save frequency (default 100)
         cache_size=50_000,            # shared LRU entries across ALL structures
+        sync_writes=False,            # False=fast (flush on close), True=safe (flush every write)
 ) as db:
     ...
 
-# Bulk inserts — defer header flushes for 10–100x speedup
+# db.batch() is useful mainly for text/blob fields — for fixed schemas the
+# lazy flush already makes per-call inserts as fast as batch inserts.
 with db.batch():
     for item in large_dataset:
         my_dict[item["key"]] = item
+
+# Long-running servers: call flush() periodically instead of sync_writes=True
+db.flush()  # force mmap writeback without closing
 ```
 
 ---
@@ -229,7 +234,7 @@ g.add_node("alice", name="Alice", age=30)
 g.add_node("bob",   name="Bob",   age=25)
 g.add_edge("alice", "bob", weight=0.9, since=2022)
 
-# Bulk insert (75x faster than per-call for large graphs)
+# Bulk insert (recommended for large graphs — slightly lower overhead)
 g.add_nodes([("alice", {"name": "Alice", "age": 30}),
              ("bob",   {"name": "Bob",   "age": 25})])
 g.add_edges([("alice", "bob",   {"weight": 0.9, "since": 2022}),
@@ -363,84 +368,60 @@ LoomError
 
 ## Performance
 
-Benchmarks on a modern laptop (Linux, SSD), 10 000 operations.
+All benchmarks: modern laptop (Linux, SSD), `sync_writes=False` (default — durable on `close()`).
 
-### loom vs SqliteDict
+### loom vs SqliteDict — 10 000 ops, fixed schema
 
-Benchmarks on 10 000 operations, fixed schema (no text/blob fields).
+| Operation | **loom** | **SqliteDict** | Ratio |
+|---|---:|---:|---:|
+| Dict insert | **23 500 ops/s** | 5 800 ops/s | loom **4×** |
+| Dict insert, batch | **23 500 ops/s** | **45 200 ops/s** | SQLite 2× |
+| Dict read | **46 800 ops/s** | 13 300 ops/s | loom **3.5×** |
+| Dict contains | **66 600 ops/s** | 14 400 ops/s | loom **4.6×** |
+| Dict keys() | **670 000 ops/s** | 120 000 ops/s | loom **5.6×** |
 
-| Operation | **loom** | **SqliteDict** | Notes |
-|---|---:|---:|---|
-| Dict insert, no batch | **23 500 ops/s** | 5 800 ops/s | loom **4×** faster — lazy mmap flush vs. per-op SQLite COMMIT |
-| Dict insert, **batch** | **23 500 ops/s** | **45 200 ops/s** | SQLite wins: defers all I/O to one COMMIT. loom batch() mainly helps for blobby text fields. |
-| **Dict read** | **46 800 ops/s** | 13 300 ops/s | loom **3.5×** faster — mmap zero-copy |
-| **Dict contains** | **66 600 ops/s** | 14 400 ops/s | loom **4.6×** faster — bloom filter |
-| **Dict keys()** | **670 000 ops/s** | 120 000 ops/s | loom **5.6×** faster — bulk numpy read |
+loom uses lazy mmap flush — no `msync()` per write, just OS page-cache writeback. Inserts are **4× faster** than SqliteDict per-call. SqliteDict's batch commit wins by deferring all I/O to a single `COMMIT`; for loom, insert-no-batch ≈ insert-batch since the flush is already lazy.
 
-loom inserts are now **4× faster** than SqliteDict per-call because loom no longer flushes the mmap on every write — the OS page cache handles writeback. Full durability is guaranteed on `close()` (or via `db.flush()` / `sync_writes=True` for server workloads).
-
-**Dict insert batch ≈ no-batch** since the flush is already lazy. `db.batch()` still helps for text/blob fields (defers blob BlobStore saves) and for concurrent reader visibility.
-
-### loom operations reference
-
-All figures with default `sync_writes=False` (lazy flush, durable on `close()`).
+### loom operations — all structures
 
 | Structure | Operation | ops/s | µs/op |
 |---|---|---:|---:|
 | Dict | insert | 23 500 | 43 |
 | Dict | read | 46 800 | 21 |
-| Dict | contains (bloom) | 66 600 | 15 |
+| Dict | contains | 66 600 | 15 |
 | Dict | keys() | 670 000 | 1.5 |
-| Dict | items() | 155 800 | 6.4 |
+| Dict | items() | 155 800 | 6 |
 | List | append | 84 100 | 12 |
 | List | read[i] | 141 000 | 7 |
-| Queue | push (batch) | 258 000 | 3.9 |
-| Queue | pop | 273 000 | 3.7 |
+| Queue | push (batch) | 258 000 | 4 |
+| Queue | pop | 273 000 | 4 |
 
-Note: `db.batch()` no longer makes a meaningful difference for fixed-schema Dicts and Lists — the lazy flush already removes the sync overhead. `batch()` is still useful for text/blob fields (defers BlobStore metadata flushes).
+### `str` (text) fields — impact of variable-length blobs
 
-### Impact of text (`str`) fields
+`str` fields bypass the fixed record and write to a separate BlobStore — slower but space-efficient.
 
 | Schema | Compression | insert | read |
 |---|---|---:|---:|
 | Fixed fields only | — | 23 500 ops/s | 46 800 ops/s |
-| + `str` body field | None | 13 100 ops/s | 39 200 ops/s |
-| + `str` body field | brotli | 1 920 ops/s | 26 700 ops/s |
+| + `str` body | None | 13 100 ops/s | 39 200 ops/s |
+| + `str` body | brotli | 1 920 ops/s | 26 700 ops/s |
 
-Text/blob inserts are still slower because each `str` field writes compressed data to the BlobStore (CPU-bound for brotli, allocation-bound for uncompressed).
+- `blob_compression=None` — fastest writes, larger files.
+- `"brotli"` — 3–5× compression on natural language, CPU-bound writes.
+- `Field(max_length=N)` — keeps the field in the fixed record, no BlobStore at all.
 
 ### Graph — Barabási-Albert scale-free network (m=2)
 
-The lazy flush now makes per-call `add_edge()` and batch `add_edges()` nearly equivalent (1.2× difference, down from 75× before). Both are usable; `add_edges()` is still recommended for clarity and slightly lower overhead.
+Per-call `add_edge()` and batch `add_edges()` are now nearly equivalent (lazy flush removed the 75× gap). Use `add_edges()` for large ingestions — cleaner and slightly lower overhead.
 
-```python
-# Both are now fast
-g.add_edge("alice", "bob", weight=0.9)        # per-call: OK
-
-g.add_edges([                                  # batch: marginally faster
-    ("alice", "bob",   {"weight": 0.9}),
-    ("alice", "carol", {"weight": 0.5}),
-])
-```
-
-| Nodes | Edges | add_node µs | add_edge µs | total | disk used |
+| Nodes | Edges | node µs | edge µs | total | disk |
 |---|---|---:|---:|---:|---:|
 | 5 000 | 9 996 | 370 | 246 | 4.3 s | 25 MB |
 | 20 000 | 39 996 | 373 | 274 | 18 s | 40 MB |
 | 50 000 | 99 996 | 379 | 295 | 48 s | 70 MB |
 | 100 000 | 199 996 | 378 | 309 | 100 s | 127 MB |
 
-Storage: ~1.3 KB/edge (double-indexed: outgoing + incoming adjacency).
-Bottleneck: hash-table probing in per-node nested Dicts (~38% CPU), not I/O.
-
-**Per-call vs batch** (5k nodes):
-- `add_edge()` per-call: **3 278 ops/s** (305 µs)
-- `add_edges()` batch: **3 864 ops/s** (259 µs) — 1.2× faster
-
-**Guidelines for `str` fields:**
-- Use `blob_compression=None` when write throughput matters more than disk space.
-- Use `"brotli"` for text-heavy workloads (natural language compresses 3–5×).
-- Use `Field(max_length=N)` for short, frequently-read fields (IDs, roles, tags) to avoid BlobStore entirely.
+~1.3 KB/edge (double-indexed: outgoing + incoming). Bottleneck: hash-table probing in per-node nested Dicts, not I/O.
 
 ---
 
