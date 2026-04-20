@@ -112,6 +112,9 @@ ENV/
 *.sqlite
 *.sqlite3
 
+# Legacy / archived code
+loom_old/
+
 # Log files
 *.log
 
