@@ -743,3 +743,39 @@ class DB:
         self._datastructures[name] = g
         self._save_datastructures_registry()
         return g
+
+    def create_queue(self, name, schema, block_size=64):
+        """Create a persistent FIFO Queue.
+
+        Args:
+            name:       Unique name
+            schema:     Pydantic BaseModel class, or dict of dtype strings
+            block_size: Records per block (default 64).  Larger = fewer
+                        allocations; smaller = less wasted space when small.
+
+        Returns:
+            Queue instance
+
+        Example:
+            from pydantic import BaseModel, Field
+
+            class Task(BaseModel):
+                id:      int
+                payload: str = Field(max_length=100)
+
+            q = db.create_queue("tasks", Task, block_size=128)
+            q.push({"id": 1, "payload": "hello"})
+            item = q.pop()
+        """
+        if not self._is_open:
+            raise DatabaseNotOpenError()
+
+        from loom.datastructures.queue import Queue
+
+        if name in self._datastructures:
+            return self._datastructures[name]
+
+        q = Queue(name, self, schema, block_size=block_size)
+        self._datastructures[name] = q
+        self._save_datastructures_registry()
+        return q

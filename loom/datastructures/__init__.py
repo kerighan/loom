@@ -16,6 +16,7 @@ from loom.datastructures.dict import Dict
 from loom.datastructures.set import Set
 from loom.datastructures.btree import BTree
 from loom.datastructures.graph import Graph
+from loom.datastructures.queue import Queue
 
 __all__ = [
     "DataStructure",
@@ -27,4 +28,5 @@ __all__ = [
     "Set",
     "BTree",
     "Graph",
+    "Queue",
 ]
