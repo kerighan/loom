@@ -229,6 +229,12 @@ g.add_node("alice", name="Alice", age=30)
 g.add_node("bob",   name="Bob",   age=25)
 g.add_edge("alice", "bob", weight=0.9, since=2022)
 
+# Bulk insert (75x faster than per-call for large graphs)
+g.add_nodes([("alice", {"name": "Alice", "age": 30}),
+             ("bob",   {"name": "Bob",   "age": 25})])
+g.add_edges([("alice", "bob",   {"weight": 0.9, "since": 2022}),
+             ("alice", "carol", {"weight": 0.5, "since": 2021})])
+
 print(g["alice"])                        # node attrs
 print(g.has_edge("alice", "bob"))        # O(1)
 print(list(g.neighbors("alice")))        # outgoing neighbors
@@ -385,6 +391,26 @@ loom **reads and lookups are 3–5× faster in all modes** because mmap gives ze
 | List | read[i] | 132 400 | 8 |
 | Queue | push (batch) | 237 900 | 4 |
 | Queue | pop | 42 200 | 24 |
+
+### Graph — bulk insert (Barabási-Albert, m=2)
+
+Use `add_nodes()` and `add_edges()` for bulk ingestion — they batch all header flushes into a single write and are **75× faster** than per-call `add_node()`/`add_edge()`.
+
+```python
+g.add_nodes((str(i), {"label": f"n{i}"}) for i in range(n))
+g.add_edges((str(s), str(d), {"weight": w}) for s, d, w in edge_list)
+```
+
+| Nodes | Edges | node µs | edge µs | total | disk used |
+|---|---|---:|---:|---:|---:|
+| 5 000 | 9 996 | 371 | 239 | 4.2 s | 24 MB |
+| 20 000 | 39 996 | 355 | 258 | 17 s | 40 MB |
+| 50 000 | 99 996 | 364 | 269 | 45 s | 70 MB |
+
+Storage: ~1.4 KB/edge (double-indexed: outgoing + incoming adjacency). The bottleneck after batch inserts is hash-table probing in the per-node nested Dicts — not I/O.
+
+`add_edge()` one-by-one: **59 ops/s** — every new node's nested Dict allocates a block and flushes the mmap header.
+`add_edges()` batch: **4 400 ops/s** — all header flushes deferred to one write.
 
 ### Impact of `str` (text) fields
 
