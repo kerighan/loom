@@ -27,6 +27,9 @@ class CounterOverflowError(Exception):
 
 
 class CountingBloomFilter(DataStructure):
+    # Top-level only — cannot be nested
+    _outer_types_supported = ()
+    _inner_types_supported = ()
     """Counting Bloom filter with removal support.
 
     Uses uint8 counters (0-255) instead of bits. Since NumPy bool uses 8 bits anyway,

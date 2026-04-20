@@ -17,6 +17,7 @@ from loom.errors import (
     RecordError,
     DeletedRecordError,
     WrongDatasetError,
+    NestingNotSupportedError,
 )
 
 __version__ = "0.1.0"
@@ -28,4 +29,5 @@ __all__ = [
     "HeaderError", "HeaderTooLargeError",
     "SchemaError", "InvalidIdentifierError", "UnknownDtypeError",
     "RecordError", "DeletedRecordError", "WrongDatasetError",
+    "NestingNotSupportedError",
 ]

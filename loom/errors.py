@@ -134,6 +134,26 @@ class UnknownDtypeError(SchemaError):
 # ── Record ────────────────────────────────────────────────────
 
 
+class NestingNotSupportedError(LoomError):
+    """The requested nesting combination is not supported.
+
+    Example::
+
+        # Queue cannot contain nested structures
+        List.template(Queue.template(...))   # raises NestingNotSupportedError
+    """
+
+    def __init__(self, outer: str, inner: str, reason: str = ""):
+        msg = (
+            f"Cannot nest {inner} inside {outer}."
+            + (f" {reason}" if reason else "")
+            + " Check the '_outer_types_supported' attribute on the inner class."
+        )
+        super().__init__(msg)
+        self.outer = outer
+        self.inner = inner
+
+
 class RecordError(LoomError):
     """Errors when reading or writing individual records."""
 

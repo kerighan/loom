@@ -18,6 +18,10 @@ class Dict(DataStructure):
     MAX_TABLES_NESTED = 8  # Nested dicts use fewer tables (still ~65K items)
     PROBE_FACTOR = 0.5
 
+    # Nesting compatibility
+    _outer_types_supported = ("Dict", "List", "BTree")  # Dict[Dict], List[Dict], BTree[Dict]
+    _inner_types_supported = ("List", "Dict", "Set", "BTree", "Queue")
+
     @classmethod
     def _get_ref_config_schema(cls):
         return {"cache_size": "uint32", "use_bloom": "bool", "p_init": "uint32"}
@@ -214,6 +218,10 @@ class Dict(DataStructure):
             # For nested dict containers, create shared datasets for children
             # For regular dicts, use the user's dataset directly (compact!)
             if self._is_nested:
+                # Validate nesting compatibility
+                inner_class = self._template.ds_class
+                inner_class._check_nesting(type(self))
+
                 ref_schema = self._template.get_ref_schema()
                 self._values_dataset = self._db.create_dataset(
                     f"_dict_{self.name}_values", **ref_schema
@@ -222,7 +230,6 @@ class Dict(DataStructure):
 
                 # Use modular approach: ask inner type what shared datasets it needs
                 inner_schema = self._extract_schema(self._template.dataset)
-                inner_class = self._template.ds_class
                 shared_specs = inner_class.get_shared_dataset_specs(
                     f"dict_{self.name}", inner_schema,
                     key_size=self._key_size,

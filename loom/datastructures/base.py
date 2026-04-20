@@ -224,6 +224,24 @@ class DataStructure(ABC):
                 self._ops_since_save = 0
 
     @classmethod
+    def _check_nesting(cls, outer_cls):
+        """Raise NestingNotSupportedError if cls cannot be nested in outer_cls.
+
+        Called by container constructors before creating shared datasets.
+
+        Args:
+            outer_cls: The container class (List, Dict, BTree, …)
+        """
+        from loom.errors import NestingNotSupportedError
+        supported = getattr(cls, "_outer_types_supported", None)
+        if supported is not None and outer_cls.__name__ not in supported:
+            reason = (
+                f"{cls.__name__} supports outer containers: "
+                + (", ".join(supported) if supported else "none")
+            )
+            raise NestingNotSupportedError(outer_cls.__name__, cls.__name__, reason)
+
+    @classmethod
     def template(cls, dataset, **config):
         """Create a template for nested data structures.
 

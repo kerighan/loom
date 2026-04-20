@@ -54,6 +54,10 @@ class Set(DataStructure):
     # Nested set parameters
     MAX_TABLES_NESTED = 8  # Same as Dict for nested
 
+    # Nesting compatibility
+    _outer_types_supported = ("Dict", "List")  # Dict[Set], List[Set]
+    _inner_types_supported = ()  # Set items are strings, not structures
+
     @classmethod
     def template(cls, key_size=50, use_bloom=False, cache_size=0):
         """Create a template for nested Sets.

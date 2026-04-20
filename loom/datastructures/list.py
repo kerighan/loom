@@ -59,6 +59,10 @@ class List(DataStructure):
         - Max capacity: ~2.7 billion items (32 blocks)
     """
 
+    # Nesting compatibility
+    _outer_types_supported = ("Dict", "List")   # Dict[List], List[List] OK
+    _inner_types_supported = ("List", "Dict", "Set", "BTree", "Queue")
+
     # Exponential growth parameters
     GROWTH_FACTOR = 1.5
     P_INIT = 10  # First block: 1.5^10 ≈ 57 items
@@ -232,6 +236,10 @@ class List(DataStructure):
             dataset_name = f"_list_{self.name}_items"
 
             if self._is_nested:
+                # Validate nesting compatibility
+                inner_class = self._template.ds_class
+                inner_class._check_nesting(type(self))
+
                 # Nested list container: store references AND create shared datasets for inner structures
                 ref_schema = self._template.get_ref_schema()
                 self._items_dataset = self._db.create_dataset(
@@ -241,7 +249,6 @@ class List(DataStructure):
 
                 # Use modular approach: ask inner type what shared datasets it needs
                 inner_schema = self._extract_schema(self._template.dataset)
-                inner_class = self._template.ds_class
                 shared_specs = inner_class.get_shared_dataset_specs(
                     f"list_{self.name}", inner_schema
                 )
@@ -469,6 +476,8 @@ class List(DataStructure):
                 # Create new nested structure from template
                 # Pass _parent=self to prevent header pollution
                 item = self._template.new(self._db, _parent=self)
+                # Set parent_key to the index this item will occupy
+                item._parent_key = self.valid_count
                 # Note: nested structures are NOT registered in _datastructures
                 # to avoid polluting the registry with potentially millions of instances
             elif not isinstance(item, expected_type):
@@ -788,7 +797,7 @@ class List(DataStructure):
 
             # Resolve reference if nested
             if self._is_nested:
-                return self._resolve_nested_ref(item)
+                return self._resolve_nested_ref_with_index(item, index)
 
             return item
 
@@ -797,7 +806,7 @@ class List(DataStructure):
 
         # Resolve reference if nested
         if self._is_nested:
-            return self._resolve_nested_ref(item)
+            return self._resolve_nested_ref_with_index(item, index)
 
         return item
 
@@ -818,6 +827,13 @@ class List(DataStructure):
         if result.needs_shared_datasets():
             result.set_shared_datasets(self._shared_datasets)
 
+        return result
+
+    def _resolve_nested_ref_with_index(self, item, index):
+        """Like _resolve_nested_ref but also sets parent/parent_key for update propagation."""
+        result = self._resolve_nested_ref(item)
+        result._parent = self
+        result._parent_key = index
         return result
 
     def _getslice(self, slice_obj):

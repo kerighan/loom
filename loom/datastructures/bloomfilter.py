@@ -20,6 +20,9 @@ from loom.datastructures.base import DataStructure
 
 
 class BloomFilter(DataStructure):
+    # Top-level only — cannot be nested
+    _outer_types_supported = ()
+    _inner_types_supported = ()
     """Optimized Bloom filter for fast membership testing.
 
     Usage:

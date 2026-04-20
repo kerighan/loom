@@ -62,6 +62,12 @@ class Queue(DataStructure):
     """Persistent FIFO queue with block-based storage and auto reclamation."""
 
     DEFAULT_BLOCK_SIZE = 64
+    MAX_BLOCKS_NESTED = 16   # supports ~1024 items with block_size=64
+
+    # ── Nesting compatibility declarations ──────────────────────────────────
+    # Queue can live inside Dict or List but cannot itself contain nested structures.
+    _outer_types_supported = ("Dict", "List")
+    _inner_types_supported = ()   # Queue items are plain records, not structures
 
     def __init__(
         self,
@@ -83,6 +89,7 @@ class Queue(DataStructure):
                                reduces wasted space for tiny queues.
         """
         self.block_size = block_size
+        self._parent_key = None   # set by parent container after append/getitem
         self._resolve_schema(dataset_or_schema)
 
         super().__init__(name, db, auto_save_interval, _parent=_parent)
@@ -126,8 +133,11 @@ class Queue(DataStructure):
 
     def _initialize(self):
         """First-time setup: create the items dataset and first block."""
-        # If schema was given as dict/Pydantic rather than Dataset, create it
-        if self._items_dataset is None:
+        if self._parent is not None and self._parent != "__nested__":
+            # Nested: use parent's shared items dataset
+            self._items_dataset = self._parent._shared_items_dataset
+        elif self._items_dataset is None:
+            # Top-level from schema dict/Pydantic
             schema = getattr(self, "_schema_dict", None)
             if schema is None:
                 raise ValueError("No schema available to create Queue dataset")
@@ -141,8 +151,8 @@ class Queue(DataStructure):
         first_addr = self._alloc_block()
 
         self._blocks = [int(first_addr)]
-        self._head_offset = 0   # next pop reads here (in blocks[0])
-        self._tail_offset = 0   # next push writes here (in blocks[-1])
+        self._head_offset = 0
+        self._tail_offset = 0
         self._size = 0
 
         self._save_state()
@@ -181,10 +191,18 @@ class Queue(DataStructure):
         return int(self._items_dataset.db.allocate(size))
 
     def _free_head_block(self):
-        """Return the exhausted head block to the ByteFileDB freelist."""
+        """Return the exhausted head block to the ByteFileDB freelist.
+
+        For nested Queue instances the shared items dataset is controlled
+        by the parent container — we drop the block from our list but do
+        NOT call ByteFileDB.free() (the parent will reclaim space when the
+        nested Queue itself is removed).
+        """
         addr = self._blocks.pop(0)
-        size = self.block_size * self._items_dataset.record_size
-        self._items_dataset.db.free(addr, size)
+        is_nested = getattr(self, "_parent", None) is not None
+        if not is_nested:
+            size = self.block_size * self._items_dataset.record_size
+            self._items_dataset.db.free(addr, size)
 
     def _item_addr(self, block_idx: int, offset: int) -> int:
         """Compute mmap address of a record."""
@@ -194,6 +212,15 @@ class Queue(DataStructure):
         )
 
     # ── Core operations ───────────────────────────────────────────────────────
+
+    def _update_parent_ref(self):
+        """Notify parent container that our state has changed."""
+        if (
+            self._parent is not None
+            and self._parent != "__nested__"
+            and getattr(self, "_parent_key", None) is not None
+        ):
+            self._parent.update_nested_ref(self._parent_key, self)
 
     def push(self, item: dict):
         """Enqueue an item at the tail.
@@ -217,6 +244,7 @@ class Queue(DataStructure):
 
         self._tail_offset += 1
         self._size += 1
+        self._update_parent_ref()
         self._auto_save_check()
 
     def pop(self) -> dict:
@@ -253,6 +281,7 @@ class Queue(DataStructure):
             new_addr = self._alloc_block()
             self._blocks = [int(new_addr)]
 
+        self._update_parent_ref()
         self._auto_save_check()
         return item
 
@@ -332,9 +361,93 @@ class Queue(DataStructure):
             f"blocks={len(self._blocks)}, block_size={self.block_size})"
         )
 
+    # ── Nesting protocol ─────────────────────────────────────────────────────
+
+    @classmethod
+    def get_shared_dataset_specs(cls, parent_name, inner_schema, **kwargs):
+        """Shared items dataset used by all nested Queue instances in a parent."""
+        # Queue items need the 'valid' prefix (Dataset convention)
+        full_schema = {**inner_schema}
+        return {
+            "_shared_items_dataset": {
+                "name": f"_{parent_name}_shared_queue_items",
+                "schema": full_schema,
+            }
+        }
+
+    def set_shared_datasets(self, shared_datasets):
+        if "_shared_items_dataset" in shared_datasets:
+            self._items_dataset = shared_datasets["_shared_items_dataset"]
+            self.item_schema = self._extract_schema(self._items_dataset)
+
+    def needs_shared_datasets(self):
+        return self._items_dataset is None
+
+    @classmethod
+    def _get_nested_ref_schema(cls):
+        """Compact binary ref: ~140 bytes per nested Queue."""
+        schema = {
+            "size":         "uint32",
+            "block_size":   "uint16",
+            "head_offset":  "uint16",
+            "tail_offset":  "uint16",
+        }
+        for i in range(cls.MAX_BLOCKS_NESTED):
+            schema[f"block_{i}"] = "uint64"
+        return schema
+
+    def to_ref(self):
+        if self._parent is not None and self._parent != "__nested__":
+            ref = {"valid": True,
+                   "size": self._size,
+                   "block_size": self.block_size,
+                   "head_offset": self._head_offset,
+                   "tail_offset": self._tail_offset}
+            for i in range(self.MAX_BLOCKS_NESTED):
+                ref[f"block_{i}"] = self._blocks[i] if i < len(self._blocks) else 0
+            return ref
+        return super().to_ref()
+
+    @classmethod
+    def _from_ref_impl(cls, db, ref):
+        is_binary = "size" in ref and "block_0" in ref
+        if not is_binary:
+            # top-level standard format
+            return cls(ref["ds_name"], db, None,
+                       block_size=ref.get("block_size", cls.DEFAULT_BLOCK_SIZE))
+
+        instance = object.__new__(cls)
+        instance._db = db
+        instance._parent = "__nested__"
+        instance.block_size = int(ref["block_size"])
+        instance._size = int(ref["size"])
+        instance._head_offset = int(ref["head_offset"])
+        instance._tail_offset = int(ref["tail_offset"])
+
+        instance._blocks = []
+        for i in range(cls.MAX_BLOCKS_NESTED):
+            addr = int(ref[f"block_{i}"])
+            if addr > 0 or i == 0:
+                instance._blocks.append(addr)
+            else:
+                break
+
+        instance.name = f"_nested_queue_{id(instance)}"
+        instance.item_schema = None
+        instance._items_dataset = None       # set by set_shared_datasets()
+        instance._schema_dict = None
+        instance._auto_save_interval = 0
+        instance._ops_since_save = 0
+        instance._inline_metadata = None
+        instance._metadata_key = None
+        instance._parent_key = None          # set by parent container after creation
+        return instance
+
     # ── Registry protocol ─────────────────────────────────────────────────────
 
     def _get_registry_params(self):
+        if self._parent is not None:
+            return None
         return {
             "schema": self.item_schema,
             "block_size": self.block_size,

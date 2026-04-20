@@ -58,6 +58,10 @@ class BTree(DataStructure):
     ORDER = 32  # Maximum children per node (keys = ORDER - 1)
     MIN_KEYS = ORDER // 2 - 1  # Minimum keys in non-root node
 
+    # Nesting compatibility
+    _outer_types_supported = ("Dict", "List")  # Dict[BTree], List[BTree]
+    _inner_types_supported = ("List", "Dict", "Set", "Queue")
+
     def __init__(
         self,
         name: str,
