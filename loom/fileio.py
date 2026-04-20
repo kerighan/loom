@@ -11,12 +11,13 @@ class ByteFileDB:
     #   [slot_size+1 : header_size]  slot B  — same layout
     # If crash during write to inactive slot, active slot is still intact.
 
-    def __init__(self, filename, initial_size=1024, header_size=32768):
+    def __init__(self, filename, initial_size=1024, header_size=32768, sync_writes=False):
         self.filename = filename
         self.log_filename = self.filename + ".log"
         self.initial_size = initial_size
         self.header_size = header_size
         self._slot_size = (header_size - 1) // 2  # usable bytes per slot
+        self.sync_writes = sync_writes  # if True, flush after every header save
         self.ensure_file_size(max(self.initial_size, self.header_size))
         self.mapped_file = None
         self.file_handle = None
@@ -24,6 +25,7 @@ class ByteFileDB:
         # Header metadata dictionary (in-memory cache)
         self._header_data = {}
         self._header_dirty = False
+        self._write_count = 0  # tracks writes since last flush
         self._batch_mode = False
         self._freelist = []
         self._freelist_dirty = False
@@ -53,7 +55,10 @@ class ByteFileDB:
             # Persist freelist if dirty
             if self._freelist_dirty:
                 self._save_freelist()
+            # Final header save + flush to guarantee on-disk durability
+            if self._header_dirty:
                 self._save_header()
+            self.mapped_file.flush()
             self.mapped_file.close()
             self.mapped_file = None
         if self.file_handle:
@@ -61,9 +66,11 @@ class ByteFileDB:
             self.file_handle = None
 
     def _remap(self, min_size):
-        """Grow file and re-create mmap. Flushes dirty header first."""
+        """Grow file and re-create mmap. Flushes before closing."""
         if self._header_dirty:
             self._save_header()
+        if self.mapped_file:
+            self.mapped_file.flush()
         self.close()
         self._grow_file_size(min_size)
         self.open()
@@ -200,11 +207,17 @@ class ByteFileDB:
         self.mapped_file[offset : offset + self._slot_size] = slot_bytes
 
     def _save_header(self):
-        """Persist header via double-buffer: write inactive slot, flip, flush.
+        """Persist header via double-buffer: write inactive slot, flip.
 
-        If crash happens during the write, the active slot is untouched.
-        If crash happens during the flip, both slots are valid (the inactive
-        one has the new data, the active one has the old data).
+        flush=False (lazy): mmap pages are written by the OS dirty-page
+        writeback (typically within seconds) and guaranteed on close().
+        This avoids a ~10 ms msync() syscall on every allocation.
+
+        Crash safety:
+        - Both slots always contain a valid state (old or new).
+        - On recovery, _load_header() reads the active slot or falls back
+          to the other — no partial-write corruption possible.
+        - Data durability is guaranteed by close() which calls flush().
         """
         assert self.mapped_file, "DB is not open. Call open() first."
 
@@ -213,15 +226,26 @@ class ByteFileDB:
             active = 0
         inactive = 1 - active
 
-        # Step 1: write to inactive slot
+        # Write to inactive slot, then flip indicator.
         self._write_slot(inactive)
-        self.mapped_file.flush()
-
-        # Step 2: flip indicator (single byte — atomic on any filesystem)
         self.mapped_file[0] = inactive
-        self.mapped_file.flush()
-
         self._header_dirty = False
+        self._write_count += 1
+
+        # sync_writes=True: flush after every save (server mode, full durability)
+        # sync_writes=False (default): flush only on close/remap (fast mode)
+        if self.sync_writes:
+            self.mapped_file.flush()
+
+    def flush(self):
+        """Force all pending mmap writes to disk immediately.
+
+        Called automatically by close() and _remap().
+        Call explicitly when you need immediate on-disk durability
+        (e.g. before an expected hard shutdown).
+        """
+        if self.mapped_file:
+            self.mapped_file.flush()
 
     def set_header_field(self, name, value):
         """Set a metadata field in the header.

@@ -59,6 +59,7 @@ class DB:
         blob_compression="brotli",
         auto_save_interval=100,
         cache_size=0,
+        sync_writes=False,
     ):
         """Initialize database.
 
@@ -79,6 +80,12 @@ class DB:
                     DB(path, cache_size=50_000)  # 50K entries total
                 This lets hot structures grow their share naturally via LRU
                 without pre-allocating per-structure budgets.
+            sync_writes: If True, flush mmap to disk after every header write
+                (slow but fully durable — use for long-running servers).
+                If False (default), flush only on close() — fast, but data
+                may not be on disk immediately after each write.
+                For servers, prefer calling db.flush() periodically, or use
+                sync_writes=True for full durability.
         """
         self.filename = filename
         self.auto_save_interval = auto_save_interval
@@ -89,7 +96,8 @@ class DB:
             self._shared_cache = LRUCache(cache_size)
         else:
             self._shared_cache = None
-        self._db = ByteFileDB(filename, initial_size, header_size)
+        self._db = ByteFileDB(filename, initial_size, header_size,
+                              sync_writes=sync_writes)
         self._datasets = {}  # name -> Dataset instance
         self._datastructures = {}  # name -> DataStructure instance
         self._is_open = False
@@ -267,6 +275,27 @@ class DB:
 
         self._db.set_header_field(self.NEXT_ID_KEY, next_id + 1)
         return next_id
+
+    def flush(self):
+        """Flush all pending mmap writes to disk immediately.
+
+        In the default sync_writes=False mode, writes accumulate in the
+        OS page cache and are only guaranteed on disk after close() or
+        this method.
+
+        For long-running servers, call this periodically:
+            import schedule
+            schedule.every(30).seconds.do(db.flush)
+
+        Or after critical transactions:
+            db["key"] = value
+            db.flush()   # now on disk regardless of OS writeback schedule
+        """
+        if not self._is_open:
+            return
+        if self._blob_store is not None:
+            self._blob_store._save_freelist()
+        self._db.flush()
 
     @contextmanager
     def batch(self):
