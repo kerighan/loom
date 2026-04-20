@@ -361,15 +361,18 @@ Benchmarks on a modern laptop (Linux, SSD), 10 000 operations.
 
 ### loom vs SqliteDict
 
-| Operation | **loom** | **SqliteDict** | Speedup |
-|---|---:|---:|---:|
-| Dict insert (batch) | 23 700 ops/s | 44 400 ops/s | 0.5× |
-| **Dict read** | **45 600 ops/s** | 13 100 ops/s | **3.5×** |
-| **Dict contains** | **61 900 ops/s** | 12 800 ops/s | **4.8×** |
+Benchmarks on 5 000 operations, fixed schema (no text/blob fields).
 
-loom inserts are slower than SqliteDict's batch commit because loom flushes header metadata per-allocation. SqliteDict buffers in SQLite's WAL and commits once. Use `db.batch()` for bulk inserts.
+| Operation | **loom** | **SqliteDict** | Notes |
+|---|---:|---:|---|
+| Dict insert, no batch | **7 200 ops/s** | 6 000 ops/s | loom 1.2× faster — each op flushes header vs. each op does a full SQLite commit |
+| Dict insert, **batch** | 23 000 ops/s | **41 200 ops/s** | SQLite wins by buffering everything in WAL; loom still flushes header per-alloc |
+| **Dict read** | **45 600 ops/s** | 13 100 ops/s | loom **3.5×** faster — mmap zero-copy vs. SQL SELECT + pickle |
+| **Dict contains** | **61 900 ops/s** | 12 800 ops/s | loom **4.8×** faster — bloom filter probe vs. SQL COUNT |
 
-loom **reads and lookups are 3–5× faster** thanks to mmap zero-copy access — no SQL parsing, no pickle deserialization per read.
+**Key insight:** in autocommit mode (the fair per-operation comparison), loom is already faster for inserts. SqliteDict's batch commit wins by deferring all durability to a single `COMMIT` — equivalent to loom's `db.batch()`. Use `db.batch()` when you can tolerate losing the last N inserts on a crash.
+
+loom **reads and lookups are 3–5× faster in all modes** because mmap gives zero-copy access — no SQL parsing, no pickle deserialization per read.
 
 ### loom operations reference
 
