@@ -1140,6 +1140,71 @@ class BTree(DataStructure):
             elif key > prefix_str and not key.startswith(prefix_str):
                 break
 
+    # ========== Datetime helpers ==========
+
+    def range_dt(self, start=None, end=None,
+                 precision: str = "second", inclusive=(True, True)):
+        """Range query using datetime objects as bounds.
+
+        Converts datetimes to BTree keys via dt_key() and delegates to
+        range().  The returned values are unchanged (use key_dt() to
+        convert back if needed).
+
+        Args:
+            start:     lower bound (datetime or None)
+            end:       upper bound (datetime or None)
+            precision: key granularity — must match what was used on insert.
+                       Default "second" → "20240115T143000".
+            inclusive: (start_inclusive, end_inclusive)
+
+        Yields:
+            (key_str, value) pairs — same as range()
+
+        Example:
+            from datetime import datetime
+            from loom.schema import dt_key, key_dt
+
+            # Insert
+            btree[dt_key(datetime(2024, 1, 15, 14, 30))] = {...}
+
+            # Query all of Jan 15
+            for k, row in btree.range_dt(datetime(2024, 1, 15),
+                                          datetime(2024, 1, 15, 23, 59, 59)):
+                print(key_dt(k), row)
+
+            # Since start of year
+            for k, row in btree.range_dt(datetime(2024, 1, 1)):
+                ...
+        """
+        from loom.schema import dt_key as _dt_key
+        s = _dt_key(start, precision) if start is not None else None
+        e = _dt_key(end,   precision) if end   is not None else None
+        yield from self.range(s, e, inclusive=inclusive)
+
+    def get_dt(self, dt, precision: str = "second"):
+        """Fetch a single record by datetime.
+
+        Args:
+            dt:        datetime to look up
+            precision: must match the precision used on insert
+
+        Returns:
+            record dict, or raises KeyError
+        """
+        from loom.schema import dt_key as _dt_key
+        return self[_dt_key(dt, precision)]
+
+    def set_dt(self, dt, value: dict, precision: str = "second"):
+        """Insert or update a record by datetime.
+
+        Args:
+            dt:        datetime key
+            value:     record dict
+            precision: must match the precision used on other operations
+        """
+        from loom.schema import dt_key as _dt_key
+        self[_dt_key(dt, precision)] = value
+
     # ========== Representation ==========
 
     def __repr__(self):
