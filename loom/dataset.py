@@ -78,6 +78,22 @@ class Dataset:
         self._valid_prefix = np.int8(identifier).tobytes()
         self._deleted_prefix = np.int8(-identifier).tobytes()
 
+        # Pre-built zero record for fast bulk-init (one write instead of N)
+        self._zero_record = self._serialize_zero()
+
+    def _serialize_zero(self):
+        """Return a zero/empty record as bytes (for bulk block init)."""
+        values = [self.identifier]
+        for field in self.user_schema.names:
+            dtype = self.user_schema.fields[field][0]
+            if field in self._text_fields or field in self._blob_fields:
+                values.append((0, 0))
+            elif dtype.kind == "U":
+                values.append("")
+            else:
+                values.append(0)
+        return np.array(tuple(values), dtype=self.schema).tobytes()
+
     def allocate_block(self, n_records):
         """Allocate space for n records and return the address.
 
@@ -96,35 +112,34 @@ class Dataset:
         For blob fields, expects (offset, n_slots) tuple.
         For text fields, expects a str — stored transparently via BlobStore.
         """
-        # Build full record with prefix
-        values = [self.identifier]
+        # Use zeros + field assignment to avoid numpy dtype __str__ overhead
+        # that np.array(tuple, dtype=...) triggers on every call.
+        arr = np.zeros(1, dtype=self.schema)
+        arr["_prefix"] = self.identifier
+
         for field in self.user_schema.names:
             if field in record:
                 value = record[field]
                 if field in self._text_fields:
-                    # Encode string and store in BlobStore
                     if value is None or value == "":
-                        values.append(_NULL_BLOB)
+                        pass  # already zero = NULL_BLOB
                     else:
                         encoded = value.encode("utf-8") if isinstance(value, str) else value
                         offset, n_slots = self.blob_store.write(encoded)
-                        values.append((offset, n_slots))
+                        arr[field]["offset"] = offset
+                        arr[field]["n_slots"] = n_slots
                 elif field in self._blob_fields:
-                    if value is None:
-                        value = _NULL_BLOB
-                    values.append(value)
+                    if value is not None:
+                        arr[field]["offset"] = value[0]
+                        arr[field]["n_slots"] = value[1]
                 else:
-                    values.append(value)
+                    arr[field] = value
             else:
-                # Use proper default for field type
+                # Default: zeros already set; only need to handle strings
                 dtype = self.user_schema.fields[field][0]
-                if dtype.kind == "U":  # Unicode string
-                    values.append("")
-                elif field in self._blob_fields or field in self._text_fields:
-                    values.append(_NULL_BLOB)
-                else:
-                    values.append(0)
-        arr = np.array(tuple(values), dtype=self.schema)
+                if dtype.kind == "U":
+                    arr[field] = ""
+                # blob/text default (0,0) is already in zeros
         return arr.tobytes()
 
     def _deserialize(self, data):
