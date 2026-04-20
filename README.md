@@ -1,374 +1,432 @@
-# Loom
+# loom
 
-**Fast, persistent data structures for Python**
+**Persistent Python data structures that feel native.**
 
-Loom provides memory-mapped, persistent dictionaries and lists with automatic crash recovery and minimal overhead.
+loom is a file-backed database library that lets you work with `Dict`, `List`, `Queue`, `Set`, `BTree`, and `Graph` exactly like their in-memory counterparts — but stored on disk with mmap zero-copy access, crash-safe writes, and automatic space reclamation.
 
-## Features
-
-- 🚀 **Fast**: Memory-mapped I/O with ~1-2 μs operations
-- 💾 **Persistent**: All data automatically saved to disk
-- 🔒 **Crash-safe**: Optional atomic operations with WAL recovery
-- 📦 **Nested structures**: Dictionaries of dictionaries, lists of lists
-- 🎯 **Bloom filters**: Fast membership checks for large datasets
-- 🔄 **Auto-growth**: Hash tables and blocks grow automatically
-- 💨 **Zero-copy**: Direct access to memory-mapped data
-
-## Quick Start
+No server. No ORM. No SQL. Just Python objects that persist.
 
 ```python
+from pydantic import BaseModel, Field
 from loom.database import DB
 
-# Create database
-with DB("mydata.db") as db:
-    # Define schema
-    user_ds = db.create_dataset("users", id="uint64", name="U50", email="U100")
-    
-    # Create persistent dict
-    users = db.create_dict("users_dict", user_ds)
-    
-    # Insert data
-    users["alice"] = {"id": 1, "name": "Alice", "email": "alice@example.com"}
-    users["bob"] = {"id": 2, "name": "Bob", "email": "bob@example.com"}
-    
-    # Read data
-    print(users["alice"])  # {'id': 1, 'name': 'Alice', 'email': 'alice@example.com'}
-    
-    # Iterate
-    for key, value in users.items():
-        print(f"{key}: {value['name']}")
+class User(BaseModel):
+    id:       int
+    username: str = Field(max_length=50)  # fixed-length, fast lookups
+    bio:      str                          # variable-length text, compressed
+    score:    float
 
-# Data persists automatically!
+with DB("app.db") as db:
+    users = db.create_dataset("users", User)
+    dct   = db.create_dict("users_by_name", users)
+
+    dct["alice"] = {"id": 1, "username": "alice", "bio": "Hello!", "score": 9.5}
+    print(dct["alice"])          # {'id': 1, 'username': 'alice', ...}
+    print("alice" in dct)        # True
 ```
+
+---
 
 ## Installation
 
 ```bash
-git clone <repository-url>
-cd loom
-pip install -r requirements.txt
+pip install loom-db          # coming soon — for now: clone + pip install -e .
 ```
 
-## Core Data Structures
+Dependencies: `numpy`, `lru-dict`, `mmh3`, `pydantic` (optional), `brotli` (optional).
 
-### Dict
+---
 
-Persistent hash table with automatic growth:
+## Core concepts
+
+### Schemas with Pydantic
+
+Define your record schema as a Pydantic model. loom maps types automatically:
+
+| Python / Pydantic type | loom dtype | Notes |
+|---|---|---|
+| `int` | `int64` | |
+| `float` | `float64` | |
+| `bool` | `bool` | |
+| `str` | `text` | Variable-length, compressed via BlobStore |
+| `str = Field(max_length=N)` | `U{N}` | Fixed-length numpy unicode, faster reads |
+| `FixedStr(N)` | `U{N}` | loom shorthand |
 
 ```python
-# Create dict
-users = db.create_dict("users", user_ds, bloom_size=100000, cache_size=1000)
+from pydantic import BaseModel, Field
+from loom.schema import FixedStr
 
-# Operations
-users["alice"] = {"id": 1, "name": "Alice"}  # Insert/update
-user = users["alice"]                         # Read
-del users["alice"]                            # Delete
-"alice" in users                              # Check existence
-len(users)                                    # Size
+class Message(BaseModel):
+    id:      int
+    role:    str = Field(max_length=20)  # → U20, fast key
+    content: str                          # → text, variable-length
+
+class Product(BaseModel):
+    sku:    FixedStr(20)   # → U20
+    name:   str            # → text
+    price:  float
+    stock:  int
+```
+
+You can also pass plain dicts:
+
+```python
+db.create_dataset("events", id="uint32", ts="int64", kind="U20")
+```
+
+**Rule of thumb:** use `Field(max_length=N)` or `FixedStr(N)` for short fields used as keys or in frequent filters. Use plain `str` (→ `text`) for anything that can be long or variable — body text, descriptions, JSON payloads, etc.
+
+### The DB object
+
+```python
+# Open (creates if not exists)
+db = DB("mydata.db")
+
+# Context manager (recommended — auto-saves on exit)
+with DB("mydata.db",
+        blob_compression="brotli",   # "brotli" | "zlib" | None
+        auto_save_interval=100,       # metadata flush frequency (default 100)
+        cache_size=50_000,            # shared LRU entries across ALL structures
+) as db:
+    ...
+
+# Bulk inserts — defer header flushes for 10–100x speedup
+with db.batch():
+    for item in large_dataset:
+        my_dict[item["key"]] = item
+```
+
+---
+
+## Data structures
+
+### Dataset — typed record store
+
+```python
+users = db.create_dataset("users", User)
+
+# Insert → returns a Ref (address + dataset handle)
+ref = users.insert({"id": 1, "username": "alice", "bio": "...", "score": 9.5})
+
+# Read / update / delete
+rec = users.read(ref.addr)
+ref.update(score=10.0)             # fast field-level update
+ref.update(bio="New bio!")         # frees old blob, writes new one
+users.delete(ref.addr)             # soft delete
+```
+
+### Dict — persistent hash map
+
+```python
+ds  = db.create_dataset("users", User)
+dct = db.create_dict("users_dict", ds)
+
+dct["alice"] = {"id": 1, "username": "alice", "bio": "...", "score": 9.5}
+print(dct["alice"])
+print("alice" in dct)              # O(1), bloom-filter accelerated
+del dct["alice"]
+
+# Bulk export — one mmap read + sorted blob resolution
+snapshot = dct.to_dict()           # {key: record_dict, ...}
 
 # Iteration
-for key in users.keys(): ...
-for value in users.values(): ...
-for key, value in users.items(): ...
-
-# Atomic operations (crash-safe)
-users.set("bob", {"id": 2, "name": "Bob"}, atomic=True)
+for key, val in dct.items(): ...
+list(dct.keys())
+list(dct.values())
 ```
 
-### List
-
-Persistent list with automatic block allocation:
+### List — dynamic array
 
 ```python
-# Create list
-logs = db.create_list("logs", log_ds, cache_size=100)
+lst = db.create_list("events", event_ds)
 
-# Operations
-logs.append({"timestamp": 123, "message": "Event"})  # Append
-logs.append_many(items, atomic=True)                 # Batch append
-log = logs[0]                                        # Read by index
-logs[0] = {"timestamp": 124, "message": "Updated"}   # Update
-del logs[5]                                          # Delete
-len(logs)                                            # Size
+lst.append({"id": 1, "ts": 1700000000, "kind": "click"})
+print(lst[0])
+print(lst[-1])
+print(lst[10:20])                  # slice
+del lst[5]                         # soft delete, auto-compacts at 30% waste
 
-# Slicing
-recent = logs[-100:]      # Last 100 items
-subset = logs[10:20]      # Range
-every_other = logs[::2]   # Step
-
-# Iteration
-for log in logs: ...
-for i, log in enumerate(logs): ...
+for item in lst: ...
 ```
 
-### Nested Structures
-
-Dictionaries of dictionaries, lists of lists:
+### Queue — FIFO with O(1) push/pop and automatic space reclamation
 
 ```python
-# Nested dicts
-user_ds = db.create_dataset("users", id="uint32", name="U50")
-UserDict = Dict.template(user_ds)
-teams = db.create_dict("teams", UserDict)
+q = db.create_queue("tasks", Task, block_size=64)
 
-# Auto-create nested dict on access
-eng_team = teams["engineering"]
-eng_team["alice"] = {"id": 1, "name": "Alice"}
+q.push({"id": 1, "payload": "process me", "priority": 0.9})
+q.push_many([...])                  # bulk push
 
-# Access nested values
-print(teams["engineering"]["alice"]["name"])  # "Alice"
+item = q.peek()                     # look without consuming
+item = q.pop()                      # consume — exhausted blocks freed automatically
 
-# Nested lists
-item_ds = db.create_dataset("items", id="uint32", value="float32")
-ItemList = List.template(item_ds)
-categories = db.create_list("categories", ItemList)
-
-# Append nested list
-electronics = categories.append()
-electronics.append({"id": 1, "value": 999.99})
+for item in q: ...                  # non-destructive iteration
+print(len(q))
 ```
 
-## Atomic Operations
+When a block is exhausted by `pop()`, it is returned to the shared ByteFileDB freelist. In steady state (push rate ≈ pop rate), **the file does not grow**.
 
-Use atomic operations for crash safety via Write-Ahead Logging (WAL):
+### BTree — ordered key-value with range queries
 
 ```python
-# Dict atomic insert
-users.set("alice", {"id": 1, "name": "Alice"}, atomic=True)
+idx = db.create_btree("docs_by_title", doc_ds, key_size=100)
 
-# List atomic append
-logs.append({"timestamp": 123, "message": "Event"}, atomic=True)
+idx["Alpha post"] = {"id": 1, ...}
+idx["Beta post"]  = {"id": 2, ...}
 
-# Batch atomic operations
-logs.append_many([
-    {"timestamp": 123, "message": "Event 1"},
-    {"timestamp": 124, "message": "Event 2"},
-], atomic=True)
+for k in idx.keys():              # sorted order
+    print(k)
+
+for k, v in idx.range("A", "C"):  # range query
+    print(k, v)
+
+for k, v in idx.prefix("Beta"):   # prefix search
+    print(k, v)
 ```
 
-**Performance**:
-- Fast path (default): ~1-2 μs per operation
-- Atomic path: ~2-4 μs per operation
+### Set — unique string collection
 
-**Recovery**: On crash, WAL automatically replays uncommitted transactions on database open.
+```python
+tags = db.create_set("popular_tags", key_size=50)
+
+tags.add("python")
+tags.add("machine-learning")
+print("python" in tags)            # True
+tags.remove("python")
+
+for tag in tags: ...
+```
+
+### BloomFilter / CountingBloomFilter — probabilistic membership
+
+```python
+seen = db.create_bloomfilter("seen_ids", expected_items=1_000_000)
+seen.add("user_42")
+if "user_42" in seen:
+    print("probably seen before")   # no false negatives
+
+# CountingBloomFilter supports removal
+cbf = db.create_counting_bloomfilter("cache", expected_items=10_000)
+cbf.add("item")
+cbf.remove("item")
+```
+
+### Graph — persistent directed/undirected graph with Cypher queries
+
+```python
+class Person(BaseModel):
+    name: str
+    age:  int
+
+class Follows(BaseModel):
+    weight: float
+    since:  int
+
+g = db.create_graph("social", Person, Follows,
+                    directed=True, node_id_max_len=50)
+
+g.add_node("alice", name="Alice", age=30)
+g.add_node("bob",   name="Bob",   age=25)
+g.add_edge("alice", "bob", weight=0.9, since=2022)
+
+print(g["alice"])                        # node attrs
+print(g.has_edge("alice", "bob"))        # O(1)
+print(list(g.neighbors("alice")))        # outgoing neighbors
+print(list(g.predecessors("bob")))       # incoming neighbors
+
+# Cypher-like queries
+results = g.query("""
+    MATCH (a)-[r]->(b)
+    WHERE a.age > 25 AND r.weight > 0.7
+    RETURN a.name, b.name, r.weight
+""")
+
+# Path quantifiers
+g.query("MATCH (a)-[+]->(b) WHERE id(a) == 'alice' RETURN id(b)")      # 1..∞ hops
+g.query("MATCH (a)-[*2..4]->(b) WHERE id(a) == 'alice' RETURN id(b)")  # 2–4 hops
+
+# Filter by node key
+g.query("MATCH (a)->(b) WHERE id(a) IN ['alice','bob'] RETURN b.name")
+g.query("MATCH (a {name:'Alice'})->(b) RETURN id(b)")   # inline node props
+
+# LIMIT
+g.query("MATCH (a)->(b) WHERE a.age > 20 RETURN a.name LIMIT 5")
+
+# Lazy iterator for large results
+for row in g.query_iter("MATCH (a)-[+]->(b) WHERE id(a)=='alice' RETURN id(b)"):
+    process(row)
+```
+
+---
+
+## Nesting
+
+Compose structures freely. loom validates compatibility at creation time and raises `NestingNotSupportedError` for invalid combinations.
+
+```python
+from loom.datastructures import List, Dict, Queue, Set
+
+# Dict[List] — user → chronological feed
+PostList  = List.template(post_ds)
+user_feed = db.create_dict("feeds", PostList)
+user_feed["alice"].append({"id": 1, "title": "Hello"})
+
+# Dict[Dict] — user → posts by slug
+PostDict   = Dict.template(post_ds)
+user_posts = db.create_dict("user_posts", PostDict)
+user_posts["alice"]["intro"] = {"id": 1, "title": "Intro"}
+
+# Dict[Queue] — per-user task queues
+TaskQueue   = Queue.template(task_ds, block_size=32)
+user_queues = db.create_dict("user_queues", TaskQueue)
+user_queues["alice"].push({"id": 1, "payload": "run job"})
+item = user_queues["alice"].pop()
+
+# List[Queue] — event channels
+EventQueue = Queue.template(event_ds)
+channels   = db.create_list("channels", EventQueue)
+ch0        = channels.append()
+ch0.push({"ts": 1700000000, "kind": "click"})
+
+# Dict[Set] — per-user tag sets
+TagSet    = Set.template(key_size=50)
+user_tags = db.create_dict("user_tags", TagSet)
+user_tags["alice"].add("python")
+```
+
+### Nesting compatibility matrix
+
+| Inner ↓ \ Outer → | Dict | List | BTree |
+|---|:---:|:---:|:---:|
+| **List** | ✓ | ✓ | ✗ |
+| **Dict** | ✓ | ✓ | ✓ |
+| **Queue** | ✓ | ✓ | ✗ |
+| **Set** | ✓ | ✓ | ✗ |
+| **BTree** | ✓ | ✓ | ✗ |
+| **BloomFilter** | ✗ | ✗ | ✗ |
+
+---
+
+## Error handling
+
+```python
+import loom
+
+try:
+    db["nonexistent"]
+except loom.StructureNotFoundError as e:
+    print(e.name)
+
+try:
+    dataset.read(deleted_addr)
+except loom.DeletedRecordError as e:
+    print(e.address)
+
+try:
+    db.create_dataset("users", User)
+    db.create_dataset("users", User)  # duplicate
+except loom.DuplicateNameError as e:
+    print(e.name, e.kind)
+
+try:
+    BloomFilter._check_nesting(Dict)   # unsupported combination
+except loom.NestingNotSupportedError as e:
+    print(e.outer, e.inner)
+```
+
+Full exception hierarchy (`loom.LoomError` is the base):
+
+```
+LoomError
+├── DatabaseError
+│   ├── DatabaseNotOpenError
+│   ├── DuplicateNameError
+│   ├── StructureNotFoundError   (also KeyError)
+│   └── NestingNotSupportedError
+├── HeaderError
+│   └── HeaderTooLargeError
+├── SchemaError
+│   ├── InvalidIdentifierError
+│   └── UnknownDtypeError
+└── RecordError
+    ├── DeletedRecordError
+    └── WrongDatasetError
+```
+
+---
 
 ## Performance
 
-### Benchmarks
+Benchmarks on a modern laptop (Linux, SSD), 10 000 operations.
 
-**Dict operations** (1M items):
-- Insert: ~1.5 μs per item
-- Read (cached): ~0.5 μs per item
-- Read (uncached): ~2 μs per item
-- Contains (with bloom): ~0.3 μs per check
+### loom vs SqliteDict
 
-**List operations** (1M items):
-- Append: ~1.2 μs per item
-- Read by index: ~0.8 μs per item
-- Slice (100 items): ~80 μs
+| Operation | **loom** | **SqliteDict** | Speedup |
+|---|---:|---:|---:|
+| Dict insert (batch) | 23 700 ops/s | 44 400 ops/s | 0.5× |
+| **Dict read** | **45 600 ops/s** | 13 100 ops/s | **3.5×** |
+| **Dict contains** | **61 900 ops/s** | 12 800 ops/s | **4.8×** |
 
-### Optimization Tips
+loom inserts are slower than SqliteDict's batch commit because loom flushes header metadata per-allocation. SqliteDict buffers in SQLite's WAL and commits once. Use `db.batch()` for bulk inserts.
 
-1. **Use bloom filters** for large dicts:
-   ```python
-   users = db.create_dict("users", user_ds, bloom_size=100000)
-   ```
+loom **reads and lookups are 3–5× faster** thanks to mmap zero-copy access — no SQL parsing, no pickle deserialization per read.
 
-2. **Adjust cache sizes**:
-   ```python
-   hot_data = db.create_dict("hot", ds, cache_size=10000)
-   cold_data = db.create_dict("cold", ds, cache_size=10)
-   ```
+### loom operations reference
 
-3. **Batch atomic operations**:
-   ```python
-   logs.append_many(items, atomic=True)  # vs many individual appends
-   ```
+| Structure | Operation | ops/s | µs/op |
+|---|---|---:|---:|
+| Dict | insert (batch) | 23 700 | 42 |
+| Dict | read | 45 600 | 22 |
+| Dict | contains (bloom) | 61 900 | 16 |
+| List | append | 18 500 | 54 |
+| List | read[i] | 132 400 | 8 |
+| Queue | push (batch) | 237 900 | 4 |
+| Queue | pop | 42 200 | 24 |
 
-4. **Use fast path for non-critical data**:
-   ```python
-   cache[key] = value  # Fast (default)
-   critical.__setitem__(key, value, atomic=True)  # Crash-safe
-   ```
+### Impact of `str` (text) fields
 
-## Architecture
+`str` fields are stored as variable-length blobs in a separate BlobStore. The cost depends on the compression setting:
 
-### Memory-Mapped I/O
+| Schema | Compression | insert | read |
+|---|---|---:|---:|
+| Fixed fields only | — | 23 700 ops/s | 45 600 ops/s |
+| + `str` body field | None | 14 900 ops/s | 38 900 ops/s |
+| + `str` body field | brotli | 1 800 ops/s | 25 800 ops/s |
 
-All data is memory-mapped for zero-copy access:
+**Guidelines:**
+- Use `blob_compression=None` when write throughput matters more than disk space.
+- Use `"brotli"` for text-heavy workloads where compression is 3–5× (natural language).
+- Use `Field(max_length=N)` for short, frequently-read fields (IDs, roles, tags) to keep them in the fixed-size record and avoid BlobStore entirely.
 
-```
-┌─────────────────────────────────────┐
-│         Database File               │
-├─────────────────────────────────────┤
-│  Header (4KB)                       │
-│  - Metadata                         │
-│  - Dataset registry                 │
-├─────────────────────────────────────┤
-│  Datasets                           │
-│  - User data (structured records)   │
-│  - Hash tables (Dict)               │
-│  - Block arrays (List)              │
-├─────────────────────────────────────┤
-│  Data Structures                    │
-│  - Dict metadata                    │
-│  - List metadata                    │
-│  - Bloom filters                    │
-└─────────────────────────────────────┘
-```
+---
 
-### Hash Table Growth
+## Reliability
 
-Dict uses linear hashing for automatic growth:
+**Crash safety**
+- Double-buffer header: two alternating slots, single-byte atomic flip. If the process crashes mid-write, the previous slot is intact.
+- Write-Ahead Log (WAL) for multi-write atomic transactions (`db.apply_writes()`).
+- `auto_save_interval=N` controls how often metadata is flushed to disk (default: every 100 ops per structure). Set lower for more durability, higher for more speed.
 
-```
-Initial: 1 table (256 slots)
-After growth: 2 tables (256 + 512 slots)
-After growth: 3 tables (256 + 512 + 1024 slots)
-...
-```
+**Space reclamation**
+- `ByteFileDB` freelist: freed blocks (Queue pop exhaustion, List compaction) are reused by any future allocation — the file does not grow unboundedly in steady state.
+- `Dict` tracks freed value slots and reuses them for new inserts.
+- `List.compact()` rebuilds without deleted items and returns old blocks to the freelist.
 
-### Block Allocation
+**Session safety**
+- Multiple processes reading simultaneously: safe — each has its own independent mmap.
+- Single writer + multiple readers: safe for fixed-schema fields. The writer always writes the value record before making the hash table entry visible. Avoid concurrent reads of a record whose `text` field is being updated.
 
-List uses exponential block growth:
+---
 
-```
-Block 0: 256 items
-Block 1: 512 items
-Block 2: 1024 items
-Block 3: 2048 items
-...
-```
+## When to use loom
 
-### Write-Ahead Logging
-
-Atomic operations use WAL for crash safety:
-
-```
-1. Log operation to WAL file
-2. Apply operation to data file
-3. Commit WAL entry
-4. On crash: replay uncommitted WAL entries
-```
-
-## Documentation
-
-- [Getting Started](docs/GETTING_STARTED.md) - Tutorial and examples
-- [API Reference](docs/API_REFERENCE.md) - Complete API documentation
-- [PLAN.md](PLAN.md) - Roadmap and development status
-
-## Testing
-
-```bash
-# Run all tests
-python -m pytest tests/ -v
-
-# Run specific test file
-python -m pytest tests/test_dict_atomic.py -v
-
-# Run with coverage
-python -m pytest tests/ --cov=loom --cov-report=html
-```
-
-**Current status**: ✅ 168/168 tests passing
-
-## Examples
-
-### User Management
-
-```python
-with DB("users.db") as db:
-    user_ds = db.create_dataset("users", 
-        id="uint64", 
-        username="U50", 
-        email="U100",
-        is_active="bool"
-    )
-    users = db.create_dict("users", user_ds, bloom_size=100000)
-    
-    users["alice"] = {
-        "id": 1,
-        "username": "alice",
-        "email": "alice@example.com",
-        "is_active": True
-    }
-    
-    if "alice" in users:
-        print(f"Welcome {users['alice']['username']}!")
-```
-
-### Event Log
-
-```python
-with DB("events.db") as db:
-    event_ds = db.create_dataset("events",
-        timestamp="uint64",
-        event_type="U50",
-        user_id="uint64",
-        data="U500"
-    )
-    events = db.create_list("events", event_ds)
-    
-    # Atomic append for crash safety
-    events.append({
-        "timestamp": 1234567890,
-        "event_type": "login",
-        "user_id": 1,
-        "data": "User logged in"
-    }, atomic=True)
-    
-    # Query recent events
-    recent = events[-100:]
-```
-
-### Hierarchical Data
-
-```python
-with DB("hierarchy.db") as db:
-    item_ds = db.create_dataset("items", id="uint32", name="U50", value="float32")
-    ItemList = List.template(item_ds)
-    categories = db.create_list("categories", ItemList)
-    
-    # Add category with items
-    electronics = categories.append()
-    electronics.append({"id": 1, "name": "Laptop", "value": 999.99})
-    electronics.append({"id": 2, "name": "Phone", "value": 699.99})
-    
-    # Access nested data
-    print(categories[0][0]["name"])  # "Laptop"
-```
-
-## Limitations
-
-### Current Limitations
-
-- **No concurrent access**: Single process only (no file locking yet)
-- **No multi-operation transactions**: Atomic operations are per-operation
-- **No compression**: Data stored uncompressed
-- **No encryption**: Data stored in plaintext
-- **Fixed schemas**: Cannot modify dataset schema after creation
-
-### Roadmap
-
-See [PLAN.md](PLAN.md) for planned features and improvements.
-
-## Contributing
-
-Contributions welcome! Please:
-
-1. Run tests: `python -m pytest tests/ -v`
-2. Follow existing code style
-3. Add tests for new features
-4. Update documentation
-
-## License
-
-[Add license information]
-
-## Acknowledgments
-
-Built with:
-- Memory-mapped I/O via Python's `mmap`
-- NumPy for structured arrays
-- Linear hashing for Dict growth
-- Write-Ahead Logging for crash recovery
+| Scenario | Recommendation |
+|---|---|
+| Fast persistent key-value, read-heavy | **loom Dict** |
+| Ordered data, range / prefix queries | **loom BTree** |
+| FIFO task queue, event stream | **loom Queue** |
+| Graph data, social / knowledge networks | **loom Graph** |
+| Large text content per record | **loom + `str` + brotli** |
+| Complex relational queries (JOINs) | SQLite / PostgreSQL |
+| Concurrent multi-writer | SQLite / PostgreSQL |
+| Pure analytics, columnar scans | Parquet / DuckDB |
