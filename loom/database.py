@@ -817,3 +817,45 @@ class DB:
         self._datastructures[name] = q
         self._save_datastructures_registry()
         return q
+
+    def create_lru_dict(
+        self, name, schema, capacity=1000, key_size=50,
+        hash_keys=False, hash_bits=128,
+    ):
+        """Create a persistent LRU Dict (fixed-capacity, evicts LRU on insert).
+
+        Args:
+            name:      Unique name
+            schema:    Pydantic BaseModel, dict of dtypes, or existing Dataset
+            capacity:  Maximum number of entries (evicts oldest on overflow)
+            key_size:  Max key length (ignored when hash_keys=True)
+            hash_keys: Hash keys before storage (for long/arbitrary keys)
+            hash_bits: Hash length in bits (64 or 128 recommended)
+
+        Example:
+            from pydantic import BaseModel
+
+            class Profile(BaseModel):
+                name:  str
+                score: float
+
+            cache = db.create_lru_dict("profiles", Profile, capacity=10_000)
+            cache["alice"] = {"name": "Alice", "score": 9.5}
+            val = cache["alice"]    # O(1), moves alice to most-recent
+        """
+        if not self._is_open:
+            raise DatabaseNotOpenError()
+
+        from loom.datastructures.lru_dict import LRUDict
+
+        if name in self._datastructures:
+            return self._datastructures[name]
+
+        lru = LRUDict(
+            name, self, schema,
+            capacity=capacity, key_size=key_size,
+            hash_keys=hash_keys, hash_bits=hash_bits,
+        )
+        self._datastructures[name] = lru
+        self._save_datastructures_registry()
+        return lru

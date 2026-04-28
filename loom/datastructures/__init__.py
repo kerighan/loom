@@ -17,6 +17,7 @@ from loom.datastructures.set import Set
 from loom.datastructures.btree import BTree
 from loom.datastructures.graph import Graph
 from loom.datastructures.queue import Queue
+from loom.datastructures.lru_dict import LRUDict
 
 __all__ = [
     "DataStructure",
@@ -29,4 +30,5 @@ __all__ = [
     "BTree",
     "Graph",
     "Queue",
+    "LRUDict",
 ]
