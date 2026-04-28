@@ -348,9 +348,10 @@ class Set(DataStructure):
             dict_instance._inline_metadata = None
             dict_instance._metadata_key = None
             dict_instance._shared_datasets = {}
-            dict_instance._hash_keys = False
-            dict_instance._hash_bits = 128
+            dict_instance._hash_keys   = False
+            dict_instance._hash_bits   = 128
             dict_instance._hash_key_fn = None
+            dict_instance._store_key   = True
 
             # These will be set by set_shared_datasets
             dict_instance._hash_table = None

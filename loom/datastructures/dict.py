@@ -112,20 +112,31 @@ class Dict(DataStructure):
         initial_capacity=None,
         hash_keys=False,
         hash_bits=128,
+        store_key=True,
         _parent=None,
     ):
         self.cache_size = cache_size
-        self.use_bloom = use_bloom
-        self._key_size = key_size or self.DEFAULT_KEY_SIZE
+        # store_key=False: binary murmur128 mode — no key stored, 26 bytes/slot
+        # hash_keys=True:  legacy hex-string mode (kept for compat)
+        self._store_key = store_key
         self._hash_keys = hash_keys
         self._hash_bits = hash_bits
-        if hash_keys:
-            # Each hash stored as hex → bits/4 hex chars
+
+        if not store_key:
+            # Binary mode: key field replaced by hash_hi + hash_lo
+            self._key_size = 0        # unused
+            self._hash_key_fn = None  # we compute murmur128 directly
+            self.use_bloom = False    # unnecessary with O(1) int comparison
+        elif hash_keys:
+            # Legacy hex-string mode
             hex_chars = hash_bits // 4
             self._key_size = hex_chars
             self._hash_key_fn = self._make_hash_fn(hex_chars)
         else:
+            self._key_size = key_size or self.DEFAULT_KEY_SIZE
             self._hash_key_fn = None
+
+        self.use_bloom = use_bloom if store_key and not hash_keys else False
         self._initial_capacity = initial_capacity or self.DEFAULT_INITIAL_CAPACITY
         self._parent = _parent  # Parent Dict if this is nested
         self._parent_key = None  # Key in parent dict (set by parent)
@@ -170,6 +181,27 @@ class Dict(DataStructure):
         self.next_data_offset += 1
         return addr
 
+    # ── Hash table schema helpers ─────────────────────────────────────────
+
+    def _ht_schema(self):
+        """Return the schema for this Dict's hash table."""
+        if not self._store_key:
+            # Binary murmur128 mode: no key field
+            return {
+                "hash_hi":     "uint64",
+                "hash_lo":     "uint64",
+                "value_addr":  "uint64",
+                "valid":       "bool",
+            }
+        return {
+            "hash":       "uint64",
+            "key":        f"U{self._key_size}",
+            "value_addr": "uint64",
+            "valid":      "bool",
+        }
+
+    # ── Key normalisation ─────────────────────────────────────────────────
+
     @staticmethod
     def _make_hash_fn(hex_chars):
         import hashlib
@@ -177,11 +209,28 @@ class Dict(DataStructure):
             return hashlib.sha256(str(key).encode()).hexdigest()[:hex_chars]
         return _hk
 
+    @staticmethod
+    def _murmur128(key):
+        """MurmurHash3_x64_128 → (hi: uint64, lo: uint64)."""
+        if not isinstance(key, str):
+            key = str(key)
+        h = mmh3.hash128(key, signed=False)
+        return (h >> 64, h & 0xFFFF_FFFF_FFFF_FFFF)
+
     def _to_internal_key(self, key):
-        """Apply hash function if hash_keys=True, else return key unchanged."""
+        """Normalise key for internal storage and lookup.
+
+        store_key=True + hash_keys=False: return str as-is
+        store_key=True + hash_keys=True:  return SHA-256 hex prefix
+        store_key=False:                  return (hi, lo) murmur128 tuple
+        """
+        if not self._store_key:
+            if isinstance(key, tuple):
+                return key   # already normalised
+            return self._murmur128(key)
         if self._hash_key_fn is not None:
             return self._hash_key_fn(key)
-        return key
+        return key if isinstance(key, str) else str(key)
 
     def _get_capacity(self, p):
         return self.GROWTH_FACTOR**p
@@ -190,6 +239,11 @@ class Dict(DataStructure):
         return int(round(p * self.PROBE_FACTOR * self.GROWTH_FACTOR))
 
     def _hash(self, key, seed=0):
+        """Return the uint32 bucket index for a (possibly pre-normalised) key."""
+        if not self._store_key:
+            # key is (hi, lo) tuple — use hi as bucket (already 64-bit uniform)
+            hi = key[0] if isinstance(key, tuple) else self._murmur128(key)[0]
+            return hi & 0xFFFF_FFFF  # keep as uint32-range for compat
         if not isinstance(key, str):
             key = str(key)
         return mmh3.hash(key, seed=seed, signed=False)
@@ -230,13 +284,10 @@ class Dict(DataStructure):
             # No shared datasets (we're a child, not a container)
             self._shared_datasets = {}
         else:
-            # Top-level dict: create our own datasets
+            # Top-level dict: create our own datasets using the appropriate schema
             self._hash_table = self._db.create_dataset(
                 f"_dict_{self.name}_hashtable",
-                hash="uint64",
-                key=f"U{self._key_size}",  # Configurable key size
-                value_addr="uint64",
-                valid="bool",
+                **self._ht_schema(),
             )
 
             # For nested dict containers, create shared datasets for children
@@ -319,8 +370,11 @@ class Dict(DataStructure):
         self._is_nested = metadata.get("is_nested", False)
         self._key_size = metadata.get("key_size", self.DEFAULT_KEY_SIZE)
         self._hash_keys = metadata.get("hash_keys", False)
-        self._hash_bits = metadata.get("hash_bits", 128)
-        if self._hash_keys:
+        self._hash_bits  = metadata.get("hash_bits",  128)
+        self._store_key  = metadata.get("store_key",  True)
+        if not self._store_key:
+            self._hash_key_fn = None
+        elif self._hash_keys:
             self._hash_key_fn = self._make_hash_fn(self._hash_bits // 4)
         else:
             self._hash_key_fn = None
@@ -484,9 +538,10 @@ class Dict(DataStructure):
             instance._inline_metadata = None
             instance._metadata_key = None
             instance.values_capacity = 10000  # Default for nested
-            # hash_keys not supported for nested dicts
-            instance._hash_keys = False
-            instance._hash_bits = 128
+            # hash_keys / store_key not used for nested dicts
+            instance._hash_keys   = False
+            instance._hash_bits   = 128
+            instance._store_key   = True
             instance._hash_key_fn = None
 
             # These will be set by the parent when reconstructing
@@ -535,8 +590,9 @@ class Dict(DataStructure):
             "key_size": self._key_size,
             "initial_capacity": self._initial_capacity,
             "value_freelist": getattr(self, "_value_freelist", []),
-            "hash_keys": getattr(self, "_hash_keys", False),
-            "hash_bits": getattr(self, "_hash_bits", 128),
+            "hash_keys":  getattr(self, "_hash_keys",  False),
+            "hash_bits":  getattr(self, "_hash_bits",  128),
+            "store_key":  getattr(self, "_store_key",  True),
         }
         # Save per-table bloom filter names
         if self.use_bloom and self._blooms:
@@ -581,6 +637,15 @@ class Dict(DataStructure):
         except KeyError:
             pass  # Key not found, nothing to update
 
+    def _entry_key_matches(self, entry, key):
+        """Check if a deserialized hash table entry matches the internal key."""
+        if not self._store_key:
+            # key is (hi, lo) tuple; entry has hash_hi + hash_lo
+            return (entry.get("valid", False)
+                    and int(entry.get("hash_hi", -1)) == key[0]
+                    and int(entry.get("hash_lo", -1)) == key[1])
+        return entry.get("valid", False) and entry.get("key") == key
+
     def _find_slot(self, key, key_hash, for_insert=False):
         """Find slot for key using per-table bloom filters.
 
@@ -594,17 +659,15 @@ class Dict(DataStructure):
         for p in range(self.p_last, p_init - 1, -1):
             table_idx = p - p_init
 
-            # Use bloom filter to skip tables
+            # Use bloom filter to skip tables (only in store_key=True mode)
             if self._blooms and table_idx < len(self._blooms):
                 if key not in self._blooms[table_idx]:
-                    # Key definitely not in this table - skip it
                     continue
 
             result = self._find_slot_in_table(key, key_hash, p, for_insert=False)
             if result is not None:
                 p_res, table_addr, position, entry = result
-                if entry.get("valid", False) and entry.get("key") == key:
-                    # Found the key - return it
+                if self._entry_key_matches(entry, key):
                     return result
 
         # Key not found in any table
@@ -631,17 +694,23 @@ class Dict(DataStructure):
         first_free = None
         slots_to_read = min(probe_range, capacity)
 
-        # Field offsets in hash table record:
-        # _prefix: 1 byte at offset 0
-        # hash: 8 bytes at offset 1
-        # key: key_size*4 bytes at offset 9
-        # value_addr: 8 bytes at offset 9 + key_size*4
-        # valid: 1 byte at offset 9 + key_size*4 + 8
-        # Get actual key size from hash table schema (more reliable than _key_size)
-        # Schema format: [('_prefix', 'i1'), ('hash', '<u8'), ('key', '<U50'), ...]
-        key_dtype = str(self._hash_table.schema[2])  # e.g., '<U50' or 'U100'
-        key_chars = int(key_dtype.replace("<U", "").replace("U", ""))
-        valid_offset = 9 + key_chars * 4 + 8  # offset of valid field
+        # Field offsets differ by mode:
+        # store_key=True:  [_prefix:1][hash:8][key:key_chars*4][value_addr:8][valid:1]
+        # store_key=False: [_prefix:1][hash_hi:8][hash_lo:8][value_addr:8][valid:1]
+        if not self._store_key:
+            # Binary mode: fixed offsets, two uint64 comparisons, no string
+            #   offset 0: prefix (1B)
+            #   offset 1: hash_hi (8B)
+            #   offset 9: hash_lo (8B)
+            #   offset 17: value_addr (8B)
+            #   offset 25: valid (1B) — but Dataset adds prefix so actually:
+            # use schema-derived valid_offset for correctness
+            valid_offset = self._hash_table.schema.fields["valid"][1]
+            hi, lo = key  # key is (hi, lo) tuple
+        else:
+            key_dtype = str(self._hash_table.schema[2])
+            key_chars = int(key_dtype.replace("<U", "").replace("U", ""))
+            valid_offset = 9 + key_chars * 4 + 8
 
         # Check if we wrap around
         if bucket + slots_to_read <= capacity:
@@ -651,39 +720,49 @@ class Dict(DataStructure):
             try:
                 chunk_data = self._hash_table.db.read(start_addr, chunk_size)
 
-                # OPTIMIZATION: Check hash and valid first before full deserialize
                 for i in range(slots_to_read):
                     position = bucket + i
                     offset = i * record_size
 
-                    # Quick check: valid byte (0 = invalid/empty)
+                    # Quick check: valid byte
                     valid = chunk_data[offset + valid_offset]
                     if not valid:
                         if for_insert and first_free is None:
                             first_free = (p, table_addr, position, {})
                         continue
 
-                    # Quick check: hash match (8 bytes at offset 1)
-                    entry_hash = struct.unpack_from("<Q", chunk_data, offset + 1)[0]
-                    if entry_hash != key_hash:
-                        continue
-
-                    # Hash matches - now deserialize full entry to check key
-                    entry_data = chunk_data[offset : offset + record_size]
-                    try:
-                        entry = self._hash_table._deserialize(entry_data)
-                    except Exception:
-                        continue
-
-                    if entry["key"] == key:
+                    if not self._store_key:
+                        # Binary: compare hi (offset 1) then lo (offset 9)
+                        entry_hi = struct.unpack_from("<Q", chunk_data, offset + 1)[0]
+                        if entry_hi != hi:
+                            continue
+                        entry_lo = struct.unpack_from("<Q", chunk_data, offset + 9)[0]
+                        if entry_lo != lo:
+                            continue
+                        # Full match (probability 1/2^128 of false positive)
+                        entry_data = chunk_data[offset : offset + record_size]
+                        try:
+                            entry = self._hash_table._deserialize(entry_data)
+                        except Exception:
+                            continue
                         return (p, table_addr, position, entry)
+                    else:
+                        # String mode: check hash first, then deserialise for key
+                        entry_hash = struct.unpack_from("<Q", chunk_data, offset + 1)[0]
+                        if entry_hash != key_hash:
+                            continue
+                        entry_data = chunk_data[offset : offset + record_size]
+                        try:
+                            entry = self._hash_table._deserialize(entry_data)
+                        except Exception:
+                            continue
+                        if entry["key"] == key:
+                            return (p, table_addr, position, entry)
 
             except Exception:
-                # Fallback to individual reads if batch read fails
                 pass
         else:
-            # Wraparound case - fall back to individual reads
-            # (Could optimize this too, but wraparound is rare)
+            # Wraparound — individual reads
             for i in range(slots_to_read):
                 position = (bucket + i) % capacity
                 entry_addr = table_addr + position * record_size
@@ -700,8 +779,13 @@ class Dict(DataStructure):
                         first_free = (p, table_addr, position, entry)
                     continue
 
-                if entry["hash"] == key_hash and entry["key"] == key:
-                    return (p, table_addr, position, entry)
+                if not self._store_key:
+                    if (int(entry.get("hash_hi", -1)) == hi
+                            and int(entry.get("hash_lo", -1)) == lo):
+                        return (p, table_addr, position, entry)
+                else:
+                    if entry["hash"] == key_hash and entry["key"] == key:
+                        return (p, table_addr, position, entry)
 
         if for_insert and first_free is not None:
             return first_free
@@ -806,22 +890,32 @@ class Dict(DataStructure):
                     value_addr = self._alloc_value_addr()
                     self._values_dataset[value_addr] = value
 
-            self._hash_table[entry_addr] = {
-                "hash": key_hash,
-                "key": key,
-                "value_addr": value_addr,
-                "valid": True,
-            }
-            # Add to the correct table's bloom filter
+            if not self._store_key:
+                hi, lo = key  # key is (hi, lo) tuple
+                self._hash_table[entry_addr] = {
+                    "hash_hi":    hi,
+                    "hash_lo":    lo,
+                    "value_addr": value_addr,
+                    "valid":      True,
+                }
+            else:
+                self._hash_table[entry_addr] = {
+                    "hash":       key_hash,
+                    "key":        key,
+                    "value_addr": value_addr,
+                    "valid":      True,
+                }
+            # Add to the correct table's bloom filter (store_key=True only)
             p_init = getattr(self, "_p_init", self.P_INIT)
             table_idx = p - p_init
             if self._blooms and table_idx < len(self._blooms):
                 self._blooms[table_idx].add(key)
             self.size += 1
 
-        # Cache the actual value (not the address!)
+        # Cache — use a hashable key (tuple for binary mode)
         if self._cache:
-            self._cache[key] = value if self._is_nested else int(value_addr)
+            cache_k = key if self._store_key else (key[0] << 64 | key[1])
+            self._cache[cache_k] = value if self._is_nested else int(value_addr)
 
         self._auto_save_check()
 
@@ -966,16 +1060,19 @@ class Dict(DataStructure):
         Raises:
             KeyError: If key not found
         """
-        # Check cache first (stores actual values!)
+        # Normalise key and compute cache key before cache check
+        key = self._to_internal_key(key)
+        cache_k = key if self._store_key else (key[0] << 64 | key[1])
+
+        # Check cache first
         if self._cache:
-            cached_value = self._cache.get(key)
+            cached_value = self._cache.get(cache_k)
             if cached_value is not None:
                 if self._is_nested:
                     return cached_value
                 return self._values_dataset[int(cached_value)]
 
         # Cache miss - do full lookup
-        key = self._to_internal_key(key)
         key_hash = self._hash(key)
 
         try:
@@ -1003,7 +1100,7 @@ class Dict(DataStructure):
 
             # Cache the actual value for next time!
             if self._cache:
-                self._cache[key] = result if self._is_nested else int(value_addr)
+                self._cache[cache_k] = result if self._is_nested else int(value_addr)
 
             return result
         except KeyError:
@@ -1171,9 +1268,10 @@ class Dict(DataStructure):
         if self._parent is not None:
             return None
         return {
-            "schema": self.item_schema,
+            "schema":    self.item_schema,
             "cache_size": self.cache_size,
             "use_bloom": self.use_bloom,
+            "store_key": getattr(self, "_store_key", True),
         }
 
     @classmethod
@@ -1182,6 +1280,7 @@ class Dict(DataStructure):
             name, db, params["schema"],
             cache_size=params.get("cache_size", 1000),
             use_bloom=params.get("use_bloom", True),
+            store_key=params.get("store_key", True),
         )
 
     def to_dict(self):

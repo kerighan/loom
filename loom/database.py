@@ -620,6 +620,7 @@ class DB:
         initial_capacity=None,
         hash_keys=False,
         hash_bits=128,
+        store_key=True,
     ):
         """Create a persistent Dict.
 
@@ -663,6 +664,7 @@ class DB:
             initial_capacity=initial_capacity,
             hash_keys=hash_keys,
             hash_bits=hash_bits,
+            store_key=store_key,
         )
         self._datastructures[name] = dct  # Register for caching and auto-save
         self._save_datastructures_registry()  # Persist registry
