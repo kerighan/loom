@@ -69,12 +69,28 @@ def _resolve_str_field(field_info) -> str:
 
 def _resolve_type(annotation: Any, field_info: Any = None) -> str:
     """Map a Python type annotation to a loom dtype string."""
-    # Unwrap Optional[X] → X
+    # Check field_info.metadata for Vec marker first
+    # (Pydantic v2 stores Annotated[...] metadata in field_info.metadata)
+    if field_info is not None:
+        for meta in getattr(field_info, "metadata", []):
+            loom_dtype = getattr(meta, "loom_dtype", None)
+            if loom_dtype:
+                return loom_dtype
+
+    # Also check via get_args (direct Annotated usage outside Pydantic)
     origin = get_origin(annotation)
-    if origin is Union:
-        args = [a for a in get_args(annotation) if a is not type(None)]
-        if len(args) == 1:
-            annotation = args[0]
+    if origin is not None:
+        args = get_args(annotation)
+        if args:
+            for meta in args[1:]:
+                loom_dtype = getattr(meta, "loom_dtype", None)
+                if loom_dtype:
+                    return loom_dtype
+        # Unwrap Optional[X] → X
+        if origin is Union:
+            inner = [a for a in args if a is not type(None)]
+            if len(inner) == 1:
+                annotation = inner[0]
 
     if annotation is str:
         return _resolve_str_field(field_info) if field_info else "text"
@@ -85,7 +101,7 @@ def _resolve_type(annotation: Any, field_info: Any = None) -> str:
 
     raise TypeError(
         f"Cannot map type {annotation!r} to a loom dtype. "
-        f"Supported: int, float, bool, str (+ Optional variants)."
+        f"Supported: int, float, bool, str, Vec(N) (+ Optional variants)."
     )
 
 
@@ -111,6 +127,46 @@ def schema_from_model(model_class) -> dict[str, str]:
     for name, field_info in model_class.model_fields.items():
         schema[name] = _resolve_type(field_info.annotation, field_info)
     return schema
+
+
+def Vec(*shape: int):
+    """Fixed-length numpy array field for a Pydantic model.
+
+    Stored inline in the record (no BlobStore), so reads are a single
+    mmap slice with zero copies.  Ideal for embeddings and feature vectors.
+
+    Args:
+        *shape: dimensions, e.g. Vec(1536) or Vec(8, 8)
+
+    Returns:
+        An Annotated type that loom maps to 'float32[N]' or 'float32[M,N]'
+
+    Example:
+        class Passage(BaseModel):
+            text:      str
+            embedding: Vec(1536)    # → stores 1536×float32 inline (6 KB/record)
+
+        passages = db.create_dataset("passages", Passage)
+        ref = passages.insert({"text": "hello", "embedding": np.zeros(1536)})
+        rec = passages.read(ref.addr)
+        print(rec["embedding"].shape)   # (1536,)
+        print(rec["embedding"].dtype)   # float32
+
+    Tip: for exact embedding lookup use a short ID as the Dict key.
+    For approximate nearest-neighbour search, see the ROADMAP (VectorIndex).
+    """
+    from typing import Annotated
+    import numpy as np
+
+    # Build the dtype string in our format: "float32[1536]" or "float32[8,8]"
+    shape_str = ",".join(str(d) for d in shape)
+    dtype_tag = f"float32[{shape_str}]"
+
+    class _VecMeta:
+        """Marker so loom's schema_from_model recognises Vec fields."""
+        loom_dtype = dtype_tag
+
+    return Annotated[list, _VecMeta]
 
 
 def FixedStr(max_length: int):

@@ -1,3 +1,4 @@
+import re
 import numpy as np
 
 from loom.ref import Ref
@@ -6,6 +7,50 @@ from loom.errors import (
     DeletedRecordError,
     WrongDatasetError,
 )
+
+# ── Array dtype helpers ────────────────────────────────────────────────────
+
+_ARRAY_DTYPE_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9_]*)\[(\d+(?:,\d+)*)\]$")
+
+
+def parse_dtype(dtype_str):
+    """Parse a dtype string, supporting array notation like 'float32[1536]'.
+
+    Returns a numpy dtype object.
+
+    Examples:
+        'uint32'           → np.dtype('uint32')
+        'float32[1536]'    → np.dtype(('float32', (1536,)))
+        'float32[8,8]'     → np.dtype(('float32', (8, 8)))
+    """
+    m = _ARRAY_DTYPE_RE.match(str(dtype_str))
+    if m:
+        base   = m.group(1)
+        shape  = tuple(int(d) for d in m.group(2).split(","))
+        return np.dtype((base, shape))
+    return np.dtype(dtype_str)
+
+
+def dtype_to_str(dtype):
+    """Serialize a numpy dtype back to a string, preserving array shapes.
+
+    Inverse of parse_dtype().
+
+    Examples:
+        np.dtype('uint32')                    → 'uint32'   (via .str)
+        np.dtype(('float32', (1536,)))        → 'float32[1536]'
+        np.dtype(('float32', (8, 8)))         → 'float32[8,8]'
+    """
+    if dtype.shape:
+        base_str = dtype.base.str          # e.g. '<f4'
+        # Use the named form if available, else fall back to .str
+        try:
+            base_str = str(dtype.base)     # e.g. 'float32'
+        except Exception:
+            pass
+        shape_str = ",".join(str(d) for d in dtype.shape)
+        return f"{base_str}[{shape_str}]"
+    return dtype.str
 
 # Blob reference dtype: (offset: uint64, n_slots: uint16)
 # Total 10 bytes per blob field
@@ -57,7 +102,10 @@ class Dataset:
         self._blob_fields = set()   # raw bytes via BlobStore
         self._text_fields = set()   # UTF-8 strings via BlobStore (transparent)
 
-        # Convert "blob"/"text" strings to actual blob dtype
+        # Track array (vector) fields for proper serialization
+        self._array_fields = {}   # field_name → shape tuple
+
+        # Convert dtype strings, handling "blob", "text", and "float32[N]" array notation
         processed_schema = []
         for field, dtype in schema.items():
             if dtype == "blob":
@@ -67,7 +115,10 @@ class Dataset:
                 self._text_fields.add(field)
                 processed_schema.append((field, BLOB_DTYPE))
             else:
-                processed_schema.append((field, dtype))
+                np_dtype = parse_dtype(dtype)
+                if np_dtype.shape:
+                    self._array_fields[field] = np_dtype.shape
+                processed_schema.append((field, np_dtype))
 
         # Build schema with prefix
         self.schema = np.dtype([("_prefix", "int8")] + processed_schema)
@@ -132,6 +183,9 @@ class Dataset:
                     if value is not None:
                         arr[field]["offset"] = value[0]
                         arr[field]["n_slots"] = value[1]
+                elif field in self._array_fields:
+                    # numpy array field — assign directly
+                    arr[field] = np.asarray(value, dtype=self.user_schema.fields[field][0].base)
                 else:
                     arr[field] = value
             else:
@@ -139,7 +193,7 @@ class Dataset:
                 dtype = self.user_schema.fields[field][0]
                 if dtype.kind == "U":
                     arr[field] = ""
-                # blob/text default (0,0) is already in zeros
+                # blob/text and array defaults (zeros) are already in place
         return arr.tobytes()
 
     def _deserialize(self, data):
@@ -168,6 +222,9 @@ class Dataset:
                     result[field] = None  # Null blob
                 else:
                     result[field] = (offset, n_slots)
+            elif field in self._array_fields:
+                # Return a writable numpy array copy (not a mmap view)
+                result[field] = np.array(value)
             else:
                 result[field] = value
         return result

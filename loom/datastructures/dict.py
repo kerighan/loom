@@ -110,11 +110,22 @@ class Dict(DataStructure):
         auto_save_interval=None,
         key_size=None,
         initial_capacity=None,
+        hash_keys=False,
+        hash_bits=128,
         _parent=None,
     ):
         self.cache_size = cache_size
         self.use_bloom = use_bloom
         self._key_size = key_size or self.DEFAULT_KEY_SIZE
+        self._hash_keys = hash_keys
+        self._hash_bits = hash_bits
+        if hash_keys:
+            # Each hash stored as hex → bits/4 hex chars
+            hex_chars = hash_bits // 4
+            self._key_size = hex_chars
+            self._hash_key_fn = self._make_hash_fn(hex_chars)
+        else:
+            self._hash_key_fn = None
         self._initial_capacity = initial_capacity or self.DEFAULT_INITIAL_CAPACITY
         self._parent = _parent  # Parent Dict if this is nested
         self._parent_key = None  # Key in parent dict (set by parent)
@@ -158,6 +169,19 @@ class Dict(DataStructure):
         )
         self.next_data_offset += 1
         return addr
+
+    @staticmethod
+    def _make_hash_fn(hex_chars):
+        import hashlib
+        def _hk(key):
+            return hashlib.sha256(str(key).encode()).hexdigest()[:hex_chars]
+        return _hk
+
+    def _to_internal_key(self, key):
+        """Apply hash function if hash_keys=True, else return key unchanged."""
+        if self._hash_key_fn is not None:
+            return self._hash_key_fn(key)
+        return key
 
     def _get_capacity(self, p):
         return self.GROWTH_FACTOR**p
@@ -294,6 +318,12 @@ class Dict(DataStructure):
         self.use_bloom = metadata["use_bloom"]
         self._is_nested = metadata.get("is_nested", False)
         self._key_size = metadata.get("key_size", self.DEFAULT_KEY_SIZE)
+        self._hash_keys = metadata.get("hash_keys", False)
+        self._hash_bits = metadata.get("hash_bits", 128)
+        if self._hash_keys:
+            self._hash_key_fn = self._make_hash_fn(self._hash_bits // 4)
+        else:
+            self._hash_key_fn = None
         self._initial_capacity = metadata.get(
             "initial_capacity", self.DEFAULT_INITIAL_CAPACITY
         )
@@ -454,6 +484,10 @@ class Dict(DataStructure):
             instance._inline_metadata = None
             instance._metadata_key = None
             instance.values_capacity = 10000  # Default for nested
+            # hash_keys not supported for nested dicts
+            instance._hash_keys = False
+            instance._hash_bits = 128
+            instance._hash_key_fn = None
 
             # These will be set by the parent when reconstructing
             # For now, they need to be passed somehow - we'll get them from parent
@@ -501,6 +535,8 @@ class Dict(DataStructure):
             "key_size": self._key_size,
             "initial_capacity": self._initial_capacity,
             "value_freelist": getattr(self, "_value_freelist", []),
+            "hash_keys": getattr(self, "_hash_keys", False),
+            "hash_bits": getattr(self, "_hash_bits", 128),
         }
         # Save per-table bloom filter names
         if self.use_bloom and self._blooms:
@@ -705,6 +741,7 @@ class Dict(DataStructure):
 
     def _setitem_fast(self, key, value):
         """Fast path for non-atomic insert/update (current implementation)."""
+        key = self._to_internal_key(key)
         key_hash = self._hash(key)
         slot = self._find_slot(key, key_hash, for_insert=True)
 
@@ -814,12 +851,8 @@ class Dict(DataStructure):
         return Ref(self._values_dataset, value_addr)
 
     def _setitem_atomic(self, key, value):
-        """Atomic insert/update using WAL for crash safety.
-
-        All writes (hash table + values + metadata) are batched in a single
-        transaction. If crash occurs, WAL recovery will either apply all
-        writes or none.
-        """
+        """Atomic insert/update using WAL for crash safety."""
+        key = self._to_internal_key(key)
         key_hash = self._hash(key)
         slot = self._find_slot(key, key_hash, for_insert=True)
 
@@ -942,6 +975,7 @@ class Dict(DataStructure):
                 return self._values_dataset[int(cached_value)]
 
         # Cache miss - do full lookup
+        key = self._to_internal_key(key)
         key_hash = self._hash(key)
 
         try:
@@ -989,6 +1023,7 @@ class Dict(DataStructure):
         Raises:
             KeyError: If key not found
         """
+        key = self._to_internal_key(key)
         key_hash = self._hash(key)
         p, table_addr, position, entry = self._find_slot(
             key, key_hash, for_insert=False
@@ -1015,11 +1050,11 @@ class Dict(DataStructure):
         self._auto_save_check()
 
     def __contains__(self, key):
+        key = self._to_internal_key(key)
         # Check cache first
         if self._cache and self._cache.get(key) is not None:
             return True
-        # Direct hash table probe — avoids reading the value and avoids
-        # auto-creating entries in nested dicts (which __getitem__ does).
+        # Direct hash table probe
         key_hash = self._hash(key)
         try:
             self._find_slot(key, key_hash, for_insert=False)

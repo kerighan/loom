@@ -3,7 +3,7 @@
 from loom.database import DB
 from loom.dataset import Dataset
 from loom.datastructures import List, BloomFilter, CountingBloomFilter
-from loom.schema import dt_key, key_dt, dt_key_size, FixedStr, schema_from_model
+from loom.schema import dt_key, key_dt, dt_key_size, FixedStr, Vec, schema_from_model
 from loom.errors import (
     LoomError,
     DatabaseError,
@@ -32,5 +32,5 @@ __all__ = [
     "RecordError", "DeletedRecordError", "WrongDatasetError",
     "NestingNotSupportedError",
     # Datetime helpers
-    "dt_key", "key_dt", "dt_key_size", "FixedStr", "schema_from_model",
+    "dt_key", "key_dt", "dt_key_size", "FixedStr", "Vec", "schema_from_model",
 ]

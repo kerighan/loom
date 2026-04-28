@@ -273,7 +273,8 @@ class DataStructure(ABC):
             Schema dict mapping field names to dtype strings
         """
         if hasattr(dataset_or_dict, "user_schema"):
-            # It's a Dataset object — extract schema, preserving "text"/"blob" markers
+            # It's a Dataset object — extract schema, preserving all markers
+            from loom.dataset import dtype_to_str
             ds = dataset_or_dict
             result = {}
             for name in ds.user_schema.names:
@@ -282,7 +283,12 @@ class DataStructure(ABC):
                 elif hasattr(ds, "_blob_fields") and name in ds._blob_fields:
                     result[name] = "blob"
                 else:
-                    result[name] = str(ds.user_schema.fields[name][0])
+                    raw = ds.user_schema.fields[name][0]
+                    # _DummySchema stores plain strings, real Dataset stores np.dtype
+                    if isinstance(raw, str):
+                        result[name] = raw
+                    else:
+                        result[name] = dtype_to_str(raw)
             return result
         else:
             # Already a dict

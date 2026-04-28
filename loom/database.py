@@ -239,17 +239,22 @@ class DB:
             # round-trips (numpy's .str would give '|V10' for BLOB_DTYPE).
             schema = {}
             for field_name in dataset.user_schema.names:
-                if field_name in dataset._text_fields:
-                    schema[field_name] = "text"
-                elif field_name in dataset._blob_fields:
-                    schema[field_name] = "blob"
-                else:
-                    dtype = dataset.user_schema.fields[field_name][0]
-                    schema[field_name] = dtype.str
+                schema[field_name] = self._dtype_to_registry_str(dataset, field_name)
 
             registry[name] = {"identifier": dataset.identifier, "schema": schema}
 
         self._db.set_header_field(self.REGISTRY_KEY, registry)
+
+    @staticmethod
+    def _dtype_to_registry_str(dataset, field_name):
+        """Serialize one field's dtype for the registry, preserving array shapes."""
+        from loom.dataset import dtype_to_str
+        if field_name in dataset._text_fields:
+            return "text"
+        if field_name in dataset._blob_fields:
+            return "blob"
+        dtype = dataset.user_schema.fields[field_name][0]
+        return dtype_to_str(dtype)
 
     def _save_datastructures_registry(self):
         """Save data structures registry to header (generic — no per-type switch)."""
@@ -613,6 +618,8 @@ class DB:
         use_bloom=True,
         key_size=None,
         initial_capacity=None,
+        hash_keys=False,
+        hash_bits=128,
     ):
         """Create a persistent Dict.
 
@@ -654,6 +661,8 @@ class DB:
             use_bloom=use_bloom,
             key_size=key_size,
             initial_capacity=initial_capacity,
+            hash_keys=hash_keys,
+            hash_bits=hash_bits,
         )
         self._datastructures[name] = dct  # Register for caching and auto-save
         self._save_datastructures_registry()  # Persist registry
