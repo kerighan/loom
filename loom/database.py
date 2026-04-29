@@ -529,9 +529,9 @@ class DB:
     def fastapi_app(self, *, title=None):
         """Return a FastAPI app exposing this DB over HTTP.
 
-        Every dataset and datastructure is auto-mounted with proper
-        OpenAPI docs and Pydantic validation.  Mount this app in your
-        own ASGI stack, or use `db.serve()` to run it directly.
+        Datastructures are auto-mounted with proper OpenAPI docs and
+        Pydantic validation.  Mount this app in your own ASGI stack, or
+        use `db.serve()` to run it directly.
 
         Requires `fastapi` (`pip install 'fastapi[standard]'`).
         """
@@ -539,13 +539,23 @@ class DB:
 
         return build_app(self, title=title)
 
-    def serve(self, host="127.0.0.1", port=8000, **uvicorn_kwargs):
+    def serve(
+        self,
+        host="127.0.0.1",
+        port=8000,
+        dashboard=False,
+        dashboard_port=8501,
+        dashboard_host=None,
+        **uvicorn_kwargs,
+    ):
         """Run an HTTP server exposing this DB.
 
         Single-writer / single-reader: requests are serialized through
         a process-wide lock so the underlying mmap stays consistent.
 
         Blocking call.  Requires `fastapi` and `uvicorn`.
+        Pass `dashboard=True` to also start an optional Streamlit dashboard
+        backed by the HTTP API.
 
         Example:
             with DB("app.db") as db:
@@ -556,7 +566,15 @@ class DB:
         """
         from loom.server import serve
 
-        serve(self, host=host, port=port, **uvicorn_kwargs)
+        serve(
+            self,
+            host=host,
+            port=port,
+            dashboard=dashboard,
+            dashboard_port=dashboard_port,
+            dashboard_host=dashboard_host,
+            **uvicorn_kwargs,
+        )
 
     # Data Structure Factory Methods
 
@@ -926,3 +944,63 @@ class DB:
         self._datastructures[name] = lru
         self._save_datastructures_registry()
         return lru
+
+    def create_flat_index(self, name, dim, metric="cosine"):
+        """Create a FlatIndex for exact vector similarity search.
+
+        Args:
+            name:   Unique name
+            dim:    Vector dimensionality (e.g. 1536 for text-embedding-3-small)
+            metric: "cosine" (default), "l2", or "dot"
+
+        Example:
+            idx = db.create_flat_index("passages", dim=1536)
+            idx.add("doc_1", embedding)
+            results = idx.search(query, k=10)
+            # [("doc_1", 0.95), ("doc_2", 0.87), ...]
+        """
+        if not self._is_open:
+            raise DatabaseNotOpenError()
+        from loom.datastructures.vector_index import FlatIndex
+        if name in self._datastructures:
+            return self._datastructures[name]
+        idx = FlatIndex(name, self, dim=dim, metric=metric)
+        self._datastructures[name] = idx
+        self._save_datastructures_registry()
+        return idx
+
+    def create_ivf_index(
+        self, name, dim, metric="cosine",
+        n_clusters=256, pq=False, n_sub=16, n_bits=8,
+    ):
+        """Create an IVFIndex for approximate vector similarity search.
+
+        Requires calling .train(sample_vectors) before inserting.
+
+        Args:
+            name:       Unique name
+            dim:        Vector dimensionality
+            metric:     "cosine" (default), "l2", or "dot"
+            n_clusters: Number of IVF cells (default 256; rule of thumb: sqrt(n))
+            pq:         Enable Product Quantization compression (default False)
+            n_sub:      Number of PQ sub-vectors (default 16; higher → less compression)
+            n_bits:     Bits per sub-quantizer (default 8 → 256 centroids each)
+
+        Example:
+            ivf = db.create_ivf_index("passages", dim=1536,
+                                       n_clusters=256, pq=True, n_sub=16)
+            ivf.train(sample_matrix)           # train on a representative sample
+            ivf.add_batch([("id", vec), ...])  # bulk insert
+            results = ivf.search(query, k=10, nprobe=32)
+        """
+        if not self._is_open:
+            raise DatabaseNotOpenError()
+        from loom.datastructures.vector_index import IVFIndex
+        if name in self._datastructures:
+            return self._datastructures[name]
+        idx = IVFIndex(name, self, dim=dim, metric=metric,
+                       n_clusters=n_clusters, pq=pq,
+                       n_sub=n_sub, n_bits=n_bits)
+        self._datastructures[name] = idx
+        self._save_datastructures_registry()
+        return idx
