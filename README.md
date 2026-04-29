@@ -2,7 +2,7 @@
 
 **Persistent Python data structures that feel native.**
 
-loom is a file-backed database library that lets you work with `Dict`, `List`, `Queue`, `Set`, `BTree`, and `Graph` exactly like their in-memory counterparts — but stored on disk with mmap zero-copy access, crash-safe writes, and automatic space reclamation.
+loom is a file-backed database library that lets you work with `Dict`, `List`, `Queue`, `Set`, `BTree`, `Graph`, and **vector indexes** exactly like their in-memory counterparts — but stored on disk with mmap zero-copy access, crash-safe writes, and automatic space reclamation.
 
 No server. No ORM. No SQL. Just Python objects that persist.
 
@@ -201,6 +201,35 @@ tags.remove("python")
 
 for tag in tags: ...
 ```
+
+### FlatIndex / IVFIndex — vector similarity search
+
+```python
+import numpy as np
+
+# Exact search — no training
+flat = db.create_flat_index("passages", dim=1536, metric="cosine")
+flat.add("doc_1", embedding_array)                       # np.ndarray
+flat.add_batch([("doc_1", v1), ("doc_2", v2)])
+results = flat.search(query_vec, k=10)
+# [("doc_1", 0.95), ("doc_2", 0.87), ...]
+
+# Approximate — requires training
+ivf = db.create_ivf_index("passages", dim=1536,
+                            n_clusters=256,   # √n_vecs is a good default
+                            pq=False)         # True for PQ compression
+ivf.train(sample_matrix)                      # np.ndarray (n_sample, dim)
+ivf.add_batch([("doc_1", v1), ("doc_2", v2)])
+results = ivf.search(query_vec, k=10, nprobe=32)
+
+# With PQ compression (n_sub bytes per vector)
+ivf_pq = db.create_ivf_index("passages", dim=1536,
+                               n_clusters=256, pq=True, n_sub=16)
+# 1536 dims × float32 = 6 144 bytes  →  16 bytes with PQ (384× compression)
+```
+
+Metrics: `"cosine"` (default), `"l2"`, `"dot"`.  
+Vectors are L2-normalised at insert time for cosine similarity.
 
 ### BloomFilter / CountingBloomFilter — probabilistic membership
 
@@ -480,6 +509,38 @@ Read phase, point queries (10 000 random samples):
 `neighbors()` visits edges at **~25 000 edges/s** when iterating the full neighbour list of each sampled node — useful for BFS / PageRank style passes.
 
 On-disk size: ~10 KB / edge in this configuration (double-indexed `_out` + `_in` plus per-source nested-Dict overhead — each new source allocates an 8-slot hash block + 8-slot values block, which doubles on demand). The dominant cost is the per-source nested table; sparser graphs (low average degree) pay a higher per-edge constant than dense ones.
+
+### Vector search — FlatIndex and IVFIndex
+
+Benchmarks: 10 000 vectors, dim=128, cosine similarity, 50 random queries.
+K=100 IVF clusters.  Training on 5 000 samples.
+
+**Insert throughput:**
+
+| Index | insert | train |
+|---|---:|---|
+| FlatIndex | 10 600 vecs/s | — (no training) |
+| IVFFlat | 9 800 vecs/s | 5 s |
+| IVF+PQ M=16 | 2 700 vecs/s | 38 s |
+
+**Search — recall@10 vs nprobe (IVFFlat, K=100):**
+
+| nprobe | ms/query | recall@10 |
+|---|---:|---:|
+| 8 (8%) | 3.2 ms | 32% |
+| 16 (16%) | 4.2 ms | 47% |
+| 32 (32%) | 5.4 ms | 68% |
+| 50 (50%) | 6.5 ms | 82% |
+| 99 (all) | 6.3 ms | 100% |
+
+FlatIndex (exact): **6.4 ms/query**.
+
+**IVF+PQ M=16 (32× compression)** — same query times (~2–3 ms) but lower recall (15–21%) due to the V1 approximation in ADC residual computation.
+
+**V1 limitations and roadmap:**
+- IVFFlat does not yet have per-cell sequential inverted lists; it loads all records and filters by `cell_id` in numpy. Query time is therefore similar to FlatIndex regardless of nprobe. The speedup comes from the reduced comparison set, not from skipping disk I/O.
+- IVF+PQ residual computation uses a single approximate centroid at search time, which reduces recall. V2 will compute per-cell residuals.
+- Both will improve in V2 with true inverted list access (per-cell contiguous blocks) and correct per-cell residuals.
 
 ---
 

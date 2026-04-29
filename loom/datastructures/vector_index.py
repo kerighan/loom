@@ -754,6 +754,7 @@ class IVFIndex(VectorIndex):
         # Step 1: find nprobe nearest centroids
         diff       = q[None, :] - self._centroids           # (K, d)
         cent_dists = np.sum(diff * diff, axis=1)             # (K,)
+        nprobe      = min(nprobe, len(self._centroids))
         probe_cells = np.argpartition(cent_dists, nprobe)[:nprobe]
 
         # Step 2: bulk read all cell records
