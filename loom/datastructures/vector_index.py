@@ -456,14 +456,22 @@ class FlatIndex(VectorIndex):
 class IVFIndex(VectorIndex):
     """Approximate nearest-neighbour using an Inverted File Index.
 
-    Training partitions the space into n_clusters Voronoi cells.
-    Each vector is stored in the cell of its nearest centroid.
-    Search probes nprobe cells (default: sqrt(n_clusters)).
+    Storage layout (uses loom Dict[List]):
+      cell_vecs: Dict[cluster_id → List[{vec: float32[dim]}]]
+        Per-cluster sequential blocks → single mmap read per probed cell.
+      cell_ids:  Dict[cluster_id → List[{ext_id: U{max_id_len}}]]
+        IDs resolved *after* distance computation (late resolution for top-k).
 
-    pq=True enables Product Quantization:
-      Vectors are compressed to n_sub uint8 codes (vs full float32).
-      Gives 10–100× storage reduction; recall depends on n_sub.
-      Codebooks are trained alongside IVF centroids.
+    Search:
+      1. Find nprobe nearest centroids.
+      2. For each probed cell: slice_array() → numpy matrix → vectorised scores.
+      3. Merge top-k across cells.
+      4. Resolve IDs only for the top-k winners.
+
+    pq=True — Product Quantization:
+      cell_vecs stores uint8[n_sub] codes instead of float32 vectors.
+      Codebook training runs alongside k-means on residuals.
+      ~32–384× storage compression depending on n_sub and dim.
     """
 
     def __init__(
@@ -476,68 +484,79 @@ class IVFIndex(VectorIndex):
         pq: bool = False,
         n_sub: int = 16,
         n_bits: int = 8,
+        max_id_len: int = 50,
         auto_save_interval=None,
         _parent=None,
     ):
-        self.n_clusters   = n_clusters
-        self.pq           = pq
-        self.n_sub        = n_sub
-        self.n_bits       = n_bits
-        self._trained     = False
-        self._centroids   = None    # np.ndarray (K, dim)
-        self._codebooks   = None    # np.ndarray (M, K_sub, sub_dim) — PQ only
+        self.n_clusters = n_clusters
+        self.pq         = pq
+        self.n_sub      = n_sub
+        self.n_bits     = n_bits
+        self.max_id_len = max_id_len
+        self._trained   = False
+        self._centroids = None
+        self._codebooks = None
 
         super().__init__(name, db, dim=dim, metric=metric,
                          auto_save_interval=auto_save_interval, _parent=_parent)
 
-    def _initialize(self):
-        # Cell data: per-vector { cell_id, vec (or pq_codes) }
-        if self.pq:
-            cell_schema = {
-                "cell_id":  "uint32",
-                "pq_codes": f"uint8[{self.n_sub}]",
-            }
-        else:
-            cell_schema = {
-                "cell_id": "uint32",
-                "vec":     f"float32[{self.dim}]",
-            }
-        self._cell_ds = self._db.create_dataset(
-            f"_vidx_{self.name}_cells", **cell_schema
+    # ── Internal structures ───────────────────────────────────────────────
+
+    def _make_cell_dicts(self):
+        """Create the two Dict[List] structures for per-cell storage."""
+        from loom.datastructures.dict import Dict
+        from loom.datastructures.list import List
+
+        # vec schema: float32[dim] or uint8[n_sub] for PQ
+        vec_field = f"pq_codes" if self.pq else "vec"
+        vec_dtype = (f"uint8[{self.n_sub}]" if self.pq
+                     else f"float32[{self.dim}]")
+
+        vec_ds = self._db.create_dataset(
+            f"_vidx_{self.name}_vec_ds", **{vec_field: vec_dtype}
         )
-        # Centroids dataset (created now; populated on train())
+        id_ds  = self._db.create_dataset(
+            f"_vidx_{self.name}_id_ds",
+            ext_id=f"U{self.max_id_len}",    # fixed-length → inline, fast bulk read
+        )
+        VecList = List.template(vec_ds)
+        IdList  = List.template(id_ds)
+
+        self._cell_vecs = Dict(
+            f"_vidx_{self.name}_cell_vecs", self._db, VecList,
+            cache_size=self.n_clusters + 8, use_bloom=False, store_key=True,
+        )
+        self._cell_ids = Dict(
+            f"_vidx_{self.name}_cell_ids", self._db, IdList,
+            cache_size=self.n_clusters + 8, use_bloom=False, store_key=True,
+        )
+        self._vec_field = vec_field
+
+    def _initialize(self):
+        # Centroids and codebooks datasets
         self._centroid_ds = self._db.create_dataset(
             f"_vidx_{self.name}_centroids", vec=f"float32[{self.dim}]"
         )
-        # Codebooks dataset (PQ only; n_sub * k_sub entries of Vec(sub_dim))
         sub_dim = max(1, self.dim // self.n_sub)
         self._codebook_ds = self._db.create_dataset(
             f"_vidx_{self.name}_codebooks", vec=f"float32[{sub_dim}]"
         )
-        # String IDs parallel to cell_ds
-        self._ids_ds = self._db.create_dataset(
-            f"_vidx_{self.name}_ids", ext_id="text"
-        )
-        # Reverse: ext_id → cell slot index
-        addr_ds = self._db.create_dataset(
-            f"_vidx_{self.name}_addrs", addr="uint64"
+        # Reverse: ext_id → (cell_id, list_idx)
+        rev_ds = self._db.create_dataset(
+            f"_vidx_{self.name}_rev_ds", cell_id="uint32", list_idx="uint64"
         )
         from loom.datastructures.dict import Dict
         self._rev = Dict(
-            f"_vidx_{self.name}_rev", self._db, addr_ds,
-            cache_size=2000, use_bloom=False, store_key=False,
+            f"_vidx_{self.name}_rev", self._db, rev_ds,
+            cache_size=4000, use_bloom=False, store_key=False,
         )
+        self._make_cell_dicts()
 
-        cap = 4096
-        self._block_addr     = int(self._cell_ds.allocate_block(cap))
-        self._ids_block_addr = int(self._ids_ds.allocate_block(cap))
-        self._capacity       = cap
         self._n_vecs         = 0
-        self._cent_block_addr = 0   # set by train()
-        self._cb_block_addr   = 0   # set by train() if pq
-        self._k_actual        = 0   # actual K after training (≤ n_clusters)
-        self._k_sub_actual    = 0   # actual k_sub after training
-
+        self._cent_block_addr = 0
+        self._cb_block_addr   = 0
+        self._k_actual        = 0
+        self._k_sub_actual    = 0
         self._save_state()
 
     def _load(self):
@@ -548,51 +567,55 @@ class IVFIndex(VectorIndex):
         self.pq           = meta["pq"]
         self.n_sub        = meta["n_sub"]
         self.n_bits       = meta["n_bits"]
+        self.max_id_len   = meta.get("max_id_len", 50)
         self._trained     = meta["trained"]
-        self._cell_ds         = self._db.get_dataset(meta["cell_ds"])
-        self._centroid_ds     = self._db.get_dataset(meta["centroid_ds"])
-        self._codebook_ds     = self._db.get_dataset(meta["codebook_ds"])
-        self._ids_ds          = self._db.get_dataset(meta["ids_ds"])
-        self._block_addr      = meta["block_addr"]
-        self._ids_block_addr  = meta["ids_block_addr"]
+        self._n_vecs      = meta["n_vecs"]
         self._cent_block_addr = meta.get("cent_block_addr", 0)
         self._cb_block_addr   = meta.get("cb_block_addr", 0)
         self._k_actual        = meta.get("k_actual", 0)
         self._k_sub_actual    = meta.get("k_sub_actual", 0)
-        self._capacity        = meta["capacity"]
-        self._n_vecs          = meta["n_vecs"]
-        self._rev_name        = f"_vidx_{self.name}_rev"
-        self._rev             = None
-        self._centroids       = None
-        self._codebooks       = None
+        self._centroid_ds = self._db.get_dataset(meta["centroid_ds"])
+        self._codebook_ds = self._db.get_dataset(meta["codebook_ds"])
+        # Lazy-load cell Dicts and rev
+        self._cell_vecs   = None
+        self._cell_ids    = None
+        self._rev         = None
+        self._centroids   = None
+        self._codebooks   = None
+        self._vec_field   = "pq_codes" if self.pq else "vec"
         if self._trained:
             self._load_centroids()
 
-    def _ensure_rev(self):
-        if self._rev is None:
-            self._rev = self._db._datastructures.get(self._rev_name)
+    def _ensure_cells(self):
+        """Lazily resolve cell Dicts and rev after DB reload."""
+        if self._cell_vecs is None:
+            self._cell_vecs = self._db._datastructures.get(
+                f"_vidx_{self.name}_cell_vecs"
+            )
+            self._cell_ids = self._db._datastructures.get(
+                f"_vidx_{self.name}_cell_ids"
+            )
+            self._rev = self._db._datastructures.get(
+                f"_vidx_{self.name}_rev"
+            )
 
     def _save_state(self):
         self._save_metadata({
-            "dim":              self.dim,
-            "metric":           self.metric,
-            "n_clusters":       self.n_clusters,
-            "pq":               self.pq,
-            "n_sub":            self.n_sub,
-            "n_bits":           self.n_bits,
-            "trained":          self._trained,
-            "cell_ds":          self._cell_ds.name,
-            "centroid_ds":      self._centroid_ds.name,
-            "codebook_ds":      self._codebook_ds.name,
-            "ids_ds":           self._ids_ds.name,
-            "block_addr":       self._block_addr,
-            "ids_block_addr":   self._ids_block_addr,
-            "cent_block_addr":  self._cent_block_addr,
-            "cb_block_addr":    self._cb_block_addr,
-            "k_actual":         self._k_actual,
-            "k_sub_actual":     self._k_sub_actual,
-            "capacity":         self._capacity,
-            "n_vecs":           self._n_vecs,
+            "dim":             self.dim,
+            "metric":          self.metric,
+            "n_clusters":      self.n_clusters,
+            "pq":              self.pq,
+            "n_sub":           self.n_sub,
+            "n_bits":          self.n_bits,
+            "max_id_len":      self.max_id_len,
+            "trained":         self._trained,
+            "n_vecs":          self._n_vecs,
+            "centroid_ds":     self._centroid_ds.name,
+            "codebook_ds":     self._codebook_ds.name,
+            "cent_block_addr": self._cent_block_addr,
+            "cb_block_addr":   self._cb_block_addr,
+            "k_actual":        self._k_actual,
+            "k_sub_actual":    self._k_sub_actual,
         })
 
     def save(self, force=False):
@@ -687,39 +710,24 @@ class IVFIndex(VectorIndex):
     def add(self, vector_id: str, vector: np.ndarray) -> None:
         if not self._trained:
             raise RuntimeError("Call train() before adding vectors.")
-        self._ensure_rev()
-        vec = self._prep_vec(np.asarray(vector, dtype=np.float32))
-
+        self._ensure_cells()
+        vec     = self._prep_vec(np.asarray(vector, dtype=np.float32))
         cell_id = self._assign_one(vec)
+        cid_str = str(cell_id)
 
-        # Grow storage if needed
-        if self._n_vecs >= self._capacity:
-            new_cap  = self._capacity * 2
-            new_cell = int(self._cell_ds.allocate_block(new_cap))
-            new_ids  = int(self._ids_ds.allocate_block(new_cap))
-            rs_c = self._cell_ds.record_size
-            rs_i = self._ids_ds.record_size
-            self._cell_ds.db.write(
-                new_cell, self._cell_ds.db.read(self._block_addr, self._n_vecs * rs_c))
-            self._ids_ds.db.write(
-                new_ids, self._ids_ds.db.read(self._ids_block_addr, self._n_vecs * rs_i))
-            self._block_addr     = new_cell
-            self._ids_block_addr = new_ids
-            self._capacity       = new_cap
-
-        slot     = self._n_vecs
-        slot_addr = self._block_addr + slot * self._cell_ds.record_size
-        id_addr   = self._ids_block_addr + slot * self._ids_ds.record_size
+        # Get current length of this cell's list (= insertion index)
+        cell_vec_list = self._cell_vecs[cid_str]
+        list_idx      = len(cell_vec_list)
 
         if self.pq:
             residual = vec - self._centroids[cell_id]
             codes    = _encode_pq(residual[None], self._codebooks)[0]
-            self._cell_ds.write(slot_addr, cell_id=cell_id, pq_codes=codes)
+            cell_vec_list.append({"pq_codes": codes})
         else:
-            self._cell_ds.write(slot_addr, cell_id=cell_id, vec=vec)
+            cell_vec_list.append({"vec": vec})
 
-        self._ids_ds.write(id_addr, ext_id=vector_id)
-        self._rev[vector_id] = {"addr": slot}
+        self._cell_ids[cid_str].append({"ext_id": vector_id})
+        self._rev[vector_id] = {"cell_id": cell_id, "list_idx": list_idx}
         self._n_vecs += 1
         self._auto_save_check()
 
@@ -728,14 +736,17 @@ class IVFIndex(VectorIndex):
             self.add(vid, vec)
 
     def remove(self, vector_id: str) -> None:
-        self._ensure_rev()
+        """Soft-delete a vector (marks its slot invalid in both cell lists)."""
+        self._ensure_cells()
         ptr = self._rev.get(vector_id)
         if ptr is None:
             raise KeyError(vector_id)
-        slot = int(ptr["addr"])
-        self._cell_ds.delete(self._block_addr + slot * self._cell_ds.record_size)
-        self._ids_ds.delete(self._ids_block_addr + slot * self._ids_ds.record_size)
+        cid_str  = str(int(ptr["cell_id"]))
+        list_idx = int(ptr["list_idx"])
+        del self._cell_vecs[cid_str][list_idx]
+        del self._cell_ids[cid_str][list_idx]
         del self._rev[vector_id]
+        self._n_vecs -= 1
         self._auto_save_check()
 
     # ── Search ────────────────────────────────────────────────────────────
@@ -748,58 +759,72 @@ class IVFIndex(VectorIndex):
         if self._n_vecs == 0:
             return []
 
-        nprobe = nprobe or max(1, int(self.n_clusters ** 0.5))
+        self._ensure_cells()
+        K      = len(self._centroids)
+        nprobe = min(nprobe or max(1, int(K ** 0.5)), K)
         q      = self._prep_query(np.asarray(query, dtype=np.float32))
 
         # Step 1: find nprobe nearest centroids
-        diff       = q[None, :] - self._centroids           # (K, d)
-        cent_dists = np.sum(diff * diff, axis=1)             # (K,)
-        nprobe      = min(nprobe, len(self._centroids))
-        probe_cells = np.argpartition(cent_dists, nprobe)[:nprobe]
+        diff        = q[None, :] - self._centroids      # (K, d)
+        cent_dists  = np.sum(diff * diff, axis=1)        # (K,)
+        if nprobe >= K:
+            probe_cells = np.arange(K)
+        else:
+            probe_cells = np.argpartition(cent_dists, nprobe)[:nprobe]
 
-        # Step 2: bulk read all cell records
-        rs_c = self._cell_ds.record_size
-        rs_i = self._ids_ds.record_size
-        raw_c = self._cell_ds.db.read(self._block_addr, self._n_vecs * rs_c)
-        raw_i = self._ids_ds.db.read(self._ids_block_addr, self._n_vecs * rs_i)
+        # Step 2: load only the probed cells — one mmap read per cell
+        # Collect (local_score, global_cid, local_idx) tuples
+        higher      = self.metric in ("cosine", "dot")
+        heap_scores : list[float] = []
+        heap_meta   : list[tuple[int,int]] = []  # (cell_id, local_idx)
 
-        arr_c = np.frombuffer(raw_c, dtype=self._cell_ds.schema)
-        arr_i = np.frombuffer(raw_i, dtype=self._ids_ds.schema)
+        for cell_id in probe_cells:
+            cid_str   = str(int(cell_id))
+            vec_list  = self._cell_vecs[cid_str]
+            n_cell    = len(vec_list)
+            if n_cell == 0:
+                continue
 
-        ident  = self._cell_ds.identifier
-        valid  = arr_c["_prefix"] == ident
-        cell_ids_all = arr_c["cell_id"][valid].astype(np.int32)
-        arr_i_valid  = arr_i[valid]
+            # Single sequential mmap read for the whole cell
+            cell_arr = vec_list.slice_array(0, n_cell)
+            if cell_arr is None or len(cell_arr) == 0:
+                continue
 
-        # Step 3: filter to probed cells
-        mask = np.isin(cell_ids_all, probe_cells)
-        if not mask.any():
+            if self.pq:
+                codes = np.array(cell_arr["pq_codes"], dtype=np.uint8)
+                # Per-cell residual for correct ADC
+                residual_q = q - self._centroids[cell_id]
+                table  = _adc_table(residual_q, self._codebooks)
+                scores = -_adc_distances(codes, table)    # higher=better
+            else:
+                vecs   = np.array(cell_arr["vec"], dtype=np.float32)
+                scores = self._scores(q, vecs)
+
+            top_idx, top_sc = _topk(scores, min(k, len(scores)),
+                                     higher_is_better=higher)
+            for li, sc in zip(top_idx, top_sc):
+                heap_scores.append(float(sc))
+                heap_meta.append((int(cell_id), int(li)))
+
+        if not heap_scores:
             return []
 
-        if self.pq:
-            codes   = np.array(arr_c["pq_codes"][valid][mask], dtype=np.uint8)
-            residual_query = q - self._centroids[probe_cells[0]]  # approx
-            table   = _adc_table(residual_query, self._codebooks)
-            scores  = -_adc_distances(codes, table)               # negate→higher=better
-            higher  = True
-        else:
-            vecs    = np.array(arr_c["vec"][valid][mask], dtype=np.float32)
-            higher  = self.metric in ("cosine", "dot")
-            scores  = self._scores(q, vecs)
+        # Step 3: global top-k across all probed cells
+        arr_sc    = np.array(heap_scores)
+        global_ki, _ = _topk(arr_sc, min(k, len(arr_sc)),
+                               higher_is_better=higher)
 
-        top_idx, top_scores = _topk(scores, k, higher_is_better=higher)
-
-        # Resolve string IDs
-        ids_subset = arr_i_valid[mask]
+        # Step 4: late ID resolution — only for winners
         results = []
-        for i, s in zip(top_idx, top_scores):
-            id_slot = int(np.where(valid)[0][np.where(mask)[0][i]])
-            id_addr = self._ids_block_addr + id_slot * rs_i
+        for gi in global_ki:
+            cell_id, local_idx = heap_meta[gi]
+            sc     = heap_scores[gi]
+            cid_str = str(cell_id)
             try:
-                ext_id = self._ids_ds.read(id_addr)["ext_id"]
+                ext_id = str(self._cell_ids[cid_str][local_idx]["ext_id"])
             except Exception:
-                ext_id = str(ids_subset["ext_id"][i]).rstrip("\x00")
-            results.append((ext_id, float(s)))
+                ext_id = f"cell{cell_id}_idx{local_idx}"
+            results.append((ext_id, float(sc)))
         return results
 
     def __len__(self) -> int:
