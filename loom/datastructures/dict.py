@@ -19,7 +19,11 @@ class Dict(DataStructure):
     PROBE_FACTOR = 0.5
 
     # Nesting compatibility
-    _outer_types_supported = ("Dict", "List", "BTree")  # Dict[Dict], List[Dict], BTree[Dict]
+    _outer_types_supported = (
+        "Dict",
+        "List",
+        "BTree",
+    )  # Dict[Dict], List[Dict], BTree[Dict]
     _inner_types_supported = ("List", "Dict", "Set", "BTree", "Queue")
 
     @classmethod
@@ -33,10 +37,14 @@ class Dict(DataStructure):
         When Dict is used as inner type (e.g., List[Dict] or Dict[Dict]),
         the parent needs shared hash table and values datasets.
 
+        The shared hash table uses the same binary murmur128 slot layout as
+        top-level Dicts (hash_keys=False mode): 25 bytes/slot regardless of
+        key length.
+
         Args:
             parent_name: Name of the parent container
             inner_schema: Schema dict for dict values
-            key_size: Max key length for inner dict keys (default 50)
+            key_size: Kept for backward compat — ignored in binary mode.
 
         Returns:
             Dict with shared dataset specifications
@@ -45,15 +53,18 @@ class Dict(DataStructure):
             "_shared_hash_table": {
                 "name": f"_{parent_name}_shared_hash",
                 "schema": {
-                    "hash": "uint64",
-                    "key": f"U{key_size}",
+                    "hash_hi": "uint64",
+                    "hash_lo": "uint64",
                     "value_addr": "uint64",
                     "valid": "bool",
                 },
             },
             "_shared_values_dataset": {
                 "name": f"_{parent_name}_shared_values",
-                "schema": inner_schema,
+                # Inject _key so nested-Dict iteration can recover the
+                # original key string.  Hash-table slots are binary and
+                # don't carry the key any more.
+                "schema": {"_key": f"U{key_size}", **inner_schema},
             },
         }
 
@@ -63,7 +74,8 @@ class Dict(DataStructure):
             self._hash_table = shared_datasets["_shared_hash_table"]
         if "_shared_values_dataset" in shared_datasets:
             self._values_dataset = shared_datasets["_shared_values_dataset"]
-            self.item_schema = self._extract_schema(self._values_dataset)
+            sch = self._extract_schema(self._values_dataset)
+            self.item_schema = {k: v for k, v in sch.items() if k != "_key"}
 
     def needs_shared_datasets(self):
         """Check if this nested Dict needs shared datasets."""
@@ -82,6 +94,7 @@ class Dict(DataStructure):
             "p_init": "uint8",  # 1 byte - initial p value (may differ for nested)
             "next_data_offset": "uint32",  # 4 bytes
             "values_block_addr": "uint64",  # 8 bytes
+            "values_capacity": "uint32",  # 4 bytes — actual allocated slots
             # 8 table addresses × 8 bytes = 64 bytes
             "table_0": "uint64",
             "table_1": "uint64",
@@ -108,35 +121,34 @@ class Dict(DataStructure):
         cache_size=1000,
         use_bloom=True,
         auto_save_interval=None,
-        key_size=None,
+        key_size=None,  # kept for legacy compat only, ignored in new code
         initial_capacity=None,
-        hash_keys=False,
-        hash_bits=128,
-        store_key=True,
+        hash_keys=False,  # legacy hex-key mode, kept for compat
+        hash_bits=128,  # used only when hash_keys=True (legacy)
+        store_key=True,  # inject _key into values dataset for iteration
+        key_dtype=None,  # dtype for _key field: "U{N}" or "text"
+        max_key_len=100,  # used when key_dtype is None → auto "U{max_key_len}"
         _parent=None,
     ):
         self.cache_size = cache_size
-        # store_key=False: binary murmur128 mode — no key stored, 26 bytes/slot
-        # hash_keys=True:  legacy hex-string mode (kept for compat)
         self._store_key = store_key
-        self._hash_keys = hash_keys
-        self._hash_bits = hash_bits
+        self._hash_keys = hash_keys  # legacy
+        self._hash_bits = hash_bits  # legacy
+        self._key_dtype = key_dtype or (f"U{max_key_len}" if store_key else None)
+        self._max_key_len = max_key_len
+        self._hash_key_fn = None  # legacy hex mode only
+        self._key_size = 0  # no longer used for slot sizing
 
-        if not store_key:
-            # Binary mode: key field replaced by hash_hi + hash_lo
-            self._key_size = 0        # unused
-            self._hash_key_fn = None  # we compute murmur128 directly
-            self.use_bloom = False    # unnecessary with O(1) int comparison
-        elif hash_keys:
-            # Legacy hex-string mode
+        # Bloom filters: only meaningful for legacy store_key-in-slot mode
+        # With binary hash table the integer comparison is already O(1)
+        self.use_bloom = False
+
+        if hash_keys and store_key:
+            # Legacy hex-string mode: key stored as SHA hex in the slot
+            # Kept for backward compat; new code should use store_key=True
             hex_chars = hash_bits // 4
             self._key_size = hex_chars
             self._hash_key_fn = self._make_hash_fn(hex_chars)
-        else:
-            self._key_size = key_size or self.DEFAULT_KEY_SIZE
-            self._hash_key_fn = None
-
-        self.use_bloom = use_bloom if store_key and not hash_keys else False
         self._initial_capacity = initial_capacity or self.DEFAULT_INITIAL_CAPACITY
         self._parent = _parent  # Parent Dict if this is nested
         self._parent_key = None  # Key in parent dict (set by parent)
@@ -171,9 +183,16 @@ class Dict(DataStructure):
         self._cache = self._make_cache("values", cache_size)
 
     def _alloc_value_addr(self):
-        """Allocate a value address, reusing freed slots first."""
+        """Allocate a value address, reusing freed slots first.
+
+        Grows the values block in place (×2) when capacity is exceeded so
+        nested children with many entries don't trample neighbouring
+        allocations.
+        """
         if hasattr(self, "_value_freelist") and self._value_freelist:
             return self._value_freelist.pop()
+        if self.next_data_offset >= self.values_capacity:
+            self._grow_values_block()
         addr = (
             self.values_block_addr
             + self.next_data_offset * self._values_dataset.record_size
@@ -181,23 +200,73 @@ class Dict(DataStructure):
         self.next_data_offset += 1
         return addr
 
+    def _grow_values_block(self):
+        """Allocate a larger values block, copy existing records, rewrite
+        slot ``value_addr``s to point into the new block.
+
+        Called from ``_alloc_value_addr`` when the current block is full.
+        Doubles the capacity (with a sane minimum) so growth is amortised
+        O(1) per insert.
+        """
+        old_addr = int(self.values_block_addr)
+        old_cap = int(self.values_capacity)
+        record_size = int(self._values_dataset.record_size)
+
+        # Double capacity (minimum bump of 8 to avoid degenerate growth)
+        new_cap = max(old_cap * 2, old_cap + 8)
+        new_addr = int(self._values_dataset.allocate_block(new_cap))
+
+        # Copy old block contents byte-for-byte (preserves prefix + payload).
+        if old_cap > 0:
+            old_bytes = self._values_dataset.db.read(old_addr, old_cap * record_size)
+            self._values_dataset.db.write(new_addr, old_bytes)
+
+        # Rewrite slot value_addrs to point into the new block.
+        # Each address moves by (new_addr - old_addr) for slots that were in
+        # the old range; out-of-range slots (e.g. Refs into a user dataset
+        # for non-nested mode) are left untouched.
+        delta = new_addr - old_addr
+        old_end = old_addr + old_cap * record_size
+        ht = self._hash_table
+        ht_record_size = ht.record_size
+        p_init = getattr(self, "_p_init", self.P_INIT)
+
+        import numpy as np
+
+        for p_idx, table_addr in enumerate(self.table_addrs):
+            cap = self._get_capacity(p_init + p_idx)
+            raw = ht.db.read(table_addr, cap * ht_record_size)
+            arr = np.frombuffer(raw, dtype=ht.schema).copy()
+            mask = (arr["_prefix"] == ht.identifier) & arr["valid"]
+            mask &= (arr["value_addr"] >= old_addr) & (arr["value_addr"] < old_end)
+            if mask.any():
+                arr["value_addr"][mask] += delta
+                ht.db.write(table_addr, arr.tobytes())
+
+        self.values_block_addr = new_addr
+        self.values_capacity = new_cap
+
     # ── Hash table schema helpers ─────────────────────────────────────────
 
     def _ht_schema(self):
-        """Return the schema for this Dict's hash table."""
-        if not self._store_key:
-            # Binary murmur128 mode: no key field
+        """Hash table schema — always binary murmur128 (26 bytes/slot).
+
+        Legacy hash_keys mode keeps the old string-key slot.
+        """
+        if self._hash_keys:
+            # Legacy: hex string in slot
             return {
-                "hash_hi":     "uint64",
-                "hash_lo":     "uint64",
-                "value_addr":  "uint64",
-                "valid":       "bool",
+                "hash": "uint64",
+                "key": f"U{self._key_size}",
+                "value_addr": "uint64",
+                "valid": "bool",
             }
+        # Default: pure binary — 26 bytes regardless of key length
         return {
-            "hash":       "uint64",
-            "key":        f"U{self._key_size}",
+            "hash_hi": "uint64",
+            "hash_lo": "uint64",
             "value_addr": "uint64",
-            "valid":      "bool",
+            "valid": "bool",
         }
 
     # ── Key normalisation ─────────────────────────────────────────────────
@@ -205,8 +274,10 @@ class Dict(DataStructure):
     @staticmethod
     def _make_hash_fn(hex_chars):
         import hashlib
+
         def _hk(key):
             return hashlib.sha256(str(key).encode()).hexdigest()[:hex_chars]
+
         return _hk
 
     @staticmethod
@@ -218,19 +289,17 @@ class Dict(DataStructure):
         return (h >> 64, h & 0xFFFF_FFFF_FFFF_FFFF)
 
     def _to_internal_key(self, key):
-        """Normalise key for internal storage and lookup.
+        """Normalise key to (hi, lo) murmur128 tuple for binary hash table.
 
-        store_key=True + hash_keys=False: return str as-is
-        store_key=True + hash_keys=True:  return SHA-256 hex prefix
-        store_key=False:                  return (hi, lo) murmur128 tuple
+        Legacy hash_keys mode returns hex string instead.
         """
-        if not self._store_key:
-            if isinstance(key, tuple):
-                return key   # already normalised
-            return self._murmur128(key)
         if self._hash_key_fn is not None:
+            # Legacy hex mode
             return self._hash_key_fn(key)
-        return key if isinstance(key, str) else str(key)
+        # Default: binary murmur128
+        if isinstance(key, tuple):
+            return key  # already normalised
+        return self._murmur128(key)
 
     def _get_capacity(self, p):
         return self.GROWTH_FACTOR**p
@@ -239,14 +308,19 @@ class Dict(DataStructure):
         return int(round(p * self.PROBE_FACTOR * self.GROWTH_FACTOR))
 
     def _hash(self, key, seed=0):
-        """Return the uint32 bucket index for a (possibly pre-normalised) key."""
-        if not self._store_key:
-            # key is (hi, lo) tuple — use hi as bucket (already 64-bit uniform)
-            hi = key[0] if isinstance(key, tuple) else self._murmur128(key)[0]
-            return hi & 0xFFFF_FFFF  # keep as uint32-range for compat
-        if not isinstance(key, str):
-            key = str(key)
-        return mmh3.hash(key, seed=seed, signed=False)
+        """Return the uint32 bucket index.
+
+        Binary mode (default): key is (hi, lo) tuple, use hi.
+        Legacy hex mode: key is a string, use murmur32.
+        """
+        if self._hash_key_fn is not None:
+            # Legacy hex mode — key is a string
+            if not isinstance(key, str):
+                key = str(key)
+            return mmh3.hash(key, seed=seed, signed=False)
+        # Binary: hi already uniform over 2^64, truncate to 32 bits for table index
+        hi = key[0] if isinstance(key, tuple) else self._murmur128(key)[0]
+        return hi & 0xFFFF_FFFF
 
     def _load_table_addresses(self):
         """Load table addresses from metadata (already loaded in _load)."""
@@ -261,7 +335,8 @@ class Dict(DataStructure):
             # Parent can be either a Dict (Dict[Dict]) or a List (List[Dict])
             self._hash_table = self._parent._shared_hash_table
             self._values_dataset = self._parent._shared_values_dataset
-            self.item_schema = self._extract_schema(self._values_dataset)
+            sch = self._extract_schema(self._values_dataset)
+            self.item_schema = {k: v for k, v in sch.items() if k != "_key"}
 
             # Allocate our own block in the shared hash table.
             # Start very small (8 slots, 2^3) — most nodes in real-world graphs
@@ -298,6 +373,10 @@ class Dict(DataStructure):
                 inner_class._check_nesting(type(self))
 
                 ref_schema = self._template.get_ref_schema()
+                # Inject _key alongside the ref so iteration can recover keys
+                # (mirrors the non-nested path).
+                if self._store_key:
+                    ref_schema = {"_key": self._key_dtype, **ref_schema}
                 self._values_dataset = self._db.create_dataset(
                     f"_dict_{self.name}_values", **ref_schema
                 )
@@ -306,8 +385,9 @@ class Dict(DataStructure):
                 # Use modular approach: ask inner type what shared datasets it needs
                 inner_schema = self._extract_schema(self._template.dataset)
                 shared_specs = inner_class.get_shared_dataset_specs(
-                    f"dict_{self.name}", inner_schema,
-                    key_size=self._key_size,
+                    f"dict_{self.name}",
+                    inner_schema,
+                    key_size=self._max_key_len,
                 )
 
                 # Create the shared datasets
@@ -317,10 +397,20 @@ class Dict(DataStructure):
                     setattr(self, attr_name, dataset)
                     self._shared_datasets[attr_name] = dataset
             else:
-                # Compact version: use user's dataset directly!
-                self._values_dataset = self._user_dataset
-                self.item_schema = self._extract_schema(self._user_dataset)
-                self._shared_datasets = {}  # No shared datasets for regular dicts
+                # Values dataset
+                if self._store_key:
+                    # Inject _key field into an internal values dataset
+                    user_schema = self._extract_schema(self._user_dataset)
+                    values_schema = {"_key": self._key_dtype, **user_schema}
+                    self._values_dataset = self._db.create_dataset(
+                        f"_dict_{self.name}_values", **values_schema
+                    )
+                    self.item_schema = user_schema
+                else:
+                    # Compact: use user dataset directly, no key storage
+                    self._values_dataset = self._user_dataset
+                    self.item_schema = self._extract_schema(self._user_dataset)
+                self._shared_datasets = {}
 
             self._p_init = self.P_INIT  # Use class constant for top-level
             capacity = self._get_capacity(self._p_init)
@@ -353,9 +443,17 @@ class Dict(DataStructure):
             )
             self._blooms.append(bloom)
 
-        # Save metadata on initialization (force=True to save even if nested)
-        # Nested dicts need their metadata saved so they can be reloaded
-        self.save(force=True)
+        # Save metadata on initialization.
+        #
+        # Nested children are reconstructed from their parent's binary ref
+        # (`Dict._from_ref_impl`), never via `_load_metadata`, so writing
+        # their metadata to the header on every creation is pure waste —
+        # and it dominates `add_edge` cost on graphs with many distinct
+        # source / destination nodes (one pickle.dumps + header write per
+        # new nested child). Top-level dicts still need this save so they
+        # can be reloaded by name from a fresh `DB`.
+        if not (self._parent is not None and self._parent != "__nested__"):
+            self.save(force=True)
 
     def _load(self):
         metadata = self._load_metadata()
@@ -370,8 +468,8 @@ class Dict(DataStructure):
         self._is_nested = metadata.get("is_nested", False)
         self._key_size = metadata.get("key_size", self.DEFAULT_KEY_SIZE)
         self._hash_keys = metadata.get("hash_keys", False)
-        self._hash_bits  = metadata.get("hash_bits",  128)
-        self._store_key  = metadata.get("store_key",  True)
+        self._hash_bits = metadata.get("hash_bits", 128)
+        self._store_key = metadata.get("store_key", True)
         if not self._store_key:
             self._hash_key_fn = None
         elif self._hash_keys:
@@ -416,7 +514,10 @@ class Dict(DataStructure):
             template_class = _DS_REGISTRY.get(template_class_name, Dict)
 
             # Reconstruct template via class protocol (no per-type switch)
-            full_config = {**template_config, "_template_dataset": metadata.get("template_dataset")}
+            full_config = {
+                **template_config,
+                "_template_dataset": metadata.get("template_dataset"),
+            }
             self._template = template_class._reconstruct_template(
                 self._db, full_config, template_class_name
             )
@@ -478,6 +579,7 @@ class Dict(DataStructure):
             ref["p_init"] = self._p_init
             ref["next_data_offset"] = self.next_data_offset
             ref["values_block_addr"] = self.values_block_addr
+            ref["values_capacity"] = self.values_capacity
 
             # Table addresses (up to 8 for nested)
             for i in range(self.MAX_TABLES_NESTED):
@@ -537,11 +639,16 @@ class Dict(DataStructure):
             instance._ops_since_save = 0
             instance._inline_metadata = None
             instance._metadata_key = None
-            instance.values_capacity = 10000  # Default for nested
+            # Restore the actual values block capacity. Older refs (written
+            # before the field was added) default to 0 — fall back to a
+            # conservative 8-slot block in that case so we don't trample
+            # neighbouring allocations.
+            cap = int(ref.get("values_capacity", 0) or 0)
+            instance.values_capacity = cap if cap > 0 else 8
             # hash_keys / store_key not used for nested dicts
-            instance._hash_keys   = False
-            instance._hash_bits   = 128
-            instance._store_key   = True
+            instance._hash_keys = False
+            instance._hash_bits = 128
+            instance._store_key = True
             instance._hash_key_fn = None
 
             # These will be set by the parent when reconstructing
@@ -590,9 +697,9 @@ class Dict(DataStructure):
             "key_size": self._key_size,
             "initial_capacity": self._initial_capacity,
             "value_freelist": getattr(self, "_value_freelist", []),
-            "hash_keys":  getattr(self, "_hash_keys",  False),
-            "hash_bits":  getattr(self, "_hash_bits",  128),
-            "store_key":  getattr(self, "_store_key",  True),
+            "hash_keys": getattr(self, "_hash_keys", False),
+            "hash_bits": getattr(self, "_hash_bits", 128),
+            "store_key": getattr(self, "_store_key", True),
         }
         # Save per-table bloom filter names
         if self.use_bloom and self._blooms:
@@ -628,22 +735,41 @@ class Dict(DataStructure):
             )
             value_addr = int(entry["value_addr"])
 
-            # Update the stored reference with current state
-            self._values_dataset[value_addr] = nested_item.to_ref()
+            # Update the stored reference with current state, preserving _key
+            ref = nested_item.to_ref()
+            if self._store_key and "_key" in self._values_dataset.user_schema.names:
+                existing = self._values_dataset[value_addr]
+                ref = {"_key": existing.get("_key", ""), **ref}
+            self._values_dataset[value_addr] = ref
 
-            # Invalidate cache to ensure fresh data on next access
-            if self._cache:
-                self._cache.invalidate(key)
+            # NOTE: do NOT invalidate the cache here.
+            #
+            # The cached entry IS the same `nested_item` instance we just
+            # mutated, so it already reflects the latest state.  Dropping
+            # it forces the next access to round-trip through `from_ref`,
+            # which is exactly the cost the LRU is meant to amortise — and
+            # tight write loops (e.g. `Graph.add_edge`) call this method
+            # after every set, turning every cache hit into a miss.
+            # Cache entries are evicted by LRU pressure, not by writes.
         except KeyError:
             pass  # Key not found, nothing to update
 
     def _entry_key_matches(self, entry, key):
-        """Check if a deserialized hash table entry matches the internal key."""
-        if not self._store_key:
+        """Check if a deserialized hash table entry matches the internal key.
+
+        Hash-table slot layout is selected by `_hash_keys`, not `_store_key`:
+          * `_hash_keys=False` (default) -> binary murmur128 slot (hash_hi/hash_lo)
+          * `_hash_keys=True`  (legacy)  -> hash + string-key slot
+        `_store_key` only controls whether the **value** record carries a `_key`
+        field for iteration; it does not affect the hash-table layout.
+        """
+        if not self._hash_keys:
             # key is (hi, lo) tuple; entry has hash_hi + hash_lo
-            return (entry.get("valid", False)
-                    and int(entry.get("hash_hi", -1)) == key[0]
-                    and int(entry.get("hash_lo", -1)) == key[1])
+            return (
+                entry.get("valid", False)
+                and int(entry.get("hash_hi", -1)) == key[0]
+                and int(entry.get("hash_lo", -1)) == key[1]
+            )
         return entry.get("valid", False) and entry.get("key") == key
 
     def _find_slot(self, key, key_hash, for_insert=False):
@@ -682,7 +808,16 @@ class Dict(DataStructure):
             raise KeyError(key)
 
     def _find_slot_in_table(self, key, key_hash, p, for_insert):
-        """Find slot in a specific table."""
+        """Find slot in a specific table.
+
+        The probe range is read as a single contiguous mmap slice
+        (`db.read(start, n*record_size)`) — no per-slot mmap call.  The
+        inner loop then walks at most `probe_range` (≈ a few dozen) slots
+        and early-outs on the first invalid byte.  We tried a numpy
+        vector-compare here; for the typical probe length (≤ ~20) the
+        ~3 µs of fixed numpy overhead per call dominates the manual
+        ``struct.unpack_from`` loop, so the loop wins.
+        """
         capacity = self._get_capacity(p)
         bucket = key_hash % capacity
         probe_range = self._get_probe_range(p)
@@ -694,17 +829,10 @@ class Dict(DataStructure):
         first_free = None
         slots_to_read = min(probe_range, capacity)
 
-        # Field offsets differ by mode:
-        # store_key=True:  [_prefix:1][hash:8][key:key_chars*4][value_addr:8][valid:1]
-        # store_key=False: [_prefix:1][hash_hi:8][hash_lo:8][value_addr:8][valid:1]
-        if not self._store_key:
-            # Binary mode: fixed offsets, two uint64 comparisons, no string
-            #   offset 0: prefix (1B)
-            #   offset 1: hash_hi (8B)
-            #   offset 9: hash_lo (8B)
-            #   offset 17: value_addr (8B)
-            #   offset 25: valid (1B) — but Dataset adds prefix so actually:
-            # use schema-derived valid_offset for correctness
+        # Field offsets differ by mode (selected by `_hash_keys`):
+        # hash_keys=False: [_prefix:1][hash_hi:8][hash_lo:8][value_addr:8][valid:1]
+        # hash_keys=True : [_prefix:1][hash:8][key:key_chars*4][value_addr:8][valid:1]
+        if not self._hash_keys:
             valid_offset = self._hash_table.schema.fields["valid"][1]
             hi, lo = key  # key is (hi, lo) tuple
         else:
@@ -731,7 +859,7 @@ class Dict(DataStructure):
                             first_free = (p, table_addr, position, {})
                         continue
 
-                    if not self._store_key:
+                    if not self._hash_keys:
                         # Binary: compare hi (offset 1) then lo (offset 9)
                         entry_hi = struct.unpack_from("<Q", chunk_data, offset + 1)[0]
                         if entry_hi != hi:
@@ -779,9 +907,11 @@ class Dict(DataStructure):
                         first_free = (p, table_addr, position, entry)
                     continue
 
-                if not self._store_key:
-                    if (int(entry.get("hash_hi", -1)) == hi
-                            and int(entry.get("hash_lo", -1)) == lo):
+                if not self._hash_keys:
+                    if (
+                        int(entry.get("hash_hi", -1)) == hi
+                        and int(entry.get("hash_lo", -1)) == lo
+                    ):
                         return (p, table_addr, position, entry)
                 else:
                     if entry["hash"] == key_hash and entry["key"] == key:
@@ -825,6 +955,8 @@ class Dict(DataStructure):
 
     def _setitem_fast(self, key, value):
         """Fast path for non-atomic insert/update (current implementation)."""
+        # Keep original string key for _key injection in values dataset
+        orig_key = key if isinstance(key, str) else str(key)
         key = self._to_internal_key(key)
         key_hash = self._hash(key)
         slot = self._find_slot(key, key_hash, for_insert=True)
@@ -835,7 +967,7 @@ class Dict(DataStructure):
 
         p, table_addr, position, entry = slot
         entry_addr = table_addr + position * self._hash_table.record_size
-        is_update = entry.get("valid", False) and entry.get("key") == key
+        is_update = self._entry_key_matches(entry, key)
 
         is_ref_value = isinstance(value, Ref)
         if is_ref_value and self._is_nested:
@@ -855,7 +987,10 @@ class Dict(DataStructure):
                     raise TypeError(
                         f"Expected {expected_type.__name__}, got {type(value)}"
                     )
-                self._values_dataset[value_addr] = value.to_ref()
+                ref = value.to_ref()
+                if self._store_key:
+                    ref = {"_key": orig_key, **ref}
+                self._values_dataset[value_addr] = ref
             else:
                 if is_ref_value:
                     # Re-point existing entry to Ref address (no copy)
@@ -881,29 +1016,36 @@ class Dict(DataStructure):
                     )
                 ref = value.to_ref()
                 value_addr = self._alloc_value_addr()
+                if self._store_key:
+                    ref = {"_key": orig_key, **ref}
                 self._values_dataset[value_addr] = ref
             else:
                 if is_ref_value:
-                    # Store pointer directly (no allocation/copy)
                     value_addr = int(value.addr)
                 else:
                     value_addr = self._alloc_value_addr()
-                    self._values_dataset[value_addr] = value
+                    if self._store_key:
+                        # Inject _key alongside user value for later iteration
+                        self._values_dataset[value_addr] = {"_key": orig_key, **value}
+                    else:
+                        self._values_dataset[value_addr] = value
 
-            if not self._store_key:
-                hi, lo = key  # key is (hi, lo) tuple
+            if self._hash_keys:
+                # Legacy hex mode: hash + string-key slot
                 self._hash_table[entry_addr] = {
-                    "hash_hi":    hi,
-                    "hash_lo":    lo,
+                    "hash": key_hash,
+                    "key": key,
                     "value_addr": value_addr,
-                    "valid":      True,
+                    "valid": True,
                 }
             else:
+                # Binary murmur128 slot: (hash_hi, hash_lo, value_addr, valid)
+                hi, lo = key
                 self._hash_table[entry_addr] = {
-                    "hash":       key_hash,
-                    "key":        key,
+                    "hash_hi": hi,
+                    "hash_lo": lo,
                     "value_addr": value_addr,
-                    "valid":      True,
+                    "valid": True,
                 }
             # Add to the correct table's bloom filter (store_key=True only)
             p_init = getattr(self, "_p_init", self.P_INIT)
@@ -937,6 +1079,7 @@ class Dict(DataStructure):
         if self._is_nested:
             raise TypeError("get_ref is not supported for nested Dict")
 
+        key = self._to_internal_key(key)
         key_hash = self._hash(key)
         p, table_addr, position, entry = self._find_slot(
             key, key_hash, for_insert=False
@@ -946,6 +1089,7 @@ class Dict(DataStructure):
 
     def _setitem_atomic(self, key, value):
         """Atomic insert/update using WAL for crash safety."""
+        orig_key = key if isinstance(key, str) else str(key)
         key = self._to_internal_key(key)
         key_hash = self._hash(key)
         slot = self._find_slot(key, key_hash, for_insert=True)
@@ -956,7 +1100,7 @@ class Dict(DataStructure):
 
         p, table_addr, position, entry = slot
         entry_addr = table_addr + position * self._hash_table.record_size
-        is_update = entry.get("valid", False) and entry.get("key") == key
+        is_update = self._entry_key_matches(entry, key)
         expected_type = self._template.ds_class if self._is_nested else None
 
         if is_update:
@@ -964,9 +1108,16 @@ class Dict(DataStructure):
             value_addr = int(entry["value_addr"])
             if self._is_nested:
                 if not isinstance(value, expected_type):
-                    raise TypeError(f"Expected {expected_type.__name__}, got {type(value)}")
-                ref_data = self._values_dataset._serialize(**value.to_ref())
+                    raise TypeError(
+                        f"Expected {expected_type.__name__}, got {type(value)}"
+                    )
+                ref = value.to_ref()
+                if self._store_key:
+                    ref = {"_key": orig_key, **ref}
+                ref_data = self._values_dataset._serialize(**ref)
             else:
+                if self._store_key:
+                    value = {"_key": orig_key, **value}
                 ref_data = self._values_dataset._serialize(**value)
 
             # Atomic update: single write
@@ -979,21 +1130,36 @@ class Dict(DataStructure):
                     value = self._template.new(self._db, _parent=self)
                     value._parent_key = key
                 elif not isinstance(value, expected_type):
-                    raise TypeError(f"Expected {expected_type.__name__}, got {type(value)}")
+                    raise TypeError(
+                        f"Expected {expected_type.__name__}, got {type(value)}"
+                    )
                 ref = value.to_ref()
+                if self._store_key:
+                    ref = {"_key": orig_key, **ref}
                 value_addr = self._alloc_value_addr()
                 value_data = self._values_dataset._serialize(**ref)
             else:
                 value_addr = self._alloc_value_addr()
+                if self._store_key:
+                    value = {"_key": orig_key, **value}
                 value_data = self._values_dataset._serialize(**value)
 
-            # Hash table entry
-            hash_entry = {
-                "hash": key_hash,
-                "key": key,
-                "value_addr": value_addr,
-                "valid": True,
-            }
+            # Hash table entry — fields depend on slot layout
+            if self._hash_keys:
+                hash_entry = {
+                    "hash": key_hash,
+                    "key": key,
+                    "value_addr": value_addr,
+                    "valid": True,
+                }
+            else:
+                hi, lo = key
+                hash_entry = {
+                    "hash_hi": hi,
+                    "hash_lo": lo,
+                    "value_addr": value_addr,
+                    "valid": True,
+                }
             hash_data = self._hash_table._serialize(**hash_entry)
 
             # Atomic insert: batch both writes
@@ -1060,6 +1226,8 @@ class Dict(DataStructure):
         Raises:
             KeyError: If key not found
         """
+        # Keep original key string for auto-creation of nested children
+        orig_key = key if isinstance(key, str) else str(key)
         # Normalise key and compute cache key before cache check
         key = self._to_internal_key(key)
         cache_k = key if self._store_key else (key[0] << 64 | key[1])
@@ -1070,7 +1238,10 @@ class Dict(DataStructure):
             if cached_value is not None:
                 if self._is_nested:
                     return cached_value
-                return self._values_dataset[int(cached_value)]
+                value_data = self._values_dataset[int(cached_value)]
+                if self._store_key and "_key" in value_data:
+                    value_data = {k: v for k, v in value_data.items() if k != "_key"}
+                return value_data
 
         # Cache miss - do full lookup
         key_hash = self._hash(key)
@@ -1095,7 +1266,9 @@ class Dict(DataStructure):
                 result._parent = self
                 result._parent_key = key
             else:
-                # Return data directly from user's dataset
+                # Return data directly from user's dataset, hiding _key
+                if self._store_key and "_key" in value_data:
+                    value_data = {k: v for k, v in value_data.items() if k != "_key"}
                 result = value_data
 
             # Cache the actual value for next time!
@@ -1106,8 +1279,8 @@ class Dict(DataStructure):
         except KeyError:
             # For nested dicts, auto-create on access (like List.append)
             if self._is_nested:
-                # Use fast path for auto-creation
-                return self._setitem_fast(key, None)
+                # Pass the original string back so _key is stored correctly
+                return self._setitem_fast(orig_key, None)
             else:
                 raise
 
@@ -1182,6 +1355,14 @@ class Dict(DataStructure):
 
         Unlike read_many(), this does NOT stop at the first uninitialized
         slot — hash tables are sparse and may have gaps.
+
+        Key recovery depends on slot layout:
+          * `_hash_keys=True` (legacy)         → key string is in the slot.
+          * binary + `_store_key=True`         → key is stored as `_key` in
+                                                 the value record.
+          * binary + `_store_key=False`        → no key kept anywhere; yields
+                                                 the raw `(hash_hi, hash_lo)`
+                                                 tuple instead.
         """
         import numpy as np
 
@@ -1192,8 +1373,21 @@ class Dict(DataStructure):
 
         identifier = self._hash_table.identifier
         mask = (arr["_prefix"] == identifier) & (arr["valid"])
-        for rec in arr[mask]:
-            yield str(rec["key"]), int(rec["value_addr"])
+
+        if self._hash_keys:
+            for rec in arr[mask]:
+                yield str(rec["key"]), int(rec["value_addr"])
+        elif self._store_key:
+            for rec in arr[mask]:
+                value_addr = int(rec["value_addr"])
+                try:
+                    v = self._values_dataset[value_addr]
+                except Exception:
+                    continue
+                yield str(v.get("_key", "")), value_addr
+        else:
+            for rec in arr[mask]:
+                yield (int(rec["hash_hi"]), int(rec["hash_lo"])), int(rec["value_addr"])
 
     def keys(self):
         """Iterate over all keys in dict.
@@ -1254,6 +1448,10 @@ class Dict(DataStructure):
                         result._parent_key = key
                         yield key, result
                     else:
+                        if self._store_key and "_key" in value_data:
+                            value_data = {
+                                k: v for k, v in value_data.items() if k != "_key"
+                            }
                         yield key, value_data
             except Exception:
                 pass
@@ -1268,7 +1466,7 @@ class Dict(DataStructure):
         if self._parent is not None:
             return None
         return {
-            "schema":    self.item_schema,
+            "schema": self.item_schema,
             "cache_size": self.cache_size,
             "use_bloom": self.use_bloom,
             "store_key": getattr(self, "_store_key", True),
@@ -1277,7 +1475,9 @@ class Dict(DataStructure):
     @classmethod
     def _from_registry_params(cls, name, db, params):
         return cls(
-            name, db, params["schema"],
+            name,
+            db,
+            params["schema"],
             cache_size=params.get("cache_size", 1000),
             use_bloom=params.get("use_bloom", True),
             store_key=params.get("store_key", True),
@@ -1316,9 +1516,7 @@ class Dict(DataStructure):
         block_end = block_start + self.next_data_offset * record_size
 
         # Check if all value addrs fall in the contiguous block
-        all_contiguous = all(
-            block_start <= addr < block_end for _, addr in entries
-        )
+        all_contiguous = all(block_start <= addr < block_end for _, addr in entries)
 
         if all_contiguous and self.next_data_offset > 0 and not self._is_nested:
             # Single bulk read of the entire values block
@@ -1355,7 +1553,7 @@ class Dict(DataStructure):
                         if off == 0 and ns == 0:
                             d[field] = ""
                         else:
-                            d[field] = None          # placeholder
+                            d[field] = None  # placeholder
                             pending_blobs.append((off, key, field, True))
                     elif field in ds._blob_fields:
                         val = rec[field]
@@ -1363,7 +1561,7 @@ class Dict(DataStructure):
                         if off == 0 and ns == 0:
                             d[field] = None
                         else:
-                            d[field] = None          # placeholder
+                            d[field] = None  # placeholder
                             pending_blobs.append((off, key, field, False))
                     else:
                         d[field] = rec[field]
@@ -1375,7 +1573,9 @@ class Dict(DataStructure):
                 pending_blobs.sort(key=lambda x: x[0])
                 for off, key, field, is_text in pending_blobs:
                     raw_blob = ds.blob_store.read(off)
-                    result[key][field] = raw_blob.decode("utf-8") if is_text else raw_blob
+                    result[key][field] = (
+                        raw_blob.decode("utf-8") if is_text else raw_blob
+                    )
 
             return result
 

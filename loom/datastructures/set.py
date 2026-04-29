@@ -125,15 +125,18 @@ class Set(DataStructure):
             "_shared_hash_table": {
                 "name": f"_{parent_name}_shared_hash",
                 "schema": {
-                    "hash": "uint64",
-                    "key": "U100",  # Fixed key size for shared table
+                    # Binary murmur128 slot — matches Dict's hash_keys=False mode
+                    "hash_hi": "uint64",
+                    "hash_lo": "uint64",
                     "value_addr": "uint64",
                     "valid": "bool",
                 },
             },
             "_shared_values_dataset": {
                 "name": f"_{parent_name}_shared_values",
-                "schema": cls._DUMMY_SCHEMA,
+                # Inject _key so nested-Set iteration can recover the
+                # original member string (Dict's binary slot has no key).
+                "schema": {"_key": "U50", **cls._DUMMY_SCHEMA},
             },
         }
 
@@ -348,10 +351,10 @@ class Set(DataStructure):
             dict_instance._inline_metadata = None
             dict_instance._metadata_key = None
             dict_instance._shared_datasets = {}
-            dict_instance._hash_keys   = False
-            dict_instance._hash_bits   = 128
+            dict_instance._hash_keys = False
+            dict_instance._hash_bits = 128
             dict_instance._hash_key_fn = None
-            dict_instance._store_key   = True
+            dict_instance._store_key = True
 
             # These will be set by set_shared_datasets
             dict_instance._hash_table = None
@@ -535,7 +538,8 @@ class Set(DataStructure):
     @classmethod
     def _from_registry_params(cls, name, db, params):
         return cls(
-            name, db,
+            name,
+            db,
             key_size=params.get("key_size", 50),
             use_bloom=params.get("use_bloom", True),
             _load_existing=True,

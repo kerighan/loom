@@ -56,7 +56,7 @@ class DB:
         initial_size=1024,
         header_size=32768,
         auto_open=True,
-        blob_compression="brotli",
+        blob_compression=None,
         auto_save_interval=100,
         cache_size=0,
         sync_writes=False,
@@ -68,7 +68,10 @@ class DB:
             initial_size: Initial file size in bytes
             header_size: Header region size in bytes
             auto_open: Automatically open database (default: True)
-            blob_compression: Compression for blobs ("brotli", "zlib", or None)
+            blob_compression: Compression for blobs ("brotli", "zlib", or None).
+                Default is None — compression typically costs ~20× on insert
+                throughput (CPU-bound).  Pass "brotli" to trade speed for
+                ~3–5× space savings on natural language.
             auto_save_interval: Auto-save metadata every N operations per
                 data structure.  Lower = safer (less data lost on crash),
                 higher = faster.  Use 0 to disable (manual save only).
@@ -93,11 +96,13 @@ class DB:
         # Shared cache: one LRU for the entire DB, namespaced per-structure
         if cache_size > 0:
             from loom.cache import LRUCache
+
             self._shared_cache = LRUCache(cache_size)
         else:
             self._shared_cache = None
-        self._db = ByteFileDB(filename, initial_size, header_size,
-                              sync_writes=sync_writes)
+        self._db = ByteFileDB(
+            filename, initial_size, header_size, sync_writes=sync_writes
+        )
         self._datasets = {}  # name -> Dataset instance
         self._datastructures = {}  # name -> DataStructure instance
         self._is_open = False
@@ -207,7 +212,9 @@ class DB:
             blob_store = self.blob_store if needs_blobs else None
 
             # Recreate Dataset instance
-            dataset = Dataset(name, self._db, identifier, blob_store=blob_store, **schema)
+            dataset = Dataset(
+                name, self._db, identifier, blob_store=blob_store, **schema
+            )
             self._datasets[name] = dataset
 
         # Load data structures registry (generic — no per-type switch)
@@ -249,6 +256,7 @@ class DB:
     def _dtype_to_registry_str(dataset, field_name):
         """Serialize one field's dtype for the registry, preserving array shapes."""
         from loom.dataset import dtype_to_str
+
         if field_name in dataset._text_fields:
             return "text"
         if field_name in dataset._blob_fields:
@@ -374,6 +382,7 @@ class DB:
         # Accept Pydantic model as positional arg
         if model is not None and not schema:
             from loom.schema import schema_from_model
+
             schema = schema_from_model(model)
 
         if dataset_name in self._datasets:
@@ -387,7 +396,9 @@ class DB:
         blob_store = self.blob_store if needs_blobs else None
 
         # Create dataset
-        dataset = Dataset(dataset_name, self._db, identifier, blob_store=blob_store, **schema)
+        dataset = Dataset(
+            dataset_name, self._db, identifier, blob_store=blob_store, **schema
+        )
         self._datasets[dataset_name] = dataset
 
         # Save registry
@@ -510,6 +521,42 @@ class DB:
         status = "open" if self._is_open else "closed"
         dataset_count = len(self._datasets)
         return f"DB('{self.filename}', {status}, {dataset_count} datasets)"
+
+    # -------------------------------------------------------------------------
+    # HTTP server
+    # -------------------------------------------------------------------------
+
+    def fastapi_app(self, *, title=None):
+        """Return a FastAPI app exposing this DB over HTTP.
+
+        Every dataset and datastructure is auto-mounted with proper
+        OpenAPI docs and Pydantic validation.  Mount this app in your
+        own ASGI stack, or use `db.serve()` to run it directly.
+
+        Requires `fastapi` (`pip install 'fastapi[standard]'`).
+        """
+        from loom.server import build_app
+
+        return build_app(self, title=title)
+
+    def serve(self, host="127.0.0.1", port=8000, **uvicorn_kwargs):
+        """Run an HTTP server exposing this DB.
+
+        Single-writer / single-reader: requests are serialized through
+        a process-wide lock so the underlying mmap stays consistent.
+
+        Blocking call.  Requires `fastapi` and `uvicorn`.
+
+        Example:
+            with DB("app.db") as db:
+                db.create_dataset("users", User)
+                db.serve(port=8000)
+
+        Visit http://localhost:8000/docs for the auto-generated API.
+        """
+        from loom.server import serve
+
+        serve(self, host=host, port=port, **uvicorn_kwargs)
 
     # Data Structure Factory Methods
 
@@ -745,7 +792,9 @@ class DB:
         self._save_datastructures_registry()  # Persist registry
         return btree
 
-    def create_graph(self, name, node_schema, edge_schema, directed=True, node_id_max_len=50):
+    def create_graph(
+        self, name, node_schema, edge_schema, directed=True, node_id_max_len=50
+    ):
         """Create a persistent Graph.
 
         Args:
@@ -779,7 +828,14 @@ class DB:
         if name in self._datastructures:
             return self._datastructures[name]
 
-        g = Graph(name, self, node_schema, edge_schema, directed=directed, node_id_max_len=node_id_max_len)
+        g = Graph(
+            name,
+            self,
+            node_schema,
+            edge_schema,
+            directed=directed,
+            node_id_max_len=node_id_max_len,
+        )
         self._datastructures[name] = g
         self._save_datastructures_registry()
         return g
@@ -821,8 +877,13 @@ class DB:
         return q
 
     def create_lru_dict(
-        self, name, schema, capacity=1000, key_size=50,
-        hash_keys=False, hash_bits=128,
+        self,
+        name,
+        schema,
+        capacity=1000,
+        key_size=50,
+        hash_keys=False,
+        hash_bits=128,
     ):
         """Create a persistent LRU Dict (fixed-capacity, evicts LRU on insert).
 
@@ -854,9 +915,13 @@ class DB:
             return self._datastructures[name]
 
         lru = LRUDict(
-            name, self, schema,
-            capacity=capacity, key_size=key_size,
-            hash_keys=hash_keys, hash_bits=hash_bits,
+            name,
+            self,
+            schema,
+            capacity=capacity,
+            key_size=key_size,
+            hash_keys=hash_keys,
+            hash_bits=hash_bits,
         )
         self._datastructures[name] = lru
         self._save_datastructures_registry()

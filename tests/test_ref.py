@@ -36,7 +36,10 @@ class TestRefAcrossStructures:
             db_path = os.path.join(tmpdir, "test.db")
             with DB(db_path, header_size=1024 * 1024) as db:
                 users = db.create_dataset("users", id="uint32", name="U50")
-                d = db.create_dict("d", users, cache_size=100)
+                # store_key=False keeps the Dict's values dataset
+                # pointing at the user's dataset (no internal wrapper),
+                # which is required for cross-structure Ref sharing.
+                d = db.create_dict("d", users, cache_size=100, store_key=False)
                 b = db.create_btree("b", users)
 
                 ref = users.insert({"id": 1, "name": "Alice"})

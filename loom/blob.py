@@ -49,12 +49,13 @@ class BlobStore:
     SLOT_SIZE = 64  # Minimum allocation unit (bytes)
     HEADER_SIZE = 8  # compressed_size (4) + original_size (4)
 
-    def __init__(self, db, compression="brotli"):
+    def __init__(self, db, compression=None):
         """Initialize blob store.
 
         Args:
             db: ByteFileDB instance
-            compression: Compression algorithm ("brotli", "zlib", or None)
+            compression: Compression algorithm ("brotli", "zlib", or None).
+                Default None — brotli costs ~20× on insert throughput.
         """
         self._db = db
         self._compression = compression

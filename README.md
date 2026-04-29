@@ -84,7 +84,7 @@ db = DB("mydata.db")
 
 # Context manager (recommended — auto-saves and flushes on exit)
 with DB("mydata.db",
-        blob_compression="brotli",   # "brotli" | "zlib" | None
+        blob_compression=None,        # None (default, fastest) | "brotli" | "zlib"
         auto_save_interval=100,       # metadata save frequency (default 100)
         cache_size=50_000,            # shared LRU entries across ALL structures
         sync_writes=False,            # False=fast (flush on close), True=safe (flush every write)
@@ -318,6 +318,46 @@ user_tags["alice"].add("python")
 
 ---
 
+## HTTP server (optional)
+
+Any open `DB` can expose itself as a REST API in one line. The server is built on FastAPI, so you get **interactive Swagger UI and ReDoc out of the box** — no extra wiring.
+
+```bash
+pip install 'fastapi[standard]'    # adds fastapi + uvicorn
+```
+
+```python
+from loom import DB
+
+with DB("app.db") as db:
+    db.create_dataset("users", id="uint32", username="U50", age="uint32")
+    db.create_dict("by_username", db._datasets["users"])
+    db.create_set("active")
+
+    db.serve(host="127.0.0.1", port=8000)   # blocking
+```
+
+Then point your browser at:
+
+| URL | What you get |
+|---|---|
+| `http://127.0.0.1:8000/docs` | **Swagger UI** — interactive try-it-out for every endpoint |
+| `http://127.0.0.1:8000/redoc` | **ReDoc** — clean reference-style docs |
+| `http://127.0.0.1:8000/openapi.json` | Raw OpenAPI 3 schema (feed it to Postman, codegen, etc.) |
+| `http://127.0.0.1:8000/` | Index: filename, datasets, structures, links to the docs |
+
+Every dataset, `Dict`, `List`, `Set`, `BTree`, `Queue`, `BloomFilter`, `LRUDict` you create gets a CRUD route family automatically (`/datasets/<name>`, `/dicts/<name>/items/<key>`, `/btrees/<name>/range`, …). Request bodies are validated against your loom schema via Pydantic models generated on the fly.
+
+```python
+# Mount inside your own ASGI stack instead of using db.serve()
+app = db.fastapi_app()      # standard FastAPI instance
+# uvicorn.run(app, host=..., port=...)
+```
+
+> **Concurrency**: loom is single-writer / single-reader. The server takes a single process-wide lock so requests are serialised against the underlying mmap. Safe from any number of clients, but throughput is bounded by one writer at a time.
+
+---
+
 ## Error handling
 
 ```python
@@ -370,31 +410,35 @@ LoomError
 
 All benchmarks: modern laptop (Linux, SSD), `sync_writes=False` (default — durable on `close()`).
 
+All numbers below come from `benchmarks/readme_benchmark.py` (run it yourself with `PYTHONPATH=. python benchmarks/readme_benchmark.py`). Figures are rounded; expect ±10% run-to-run variance from page-cache warmup and CPU frequency.
+
 ### loom vs SqliteDict — 10 000 ops, fixed schema
 
 | Operation | **loom** | **SqliteDict** | Ratio |
 |---|---:|---:|---:|
-| Dict insert | **23 500 ops/s** | 5 800 ops/s | loom **4×** |
-| Dict insert, batch | **23 500 ops/s** | **45 200 ops/s** | SQLite 2× |
-| Dict read | **46 800 ops/s** | 13 300 ops/s | loom **3.5×** |
-| Dict contains | **66 600 ops/s** | 14 400 ops/s | loom **4.6×** |
-| Dict keys() | **670 000 ops/s** | 120 000 ops/s | loom **5.6×** |
+| Dict insert (per-call) | **27 000 ops/s** | 4 900 ops/s (autocommit) | loom **5.5×** |
+| Dict insert (batch) | **28 000 ops/s** | 22 000 ops/s (single `COMMIT`) | loom **1.3×** |
+| Dict read | **55 000 ops/s** | 11 200 ops/s | loom **4.9×** |
+| Dict contains | **95 000 ops/s** | 11 800 ops/s | loom **8×** |
+| Dict keys() | **180 000 ops/s** | 115 000 ops/s | loom **1.6×** |
 
-loom uses lazy mmap flush — no `msync()` per write, just OS page-cache writeback. Inserts are **4× faster** than SqliteDict per-call. SqliteDict's batch commit wins by deferring all I/O to a single `COMMIT`; for loom, insert-no-batch ≈ insert-batch since the flush is already lazy.
+loom is faster on every line, including SQLite's most favourable mode (defer all writes to a single transaction). The gap is widest on point ops because loom uses lazy mmap flush — no `msync()` per write, just OS page-cache writeback — while SQLite has to walk a B-tree per call. `contains` benefits from binary murmur128 slots (25 bytes regardless of key length), which makes the inner loop a couple of integer compares.
+
+Per-call inserts already run at batch speed in loom (the flush is already lazy), so wrapping inserts in `db.batch()` mostly matters for `text` / blob fields, where it amortises one BlobStore flush across many writes.
 
 ### loom operations — all structures
 
 | Structure | Operation | ops/s | µs/op |
 |---|---|---:|---:|
-| Dict | insert | 23 500 | 43 |
-| Dict | read | 46 800 | 21 |
-| Dict | contains | 66 600 | 15 |
-| Dict | keys() | 670 000 | 1.5 |
-| Dict | items() | 155 800 | 6 |
-| List | append | 84 100 | 12 |
-| List | read[i] | 141 000 | 7 |
-| Queue | push (batch) | 258 000 | 4 |
-| Queue | pop | 273 000 | 4 |
+| Dict | insert | 27 000 | 37 |
+| Dict | read | 55 000 | 18 |
+| Dict | contains | 90 000 | 11 |
+| Dict | keys() | 185 000 | 5 |
+| Dict | items() | 90 000 | 11 |
+| List | append | 105 000 | 10 |
+| List | read[i] | 165 000 | 6 |
+| Queue | push (batch) | 220 000 | 5 |
+| Queue | pop | 260 000 | 4 |
 
 ### `str` (text) fields — impact of variable-length blobs
 
@@ -402,26 +446,40 @@ loom uses lazy mmap flush — no `msync()` per write, just OS page-cache writeba
 
 | Schema | Compression | insert | read |
 |---|---|---:|---:|
-| Fixed fields only | — | 23 500 ops/s | 46 800 ops/s |
-| + `str` body | None | 13 100 ops/s | 39 200 ops/s |
-| + `str` body | brotli | 1 920 ops/s | 26 700 ops/s |
+| Fixed fields only | — | 27 000 ops/s | 55 000 ops/s |
+| + `str` body (≈600 chars) | None (default) | 29 000 ops/s | 54 000 ops/s |
+| + `str` body (≈600 chars) | brotli | 1 400 ops/s | 32 000 ops/s |
 
-- `blob_compression=None` — fastest writes, larger files.
-- `"brotli"` — 3–5× compression on natural language, CPU-bound writes.
+- `blob_compression=None` (**default**) — fastest writes, larger files.
+- `"brotli"` — 3–5× compression on natural language, but ~20× slower inserts; pick when storage > write throughput.
 - `Field(max_length=N)` — keeps the field in the fixed record, no BlobStore at all.
 
-### Graph — Barabási-Albert scale-free network (m=2)
+### Graph — Barabási-Albert scale-free network (m=2, 20 000 nodes / 39 996 edges, directed)
 
-Per-call `add_edge()` and batch `add_edges()` are now nearly equivalent (lazy flush removed the 75× gap). Use `add_edges()` for large ingestions — cleaner and slightly lower overhead.
+Build phase (write):
 
-| Nodes | Edges | node µs | edge µs | total | disk |
-|---|---|---:|---:|---:|---:|
-| 5 000 | 9 996 | 370 | 246 | 4.3 s | 25 MB |
-| 20 000 | 39 996 | 373 | 274 | 18 s | 40 MB |
-| 50 000 | 99 996 | 379 | 295 | 48 s | 70 MB |
-| 100 000 | 199 996 | 378 | 309 | 100 s | 127 MB |
+| Operation | ops/s | µs/op |
+|---|---:|---:|
+| `add_node` | 25 000 | 40 |
+| `add_edge` (per-call) | 2 900 | 345 |
+| `add_edges` (bulk, in `db.batch()`) | 3 300 | 305 |
 
-~1.3 KB/edge (double-indexed: outgoing + incoming). Bottleneck: hash-table probing in per-node nested Dicts, not I/O.
+Each `add_edge` does two double-indexed nested-Dict writes (`_out[src][dst]` and `_in[dst][src]`); each of those probes the parent's hash table, finds / grows the child's slot block, writes the value record, and rewrites the parent's ref. Bulk insertion via `g.add_edges([...])` is ~15 % faster — most of the difference is one deferred header save per `db.allocate()` (`db.batch()` accumulates them).
+
+Read phase, point queries (10 000 random samples):
+
+| Operation | ops/s | µs/op |
+|---|---:|---:|
+| `g[node_id]` (`get_node`) | 57 000 | 18 |
+| `has_edge` (hit) | 17 000 | 60 |
+| `has_edge` (miss) | 16 000 | 60 |
+| `get_edge` | 19 000 | 52 |
+| `out_degree` | 20 000 | 50 |
+| `neighbors(node_id)` (per source) | 12 000 | 80 |
+
+`neighbors()` visits edges at **~25 000 edges/s** when iterating the full neighbour list of each sampled node — useful for BFS / PageRank style passes.
+
+On-disk size: ~10 KB / edge in this configuration (double-indexed `_out` + `_in` plus per-source nested-Dict overhead — each new source allocates an 8-slot hash block + 8-slot values block, which doubles on demand). The dominant cost is the per-source nested table; sparser graphs (low average degree) pay a higher per-edge constant than dense ones.
 
 ---
 

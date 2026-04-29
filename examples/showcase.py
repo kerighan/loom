@@ -18,13 +18,15 @@ from loom.datastructures import BTree, Dict, List, Queue, Set
 
 TMPDIR = tempfile.mkdtemp()
 
+
 def path(name):
     return os.path.join(TMPDIR, f"{name}.db")
+
 
 def section(title):
     print(f"\n{'═'*60}")
     print(f"  {title}")
-    print('═'*60)
+    print("═" * 60)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -33,37 +35,52 @@ def section(title):
 
 section("1. Dataset + Dict — user directory")
 
+
 class User(BaseModel):
-    id:       int
+    id: int
     username: str = Field(max_length=50)
-    email:    str
-    age:      int
-    premium:  bool
+    email: str
+    age: int
+    premium: bool
+
 
 with DB(path("users")) as db:
-    users_ds  = db.create_dataset("users", User)
-    users     = db.create_dict("by_username", users_ds)
+    users_ds = db.create_dataset("users", User)
+    users = db.create_dict("by_username", users_ds)
 
     # bulk insert
     with db.batch():
-        for i, (uname, email, age, premium) in enumerate([
-            ("alice",   "alice@example.com",   30, True),
-            ("bob",     "bob@example.com",     25, False),
-            ("carol",   "carol@example.com",   35, True),
-            ("dave",    "dave@example.com",    28, False),
-            ("eve",     "eve@example.com",     22, True),
-        ]):
-            users[uname] = {"id": i+1, "username": uname,
-                            "email": email, "age": age, "premium": premium}
+        for i, (uname, email, age, premium) in enumerate(
+            [
+                ("alice", "alice@example.com", 30, True),
+                ("bob", "bob@example.com", 25, False),
+                ("carol", "carol@example.com", 35, True),
+                ("dave", "dave@example.com", 28, False),
+                ("eve", "eve@example.com", 22, True),
+            ]
+        ):
+            users[uname] = {
+                "id": i + 1,
+                "username": uname,
+                "email": email,
+                "age": age,
+                "premium": premium,
+            }
 
     print(f"users['alice']: {users['alice']}")
     print(f"'bob' in users: {'bob' in users}")
     print(f"premium users:  {[k for k, v in users.items() if v['premium']]}")
 
     # Ref-based update
-    ref = users_ds.insert({"id": 6, "username": "frank",
-                            "email": "frank@example.com",
-                            "age": 40, "premium": False})
+    ref = users_ds.insert(
+        {
+            "id": 6,
+            "username": "frank",
+            "email": "frank@example.com",
+            "age": 40,
+            "premium": False,
+        }
+    )
     ref.update(premium=True, email="frank.new@example.com")
     print(f"frank after update: {users_ds.read(ref.addr)}")
 
@@ -78,22 +95,24 @@ with DB(path("users")) as db:
 
 section("2. List — activity feed")
 
+
 class Event(BaseModel):
-    ts:      int           # unix timestamp
-    kind:    str = Field(max_length=30)
-    payload: str           # variable-length JSON / text
+    ts: int  # unix timestamp
+    kind: str = Field(max_length=30)
+    payload: str  # variable-length JSON / text
+
 
 with DB(path("feed")) as db:
     event_ds = db.create_dataset("events", Event)
-    feed     = db.create_list("feed", event_ds)
+    feed = db.create_list("feed", event_ds)
 
     now = int(time.time())
     actions = [
-        ("login",    "ip=1.2.3.4"),
+        ("login", "ip=1.2.3.4"),
         ("purchase", '{"item":"loom-pro","price":49.0}'),
-        ("view",     "page=/dashboard"),
-        ("logout",   ""),
-        ("login",    "ip=5.6.7.8"),
+        ("view", "page=/dashboard"),
+        ("logout", ""),
+        ("login", "ip=5.6.7.8"),
     ]
     for i, (kind, payload) in enumerate(actions):
         feed.append({"ts": now + i, "kind": kind, "payload": payload})
@@ -117,20 +136,29 @@ with DB(path("feed")) as db:
 
 section("3. Queue — job processing pipeline")
 
+
 class Job(BaseModel):
-    id:       int
-    task:     str = Field(max_length=80)
+    id: int
+    task: str = Field(max_length=80)
     priority: float
-    retries:  int
+    retries: int
+
 
 with DB(path("jobs")) as db:
     q = db.create_queue("pending", Job, block_size=32)
 
     # Producer: enqueue jobs
-    q.push_many([
-        {"id": i, "task": f"process_batch_{i}", "priority": random.random(), "retries": 0}
-        for i in range(20)
-    ])
+    q.push_many(
+        [
+            {
+                "id": i,
+                "task": f"process_batch_{i}",
+                "priority": random.random(),
+                "retries": 0,
+            }
+            for i in range(20)
+        ]
+    )
     print(f"queued: {len(q)} jobs")
     print(f"peek:   {q.peek()}")
 
@@ -153,29 +181,36 @@ with DB(path("jobs")) as db:
 
 section("4. BTree — product catalog (sorted by name)")
 
+
 class Product(BaseModel):
-    sku:      str = Field(max_length=20)
-    name:     str
-    price:    float
-    stock:    int
+    sku: str = Field(max_length=20)
+    name: str
+    price: float
+    stock: int
     category: str = Field(max_length=30)
+
 
 with DB(path("catalog")) as db:
     prod_ds = db.create_dataset("products", Product)
     catalog = db.create_btree("by_name", prod_ds, key_size=80)
 
     products = [
-        ("P001", "Apple MacBook Pro",    2499.0, 15, "laptops"),
-        ("P002", "Apple iPhone 15",       999.0, 50, "phones"),
-        ("P003", "Dell XPS 15",          1799.0, 8,  "laptops"),
-        ("P004", "Google Pixel 8",        699.0, 30, "phones"),
-        ("P005", "Samsung Galaxy S24",    799.0, 25, "phones"),
-        ("P006", "Sony WH-1000XM5",       349.0, 40, "audio"),
-        ("P007", "iPad Pro 12.9",        1099.0, 20, "tablets"),
+        ("P001", "Apple MacBook Pro", 2499.0, 15, "laptops"),
+        ("P002", "Apple iPhone 15", 999.0, 50, "phones"),
+        ("P003", "Dell XPS 15", 1799.0, 8, "laptops"),
+        ("P004", "Google Pixel 8", 699.0, 30, "phones"),
+        ("P005", "Samsung Galaxy S24", 799.0, 25, "phones"),
+        ("P006", "Sony WH-1000XM5", 349.0, 40, "audio"),
+        ("P007", "iPad Pro 12.9", 1099.0, 20, "tablets"),
     ]
     for sku, name, price, stock, cat in products:
-        catalog[name] = {"sku": sku, "name": name,
-                          "price": price, "stock": stock, "category": cat}
+        catalog[name] = {
+            "sku": sku,
+            "name": name,
+            "price": price,
+            "stock": stock,
+            "category": cat,
+        }
 
     # All products in alphabetical order
     print("All products (alpha):")
@@ -203,17 +238,19 @@ with DB(path("catalog")) as db:
 
 section("5. Dict[BTree] — ticker timeseries (OHLCV)")
 
+
 class OHLCV(BaseModel):
-    open:   float
-    high:   float
-    low:    float
-    close:  float
+    open: float
+    high: float
+    low: float
+    close: float
     volume: int
 
+
 with DB(path("market")) as db:
-    ohlcv_ds  = db.create_dataset("ohlcv", OHLCV)
+    ohlcv_ds = db.create_dataset("ohlcv", OHLCV)
     OHLCVTree = BTree.template(ohlcv_ds, key_size=loom.dt_key_size("second"))
-    tickers   = db.create_dict("tickers", OHLCVTree)
+    tickers = db.create_dict("tickers", OHLCVTree)
 
     # Simulate 30 daily bars for AAPL and TSLA
     random.seed(1)
@@ -223,21 +260,26 @@ with DB(path("market")) as db:
         price = seed_price
         for day in range(30):
             dt = market_open + timedelta(days=day)
-            price *= (1 + random.gauss(0, 0.015))
-            tickers[ticker].set_dt(dt, {
-                "open":   round(price, 2),
-                "high":   round(price * 1.008, 2),
-                "low":    round(price * 0.992, 2),
-                "close":  round(price * 1.003, 2),
-                "volume": random.randint(15_000_000, 60_000_000),
-            })
+            price *= 1 + random.gauss(0, 0.015)
+            tickers[ticker].set_dt(
+                dt,
+                {
+                    "open": round(price, 2),
+                    "high": round(price * 1.008, 2),
+                    "low": round(price * 0.992, 2),
+                    "close": round(price * 1.003, 2),
+                    "volume": random.randint(15_000_000, 60_000_000),
+                },
+            )
 
     # Range: AAPL first week
     week_end = market_open + timedelta(days=4)
     print("AAPL first week:")
     for k, row in tickers["AAPL"].range_dt(market_open, week_end):
-        print(f"  {loom.key_dt(k).date()}  "
-              f"C={row['close']:>8.2f}  V={int(row['volume']):>12,}")
+        print(
+            f"  {loom.key_dt(k).date()}  "
+            f"C={row['close']:>8.2f}  V={int(row['volume']):>12,}"
+        )
 
     # Point lookup
     bar = tickers["TSLA"].get_dt(market_open + timedelta(days=10))
@@ -249,7 +291,9 @@ with DB(path("market")) as db:
 
 with DB(path("market")) as db:
     tickers = db["tickers"]
-    print(f"Round-trip: AAPL bars={len(tickers['AAPL'])}, TSLA bars={len(tickers['TSLA'])}")
+    print(
+        f"Round-trip: AAPL bars={len(tickers['AAPL'])}, TSLA bars={len(tickers['TSLA'])}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -258,30 +302,32 @@ with DB(path("market")) as db:
 
 section("6. Dict[List] — per-user post feed")
 
+
 class Post(BaseModel):
-    id:      int
-    title:   str = Field(max_length=100)
-    body:    str
-    likes:   int
+    id: int
+    title: str = Field(max_length=100)
+    body: str
+    likes: int
+
 
 with DB(path("posts")) as db:
-    post_ds   = db.create_dataset("posts", Post)
-    PostFeed  = List.template(post_ds)
+    post_ds = db.create_dataset("posts", Post)
+    PostFeed = List.template(post_ds)
     user_feed = db.create_dict("feed", PostFeed)
 
     # Each user has their own list of posts
     posts_data = {
         "alice": [
-            ("Intro to loom",     "loom is a persistent Python DB...", 42),
+            ("Intro to loom", "loom is a persistent Python DB...", 42),
             ("BTree range queries", "Fast ordered lookups with range()...", 18),
         ],
         "bob": [
             ("My TSLA strategy", "Buy when RSI < 30...", 7),
         ],
         "carol": [
-            ("Python tips",      "Use type hints everywhere...", 93),
-            ("Async patterns",   "asyncio.gather is your friend...", 55),
-            ("loom timeseries",  "Dict[BTree] for OHLCV data...", 31),
+            ("Python tips", "Use type hints everywhere...", 93),
+            ("Async patterns", "asyncio.gather is your friend...", 55),
+            ("loom timeseries", "Dict[BTree] for OHLCV data...", 31),
         ],
     }
     post_id = 1
@@ -313,12 +359,12 @@ with DB(path("posts")) as db:
 section("7. Dict[Set] — user interests / tag system")
 
 with DB(path("tags")) as db:
-    TagSet    = Set.template(key_size=50)
+    TagSet = Set.template(key_size=50)
     user_tags = db.create_dict("tags", TagSet)
 
     interests = {
         "alice": ["python", "machine-learning", "databases", "finance"],
-        "bob":   ["trading", "finance", "rust"],
+        "bob": ["trading", "finance", "rust"],
         "carol": ["python", "databases", "open-source", "devops"],
     }
     for user, tags in interests.items():
@@ -335,8 +381,7 @@ with DB(path("tags")) as db:
     print(f"alice ∩ carol: {alice_tags & carol_tags}")
 
     # All users interested in 'finance'
-    finance_users = [u for u in ["alice","bob","carol"]
-                     if "finance" in user_tags[u]]
+    finance_users = [u for u in ["alice", "bob", "carol"] if "finance" in user_tags[u]]
     print(f"users into finance: {finance_users}")
 
 with DB(path("tags")) as db:
@@ -350,30 +395,32 @@ with DB(path("tags")) as db:
 
 section("8. Dict[Queue] — per-user notification inbox")
 
+
 class Notification(BaseModel):
-    id:      int
-    kind:    str = Field(max_length=30)
+    id: int
+    kind: str = Field(max_length=30)
     message: str
 
+
 with DB(path("inbox")) as db:
-    notif_ds  = db.create_dataset("notifs", Notification)
-    NotifQ    = Queue.template(notif_ds, block_size=16)
-    inboxes   = db.create_dict("inboxes", NotifQ)
+    notif_ds = db.create_dataset("notifs", Notification)
+    NotifQ = Queue.template(notif_ds, block_size=16)
+    inboxes = db.create_dict("inboxes", NotifQ)
 
     # Push notifications to various users
     nid = 1
     events = [
-        ("alice", "like",    "Bob liked your post"),
-        ("alice", "follow",  "Carol started following you"),
-        ("bob",   "mention", "Alice mentioned you in a post"),
+        ("alice", "like", "Bob liked your post"),
+        ("alice", "follow", "Carol started following you"),
+        ("bob", "mention", "Alice mentioned you in a post"),
         ("alice", "comment", "Dave commented: 'Great article!'"),
-        ("carol", "like",    "Eve liked your post"),
+        ("carol", "like", "Eve liked your post"),
     ]
     for user, kind, msg in events:
         inboxes[user].push({"id": nid, "kind": kind, "message": msg})
         nid += 1
 
-    print("Inbox sizes:", {u: len(inboxes[u]) for u in ["alice","bob","carol"]})
+    print("Inbox sizes:", {u: len(inboxes[u]) for u in ["alice", "bob", "carol"]})
 
     # Alice reads her notifications one by one
     print("Alice reading inbox:")
@@ -393,34 +440,36 @@ with DB(path("inbox")) as db:
 
 section("9. Dict[Dict] — application config (app → env → values)")
 
+
 class ConfigEntry(BaseModel):
-    value:   str
-    secret:  bool
-    updated: int   # unix timestamp
+    value: str
+    secret: bool
+    updated: int  # unix timestamp
+
 
 with DB(path("config")) as db:
-    cfg_ds   = db.create_dataset("cfg", ConfigEntry)
-    CfgDict  = Dict.template(cfg_ds)
-    app_cfg  = db.create_dict("config", CfgDict)
+    cfg_ds = db.create_dataset("cfg", ConfigEntry)
+    CfgDict = Dict.template(cfg_ds)
+    app_cfg = db.create_dict("config", CfgDict)
 
     now = int(time.time())
     configs = {
         "api-service": {
             "production": {
-                "DATABASE_URL": ("postgres://prod-host/db", True,  now),
-                "LOG_LEVEL":    ("WARNING",                  False, now),
-                "WORKERS":      ("8",                        False, now),
+                "DATABASE_URL": ("postgres://prod-host/db", True, now),
+                "LOG_LEVEL": ("WARNING", False, now),
+                "WORKERS": ("8", False, now),
             },
             "staging": {
-                "DATABASE_URL": ("postgres://staging-host/db", True,  now),
-                "LOG_LEVEL":    ("DEBUG",                       False, now),
-                "WORKERS":      ("2",                           False, now),
+                "DATABASE_URL": ("postgres://staging-host/db", True, now),
+                "LOG_LEVEL": ("DEBUG", False, now),
+                "WORKERS": ("2", False, now),
             },
         },
         "worker": {
             "production": {
-                "QUEUE_URL":    ("redis://prod-redis:6379", True,  now),
-                "CONCURRENCY":  ("16",                      False, now),
+                "QUEUE_URL": ("redis://prod-redis:6379", True, now),
+                "CONCURRENCY": ("16", False, now),
             },
         },
     }
@@ -439,9 +488,14 @@ with DB(path("config")) as db:
         print(f"  {k} = {display}")
 
     # Update a value
-    app_cfg["api-service/staging"]["WORKERS"] = \
-        {"value": "4", "secret": False, "updated": now + 1}
-    print(f"staging workers updated: {app_cfg['api-service/staging']['WORKERS']['value']}")
+    app_cfg["api-service/staging"]["WORKERS"] = {
+        "value": "4",
+        "secret": False,
+        "updated": now + 1,
+    }
+    print(
+        f"staging workers updated: {app_cfg['api-service/staging']['WORKERS']['value']}"
+    )
 
 with DB(path("config")) as db:
     app_cfg = db["config"]
@@ -455,44 +509,46 @@ with DB(path("config")) as db:
 
 section("10. Graph + Cypher — social follow network")
 
+
 class Person(BaseModel):
-    name:     str
-    age:      int
+    name: str
+    age: int
     location: str = Field(max_length=50)
 
+
 class Follows(BaseModel):
-    since:  int   # unix timestamp
-    weight: float # engagement score 0–1
+    since: int  # unix timestamp
+    weight: float  # engagement score 0–1
+
 
 with DB(path("social")) as db:
-    g = db.create_graph("social", Person, Follows,
-                         directed=True, node_id_max_len=20)
+    g = db.create_graph("social", Person, Follows, directed=True, node_id_max_len=20)
 
     people = [
-        ("alice",   "Alice",   30, "Paris"),
-        ("bob",     "Bob",     25, "London"),
-        ("carol",   "Carol",   35, "Paris"),
-        ("dave",    "Dave",    28, "NYC"),
-        ("eve",     "Eve",     22, "London"),
-        ("frank",   "Frank",   40, "Berlin"),
+        ("alice", "Alice", 30, "Paris"),
+        ("bob", "Bob", 25, "London"),
+        ("carol", "Carol", 35, "Paris"),
+        ("dave", "Dave", 28, "NYC"),
+        ("eve", "Eve", 22, "London"),
+        ("frank", "Frank", 40, "Berlin"),
     ]
-    g.add_nodes([(pid, {"name": n, "age": a, "location": loc})
-                 for pid, n, a, loc in people])
+    g.add_nodes(
+        [(pid, {"name": n, "age": a, "location": loc}) for pid, n, a, loc in people]
+    )
 
     follows = [
-        ("alice", "bob",   2021, 0.9),
+        ("alice", "bob", 2021, 0.9),
         ("alice", "carol", 2020, 0.7),
-        ("alice", "dave",  2022, 0.5),
-        ("bob",   "alice", 2021, 0.8),
-        ("bob",   "eve",   2023, 0.6),
+        ("alice", "dave", 2022, 0.5),
+        ("bob", "alice", 2021, 0.8),
+        ("bob", "eve", 2023, 0.6),
         ("carol", "alice", 2020, 0.9),
         ("carol", "frank", 2019, 0.4),
-        ("dave",  "alice", 2022, 0.7),
-        ("eve",   "bob",   2023, 0.5),
+        ("dave", "alice", 2022, 0.7),
+        ("eve", "bob", 2023, 0.5),
         ("frank", "carol", 2021, 0.3),
     ]
-    g.add_edges([(s, d, {"since": ts, "weight": w})
-                 for s, d, ts, w in follows])
+    g.add_edges([(s, d, {"since": ts, "weight": w}) for s, d, ts, w in follows])
 
     # Followers / following
     print(f"Alice follows:   {list(g.neighbors('alice'))}")
@@ -526,9 +582,7 @@ with DB(path("social")) as db:
 
     # Cypher: 2-hop reach from alice
     print("\nAlice can reach in ≤ 2 hops:")
-    for r in g.query(
-        "MATCH (a)-[*1..2]->(b) WHERE id(a) == 'alice' RETURN id(b)"
-    ):
+    for r in g.query("MATCH (a)-[*1..2]->(b) WHERE id(a) == 'alice' RETURN id(b)"):
         print(f"  {r['id(b)']}")
 
     # Inline props
@@ -547,4 +601,5 @@ print("  All examples completed successfully.")
 print(f"{'═'*60}\n")
 
 import shutil
+
 shutil.rmtree(TMPDIR)
