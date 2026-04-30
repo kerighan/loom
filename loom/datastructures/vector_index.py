@@ -456,10 +456,11 @@ class FlatIndex(VectorIndex):
 class IVFIndex(VectorIndex):
     """Approximate nearest-neighbour using an Inverted File Index.
 
-    Storage layout (uses loom Dict[List]):
-      cell_vecs: Dict[cluster_id → List[{vec: float32[dim]}]]
+    Storage layout (uses loom List[List]):
+      cell_vecs: List[List[{vec: float32[dim]}]]  — K entries, one per cluster.
         Per-cluster sequential blocks → single mmap read per probed cell.
-      cell_ids:  Dict[cluster_id → List[{ext_id: U{max_id_len}}]]
+        Direct integer index access: cell_vecs[cell_id], no hashmap probe.
+      cell_ids:  List[List[{ext_id: U{max_id_len}}]]
         IDs resolved *after* distance computation (late resolution for top-k).
 
     Search:
@@ -502,35 +503,42 @@ class IVFIndex(VectorIndex):
 
     # ── Internal structures ───────────────────────────────────────────────
 
-    def _make_cell_dicts(self):
-        """Create the two Dict[List] structures for per-cell storage."""
-        from loom.datastructures.dict import Dict
+    def _make_cell_lists(self):
+        """Create the two List[List] outer containers for per-cell storage.
+
+        K inner lists are pre-populated after training (train() calls _populate_cells).
+        Direct integer index access: cell_vecs[cell_id] — no hashmap probe.
+        """
         from loom.datastructures.list import List
 
-        # vec schema: float32[dim] or uint8[n_sub] for PQ
-        vec_field = f"pq_codes" if self.pq else "vec"
+        vec_field = "pq_codes" if self.pq else "vec"
         vec_dtype = (f"uint8[{self.n_sub}]" if self.pq
                      else f"float32[{self.dim}]")
 
         vec_ds = self._db.create_dataset(
             f"_vidx_{self.name}_vec_ds", **{vec_field: vec_dtype}
         )
-        id_ds  = self._db.create_dataset(
+        id_ds = self._db.create_dataset(
             f"_vidx_{self.name}_id_ds",
             ext_id=f"U{self.max_id_len}",    # fixed-length → inline, fast bulk read
         )
         VecList = List.template(vec_ds)
         IdList  = List.template(id_ds)
 
-        self._cell_vecs = Dict(
+        self._cell_vecs = List(
             f"_vidx_{self.name}_cell_vecs", self._db, VecList,
-            cache_size=self.n_clusters + 8, use_bloom=False, store_key=True,
         )
-        self._cell_ids = Dict(
+        self._cell_ids = List(
             f"_vidx_{self.name}_cell_ids", self._db, IdList,
-            cache_size=self.n_clusters + 8, use_bloom=False, store_key=True,
         )
         self._vec_field = vec_field
+
+    def _populate_cells(self, K: int):
+        """Pre-append K empty inner Lists so cell_id maps directly to index."""
+        if len(self._cell_vecs) == 0:
+            for _ in range(K):
+                self._cell_vecs.append()
+                self._cell_ids.append()
 
     def _initialize(self):
         # Centroids and codebooks datasets
@@ -550,7 +558,7 @@ class IVFIndex(VectorIndex):
             f"_vidx_{self.name}_rev", self._db, rev_ds,
             cache_size=4000, use_bloom=False, store_key=False,
         )
-        self._make_cell_dicts()
+        self._make_cell_lists()
 
         self._n_vecs         = 0
         self._cent_block_addr = 0
@@ -645,6 +653,8 @@ class IVFIndex(VectorIndex):
         else:
             self._save_centroids()
 
+        # Pre-populate K empty inner Lists (one per cluster) for O(1) index access
+        self._populate_cells(len(self._centroids))
         self._trained = True
         self._save_state()
 
@@ -713,10 +723,9 @@ class IVFIndex(VectorIndex):
         self._ensure_cells()
         vec     = self._prep_vec(np.asarray(vector, dtype=np.float32))
         cell_id = self._assign_one(vec)
-        cid_str = str(cell_id)
 
         # Get current length of this cell's list (= insertion index)
-        cell_vec_list = self._cell_vecs[cid_str]
+        cell_vec_list = self._cell_vecs[cell_id]
         list_idx      = len(cell_vec_list)
 
         if self.pq:
@@ -726,7 +735,7 @@ class IVFIndex(VectorIndex):
         else:
             cell_vec_list.append({"vec": vec})
 
-        self._cell_ids[cid_str].append({"ext_id": vector_id})
+        self._cell_ids[cell_id].append({"ext_id": vector_id})
         self._rev[vector_id] = {"cell_id": cell_id, "list_idx": list_idx}
         self._n_vecs += 1
         self._auto_save_check()
@@ -741,10 +750,10 @@ class IVFIndex(VectorIndex):
         ptr = self._rev.get(vector_id)
         if ptr is None:
             raise KeyError(vector_id)
-        cid_str  = str(int(ptr["cell_id"]))
+        cell_id  = int(ptr["cell_id"])
         list_idx = int(ptr["list_idx"])
-        del self._cell_vecs[cid_str][list_idx]
-        del self._cell_ids[cid_str][list_idx]
+        del self._cell_vecs[cell_id][list_idx]
+        del self._cell_ids[cell_id][list_idx]
         del self._rev[vector_id]
         self._n_vecs -= 1
         self._auto_save_check()
@@ -779,8 +788,7 @@ class IVFIndex(VectorIndex):
         heap_meta   : list[tuple[int,int]] = []  # (cell_id, local_idx)
 
         for cell_id in probe_cells:
-            cid_str   = str(int(cell_id))
-            vec_list  = self._cell_vecs[cid_str]
+            vec_list  = self._cell_vecs[int(cell_id)]
             n_cell    = len(vec_list)
             if n_cell == 0:
                 continue
@@ -819,9 +827,8 @@ class IVFIndex(VectorIndex):
         for gi in global_ki:
             cell_id, local_idx = heap_meta[gi]
             sc     = heap_scores[gi]
-            cid_str = str(cell_id)
             try:
-                ext_id = str(self._cell_ids[cid_str][local_idx]["ext_id"])
+                ext_id = str(self._cell_ids[cell_id][local_idx]["ext_id"])
             except Exception:
                 ext_id = f"cell{cell_id}_idx{local_idx}"
             results.append((ext_id, float(sc)))
