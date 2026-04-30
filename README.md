@@ -512,35 +512,47 @@ On-disk size: ~10 KB / edge in this configuration (double-indexed `_out` + `_in`
 
 ### Vector search — FlatIndex and IVFIndex
 
-Benchmarks: 10 000 vectors, dim=128, cosine similarity, 50 random queries.
-K=100 IVF clusters.  Training on 5 000 samples.
+Benchmarks: 20 000 vectors, dim=128, cosine similarity, 500 random queries.
+Training on 5 000 samples.  All timings include full Python round-trip.
 
-**Insert throughput:**
+**IVFIndex storage layout:** `List[List]` — K outer slots, one inner List per cluster.
+`cell_vecs[cell_id]` is a direct O(1) integer index, no hashmap probe.
+Per-cell data is a single sequential mmap read via `slice_array()`.
 
-| Index | insert | train |
-|---|---:|---|
-| FlatIndex | 10 600 vecs/s | — (no training) |
-| IVFFlat | 9 800 vecs/s | 5 s |
-| IVF+PQ M=16 | 2 700 vecs/s | 38 s |
+**Search — FlatIndex (exact, baseline):**
 
-**Search — recall@10 vs nprobe (IVFFlat, K=100):**
-
-| nprobe | ms/query | recall@10 |
+| N | ms/query | QPS |
 |---|---:|---:|
-| 8 (8%) | 3.2 ms | 32% |
-| 16 (16%) | 4.2 ms | 47% |
-| 32 (32%) | 5.4 ms | 68% |
-| 50 (50%) | 6.5 ms | 82% |
-| 99 (all) | 6.3 ms | 100% |
+| 20 000 | 9.7 ms | ~105 |
 
-FlatIndex (exact): **6.4 ms/query**.
+**IVFIndex — recall@10 and speed vs nprobe:**
 
-**IVF+PQ M=16 (32× compression)** — same query times (~2–3 ms) but lower recall (15–21%) due to the V1 approximation in ADC residual computation.
+*K=64 (≈312 vecs/cell):*
 
-**V1 limitations and roadmap:**
-- IVFFlat does not yet have per-cell sequential inverted lists; it loads all records and filters by `cell_id` in numpy. Query time is therefore similar to FlatIndex regardless of nprobe. The speedup comes from the reduced comparison set, not from skipping disk I/O.
-- IVF+PQ residual computation uses a single approximate centroid at search time, which reduces recall. V2 will compute per-cell residuals.
-- Both will improve in V2 with true inverted list access (per-cell contiguous blocks) and correct per-cell residuals.
+| nprobe | % probed | QPS | vs Flat | recall@10 |
+|---:|---:|---:|---:|---:|
+| 1 | 1.6% | 262 | **2.6×** | 7.5% |
+| 4 | 6.3% | 129 | **1.3×** | 21.3% |
+| 8 | 12.5% | 81 | 0.8× | 36.0% |
+| 16 | 25% | 43 | 0.4× | 56.6% |
+| 32 | 50% | 24 | 0.2× | 80.0% |
+| 64 | 100% | 13 | 0.1× | 100% |
+
+*K=128 (≈156 vecs/cell):*
+
+| nprobe | % probed | QPS | vs Flat | recall@10 |
+|---:|---:|---:|---:|---:|
+| 1 | 0.8% | 280 | **2.5×** | 5.2% |
+| 4 | 3.1% | 156 | **1.4×** | 15.5% |
+| 8 | 6.3% | 101 | 0.9× | 24.7% |
+| 16 | 12.5% | 57 | 0.5× | 38.5% |
+| 32 | 25% | 29 | 0.3× | 58.1% |
+
+**When to use which:**
+
+- **FlatIndex** — best for ≤ 50K vectors. One sequential mmap read + numpy matmul. Exact results, no training, no parameters.
+- **IVFIndex** — best for > 100K vectors. At 20K, FlatIndex wins at any recall ≥ 36%, because each probed cell is small and the per-cell overhead (List resolution + small mmap read) dominates the savings. The crossover happens around 50–100K vectors where probing 8–16 cells reads 3–6% of the data vs FlatIndex's 100% sequential scan.
+- **Rule of thumb:** set `n_clusters ≈ sqrt(n_vecs)` and `nprobe ≈ sqrt(K)` as a starting point; tune nprobe up for higher recall.
 
 ---
 
