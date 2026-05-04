@@ -152,6 +152,7 @@ class Dict(DataStructure):
         self._initial_capacity = initial_capacity or self.DEFAULT_INITIAL_CAPACITY
         self._parent = _parent  # Parent Dict if this is nested
         self._parent_key = None  # Key in parent dict (set by parent)
+        self._defer_parent_update = False  # set by set_batch() to skip per-insert ref writes
 
         if isinstance(dataset_or_template, DataStructureTemplate):
             self._template = dataset_or_template
@@ -755,6 +756,32 @@ class Dict(DataStructure):
         except KeyError:
             pass  # Key not found, nothing to update
 
+    @write_op
+    def set_batch(self, items):
+        """Insert multiple (key, value) pairs with a single parent ref update.
+
+        Equivalent to calling self[k] = v for each item, but defers the
+        update_nested_ref call to once at the end instead of after every
+        insert.  Use this when inserting many edges into the same nested
+        Dict (e.g. all outgoing edges from one source node in a Graph).
+
+        Args:
+            items: iterable of (key, value) pairs
+        """
+        self._defer_parent_update = True
+        try:
+            for key, value in items:
+                self._setitem_fast(key, value)
+        finally:
+            self._defer_parent_update = False
+        if (
+            self._parent is not None
+            and self._parent != "__nested__"
+            and self._parent_key is not None
+        ):
+            self._parent.update_nested_ref(self._parent_key, self)
+        self._auto_save_check()
+
     def _entry_key_matches(self, entry, key):
         """Check if a deserialized hash table entry matches the internal key.
 
@@ -1065,7 +1092,8 @@ class Dict(DataStructure):
 
         # If this is a nested dict, update our reference in parent
         if (
-            self._parent is not None
+            not getattr(self, "_defer_parent_update", False)
+            and self._parent is not None
             and self._parent != "__nested__"
             and self._parent_key is not None
         ):
@@ -1185,7 +1213,8 @@ class Dict(DataStructure):
 
         # If this is a nested dict, update our reference in parent
         if (
-            self._parent is not None
+            not getattr(self, "_defer_parent_update", False)
+            and self._parent is not None
             and self._parent != "__nested__"
             and self._parent_key is not None
         ):
