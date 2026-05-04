@@ -160,6 +160,7 @@ def build_app(
     title: Optional[str] = None,
     dashboard: bool = False,
     auth_token: Optional[str] = None,
+    _reopen_lock_on_startup: bool = False,
 ):
     """Build a FastAPI app exposing loom data structures in `db`.
 
@@ -179,6 +180,7 @@ def build_app(
     try:
         from fastapi import FastAPI, HTTPException, Body, Query
         from fastapi.responses import HTMLResponse, RedirectResponse
+        from contextlib import asynccontextmanager
     except ImportError as e:  # pragma: no cover
         raise RuntimeError(
             "FastAPI is required for `loom.server`. "
@@ -196,6 +198,16 @@ def build_app(
     from loom.datastructures.queue import Queue
     from loom.datastructures.lru_dict import LRUDict
 
+    @asynccontextmanager
+    async def lifespan(app):
+        # Each worker process (after fork) must reopen the lockfile to get
+        # its own independent file description — shared fd after fork would
+        # make flock useless across workers.
+        if _reopen_lock_on_startup and db._multiprocess_safe:
+            db._lockfile.close()
+            db._lockfile = open(db.filename + ".lock", "w")
+        yield
+
     app = FastAPI(
         title=title or f"loom: {db.filename}",
         description=(
@@ -204,10 +216,12 @@ def build_app(
             "* Swagger UI — [`/docs`](/docs) (try requests live)\n"
             "* ReDoc — [`/redoc`](/redoc)\n"
             "* OpenAPI 3 schema — [`/openapi.json`](/openapi.json)\n\n"
-            "Single-writer / single-reader: every request is serialized "
-            "through a process-wide lock."
+            "All requests within a process are serialised through a "
+            "threading.RLock. With workers > 1, cross-process writes are "
+            "serialised via fcntl.flock."
         ),
         version="1.0.0",
+        lifespan=lifespan,
     )
     lock = db._lock  # reuse DB's RLock — same thread-safety, enables write_lock() interop
     _model_cache: dict[tuple[str, str], Any] = {}
@@ -853,12 +867,15 @@ def serve(
     port: int = 8000,
     dashboard: bool = False,
     auth_token: Optional[str] = None,
+    workers: int = 1,
     **uvicorn_kwargs,
 ):
     """Run a uvicorn server exposing `db` over HTTP.
 
-    Blocking call.  Single-writer / single-reader: all requests are
-    serialized through a process-wide lock.
+    Blocking call.  All requests within a process are serialized through
+    db._lock (threading.RLock).  With workers > 1, cross-process writes
+    are serialized via fcntl.flock — db must be opened with
+    multiprocess_safe=True (enforced automatically if not set).
 
     Args:
         db: an open `loom.DB` instance.
@@ -866,6 +883,9 @@ def serve(
         dashboard: mount an optional integrated dashboard at `/dashboard`.
         auth_token: optional API token protecting every route, including
             interactive docs and the dashboard.
+        workers: number of uvicorn worker processes (default 1).
+            Use > 1 for CPU-bound read-heavy workloads.  Writes are safe
+            across workers via fcntl.flock on a companion .lock file.
         **uvicorn_kwargs: forwarded to `uvicorn.run`.
     """
     try:
@@ -876,5 +896,13 @@ def serve(
             "Install with: pip install 'fastapi[standard]'"
         ) from e
 
-    app = build_app(db, dashboard=dashboard, auth_token=auth_token)
+    if workers > 1 and not db._multiprocess_safe:
+        import fcntl as _fcntl
+        db._multiprocess_safe = True
+        db._fcntl = _fcntl
+        db._lockfile = open(db.filename + ".lock", "w")
+
+    app = build_app(db, dashboard=dashboard, auth_token=auth_token,
+                    _reopen_lock_on_startup=(workers > 1))
+    uvicorn_kwargs.setdefault("workers", workers if workers > 1 else None)
     uvicorn.run(app, host=host, port=port, **uvicorn_kwargs)

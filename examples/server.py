@@ -73,6 +73,7 @@ class Product(BaseModel):
 # ── Build the DB ──────────────────────────────────────────────────────────
 
 DB_PATH = os.path.join(tempfile.gettempdir(), "loom_demo_server.db")
+API_TOKEN = "secret"
 fresh = not os.path.exists(DB_PATH)
 
 try:
@@ -120,7 +121,8 @@ if fresh:
 print(f"Loom DB: {DB_PATH}")
 print("Open http://localhost:8000/docs for the interactive API")
 print("Open http://localhost:8000/dashboard for the integrated dashboard")
+print(f"Dashboard/API token: {API_TOKEN}")
 print("Press Ctrl-C to stop.\n")
 
 # Blocking call — runs uvicorn under the hood
-db.serve(host="127.0.0.1", port=8000, dashboard=True)
+db.serve(host="127.0.0.1", port=8000, dashboard=True, auth_token=API_TOKEN)

@@ -383,7 +383,24 @@ app = db.fastapi_app()      # standard FastAPI instance
 # uvicorn.run(app, host=..., port=...)
 ```
 
-> **Concurrency**: loom is single-writer / single-reader. The server takes a single process-wide lock so requests are serialised against the underlying mmap. Safe from any number of clients, but throughput is bounded by one writer at a time.
+Protect the API, docs, and dashboard with a shared token when exposing the server beyond trusted local use:
+
+```python
+db.serve(host="0.0.0.0", port=8000, dashboard=True, auth_token="change-me")
+```
+
+Clients can authenticate with `Authorization: Bearer <token>` or `X-API-Key: <token>`. Browser users can sign in from `/dashboard`; the server stores the token in an HttpOnly same-site cookie. You can also open `/dashboard?token=<token>` once to set that cookie directly.
+
+> **Concurrency**: Within a single process, all requests are serialised through `db._lock` (threading.RLock). For multi-process deployments, open the DB with `multiprocess_safe=True` and pass `workers=N` to `db.serve()` — cross-process writes are then serialised via `fcntl.flock` on a companion `.lock` file with no additional overhead on reads.
+
+```python
+# Single process (default)
+db.serve(host="0.0.0.0", port=8000)
+
+# Multiple workers — writes serialised across processes via flock
+with DB("app.db", multiprocess_safe=True) as db:
+    db.serve(host="0.0.0.0", port=8000, workers=4)
+```
 
 ---
 
@@ -602,8 +619,17 @@ db = DB("app.db", sync_writes=True)
 - `List.compact()` rebuilds without deleted items and returns old blocks to the freelist.
 
 **Session safety**
-- Multiple processes reading simultaneously: safe — each has its own independent mmap.
-- Single writer + multiple readers: safe for fixed-schema fields. The writer always writes the value record before making the hash table entry visible. Avoid concurrent reads of a record whose `text` field is being updated.
+
+| Scenario | Status | Mechanism |
+|---|---|---|
+| Single process, single thread | ✅ | nominal |
+| Single process, multiple threads | ✅ | `threading.RLock` via `@write_op` on every write method |
+| Multiple HTTP clients → `db.serve()` | ✅ | same RLock shared across all request handlers |
+| Multiple processes, reads only | ✅ | Linux shared mmap pages, x86 TSO ordering |
+| Multiple processes, SWMR | ✅ | `DB(path, multiprocess_safe=True)` + `fcntl.flock(LOCK_EX)` on writes; readers never block |
+| Multiple concurrent writers | ❌ | not supported — use a single writer process |
+
+Every public write method (`__setitem__`, `append`, `push`, `add`, …) acquires the lock automatically — no manual wrapping required.  For compound operations that must be atomic together, use `with db.write_lock(): ...`.
 
 ---
 

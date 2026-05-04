@@ -186,6 +186,67 @@ def test_dashboard_route_is_served_when_enabled(db):
     assert "loom dashboard" in r.text.lower()
 
 
+def test_auth_token_protects_api_docs_and_dashboard(db):
+    db.create_dataset("users", User)
+    db.create_set("active")
+    client = TestClient(db.fastapi_app(dashboard=True, auth_token="secret-token"))
+
+    assert client.get("/").status_code == 401
+    assert client.get("/docs").status_code == 401
+    assert client.get("/dashboard").status_code == 401
+    assert "api token" in client.get("/dashboard").text.lower()
+
+    r = client.get("/", headers={"Authorization": "Bearer secret-token"})
+    assert r.status_code == 200
+    assert r.json()["structures"]["active"] == "Set"
+
+    r = client.get("/dashboard", headers={"X-API-Key": "secret-token"})
+    assert r.status_code == 200
+    assert "loom dashboard" in r.text.lower()
+
+
+def test_auth_token_query_sets_dashboard_cookie(db):
+    db.create_dataset("users", User)
+    client = TestClient(db.fastapi_app(dashboard=True, auth_token="secret-token"))
+
+    r = client.get("/dashboard?token=secret-token")
+    assert r.status_code == 200
+    assert "loom_auth" in r.cookies
+
+    r = client.get("/")
+    assert r.status_code == 200
+
+
+def test_dashboard_login_sets_auth_cookie(db):
+    db.create_dataset("users", User)
+    client = TestClient(db.fastapi_app(dashboard=True, auth_token="secret-token"))
+
+    r = client.post(
+        "/dashboard/login",
+        content="token=wrong",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert r.status_code == 401
+
+    r = client.post(
+        "/dashboard/login",
+        content="token=secret-token",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert "loom_auth" in r.cookies
+
+    r = client.get("/dashboard")
+    assert r.status_code == 200
+    assert "loom dashboard" in r.text.lower()
+
+
+def test_empty_auth_token_is_rejected(db):
+    with pytest.raises(ValueError):
+        db.fastapi_app(auth_token="")
+
+
 def test_serve_mounts_optional_dashboard(monkeypatch, db):
     import loom.server as server
 
@@ -195,7 +256,14 @@ def test_serve_mounts_optional_dashboard(monkeypatch, db):
     monkeypatch.setattr(server, "build_app", build_app)
     monkeypatch.setitem(sys.modules, "uvicorn", uvicorn)
 
-    server.serve(db, host="127.0.0.1", port=8123, dashboard=True)
+    server.serve(
+        db,
+        host="127.0.0.1",
+        port=8123,
+        dashboard=True,
+        auth_token="secret-token",
+    )
 
-    build_app.assert_called_once_with(db, dashboard=True)
-    uvicorn.run.assert_called_once_with(app, host="127.0.0.1", port=8123)
+    build_app.assert_called_once_with(db, dashboard=True, auth_token="secret-token",
+                                       _reopen_lock_on_startup=False)
+    uvicorn.run.assert_called_once_with(app, host="127.0.0.1", port=8123, workers=None)
