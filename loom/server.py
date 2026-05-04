@@ -28,10 +28,17 @@ Or, to mount the API in your own ASGI stack:
 from __future__ import annotations
 
 import re
+import secrets
 import threading
 from typing import Any, Optional
+from urllib.parse import parse_qs
 
 import numpy as np
+
+try:
+    from starlette.requests import Request
+except ImportError:  # pragma: no cover
+    Request = Any
 
 # ---------------------------------------------------------------------------
 # Schema → Pydantic helpers
@@ -147,7 +154,13 @@ def _to_jsonable(value):
 # ---------------------------------------------------------------------------
 
 
-def build_app(db, *, title: Optional[str] = None, dashboard: bool = False):
+def build_app(
+    db,
+    *,
+    title: Optional[str] = None,
+    dashboard: bool = False,
+    auth_token: Optional[str] = None,
+):
     """Build a FastAPI app exposing loom data structures in `db`.
 
     The app is built once and resolves names lazily on every request, so
@@ -157,13 +170,15 @@ def build_app(db, *, title: Optional[str] = None, dashboard: bool = False):
         db: a `loom.DB` instance (must be open).
         title: OpenAPI title (default: "loom: <filename>").
         dashboard: mount an integrated FastAPI dashboard at `/dashboard`.
+        auth_token: optional API token protecting every route, including
+            interactive docs and the dashboard.
 
     Returns:
         A FastAPI application.
     """
     try:
         from fastapi import FastAPI, HTTPException, Body, Query
-        from fastapi.responses import HTMLResponse
+        from fastapi.responses import HTMLResponse, RedirectResponse
     except ImportError as e:  # pragma: no cover
         raise RuntimeError(
             "FastAPI is required for `loom.server`. "
@@ -194,8 +209,91 @@ def build_app(db, *, title: Optional[str] = None, dashboard: bool = False):
         ),
         version="1.0.0",
     )
-    lock = threading.Lock()
+    lock = db._lock  # reuse DB's RLock — same thread-safety, enables write_lock() interop
     _model_cache: dict[tuple[str, str], Any] = {}
+    auth_enabled = bool(auth_token)
+
+    if auth_token is not None and not str(auth_token):
+        raise ValueError("auth_token must be a non-empty string when provided")
+
+    def _authorized(value: Optional[str]) -> bool:
+        return bool(value) and secrets.compare_digest(str(value), str(auth_token))
+
+    def _dashboard_login_html(error: Optional[str] = None) -> str:
+        message = (
+            f'<div class="error">{error}</div>'
+            if error
+            else "<p>Enter the API token to access the dashboard.</p>"
+        )
+        return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>loom dashboard login</title>
+  <style>
+    :root {{ color-scheme: dark; }}
+    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at 20% 0%, rgba(115,87,255,.22), transparent 32%), linear-gradient(180deg, #071225, #030712); color: #e8f1ff; font: 14px/1.45 Inter, ui-sans-serif, system-ui, sans-serif; }}
+    form {{ width: min(420px, calc(100vw - 32px)); border: 1px solid rgba(148,163,184,.18); border-radius: 14px; padding: 24px; background: rgba(8,17,31,.92); box-shadow: 0 18px 58px rgba(0,0,0,.30); }}
+    h1 {{ margin: 0 0 8px; font-size: 24px; letter-spacing: -.04em; }}
+    p {{ margin: 0 0 18px; color: #8ea2bf; }}
+    label {{ display: block; margin-bottom: 8px; color: #dce8f8; font-weight: 800; font-size: 12px; }}
+    input {{ width: 100%; min-height: 42px; border: 1px solid rgba(148,163,184,.26); border-radius: 9px; padding: 10px 12px; background: #0a1424; color: #e8f1ff; outline: none; box-sizing: border-box; }}
+    input:focus {{ border-color: rgba(17,199,229,.68); box-shadow: 0 0 0 4px rgba(17,199,229,.08); }}
+    button {{ width: 100%; min-height: 42px; margin-top: 14px; border: 0; border-radius: 9px; background: linear-gradient(135deg, #7357ff, #2563eb); color: white; font-weight: 900; cursor: pointer; }}
+    .error {{ margin-bottom: 18px; color: #fecaca; }}
+  </style>
+</head>
+<body>
+  <form method="post" action="/dashboard/login">
+    <h1>loom dashboard</h1>
+    {message}
+    <label for="token">API token</label>
+    <input id="token" name="token" type="password" autocomplete="current-password" autofocus />
+    <button type="submit">Sign in</button>
+  </form>
+</body>
+</html>"""
+
+    if auth_enabled:
+
+        @app.middleware("http")
+        async def _auth_middleware(request: Request, call_next):
+            if request.url.path == "/dashboard/login":
+                return await call_next(request)
+            auth_header = request.headers.get("authorization", "")
+            bearer = (
+                auth_header[7:].strip()
+                if auth_header.lower().startswith("bearer ")
+                else None
+            )
+            supplied_token = (
+                bearer
+                or request.headers.get("x-api-key")
+                or request.cookies.get("loom_auth")
+                or request.query_params.get("token")
+            )
+            if not _authorized(supplied_token):
+                if request.url.path == "/dashboard":
+                    return HTMLResponse(_dashboard_login_html(), status_code=401)
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse(
+                    {"detail": "Authentication required"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            response = await call_next(request)
+            if request.query_params.get("token") and _authorized(
+                request.query_params.get("token")
+            ):
+                response.set_cookie(
+                    "loom_auth",
+                    str(auth_token),
+                    httponly=True,
+                    samesite="strict",
+                )
+            return response
 
     # ------------------------------------------------------------------ utils
     def _model_for(prefix: str, name: str, schema: dict[str, str]):
@@ -254,6 +352,33 @@ def build_app(db, *, title: Optional[str] = None, dashboard: bool = False):
             }
 
     if dashboard:
+        if auth_enabled:
+
+            @app.get(
+                "/dashboard/login",
+                include_in_schema=False,
+                response_class=HTMLResponse,
+            )
+            def dashboard_login_page():
+                return HTMLResponse(_dashboard_login_html())
+
+            @app.post("/dashboard/login", include_in_schema=False)
+            async def dashboard_login(request: Request):
+                body = (await request.body()).decode("utf-8")
+                token = parse_qs(body).get("token", [""])[0]
+                if not _authorized(token):
+                    return HTMLResponse(
+                        _dashboard_login_html("Invalid API token."),
+                        status_code=401,
+                    )
+                response = RedirectResponse("/dashboard", status_code=303)
+                response.set_cookie(
+                    "loom_auth",
+                    str(auth_token),
+                    httponly=True,
+                    samesite="strict",
+                )
+                return response
 
         @app.get(
             "/dashboard",
@@ -727,6 +852,7 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8000,
     dashboard: bool = False,
+    auth_token: Optional[str] = None,
     **uvicorn_kwargs,
 ):
     """Run a uvicorn server exposing `db` over HTTP.
@@ -738,6 +864,8 @@ def serve(
         db: an open `loom.DB` instance.
         host, port: API bind address.
         dashboard: mount an optional integrated dashboard at `/dashboard`.
+        auth_token: optional API token protecting every route, including
+            interactive docs and the dashboard.
         **uvicorn_kwargs: forwarded to `uvicorn.run`.
     """
     try:
@@ -748,5 +876,5 @@ def serve(
             "Install with: pip install 'fastapi[standard]'"
         ) from e
 
-    app = build_app(db, dashboard=dashboard)
+    app = build_app(db, dashboard=dashboard, auth_token=auth_token)
     uvicorn.run(app, host=host, port=port, **uvicorn_kwargs)

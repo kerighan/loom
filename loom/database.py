@@ -9,6 +9,7 @@ Provides high-level API with:
 - Dict-like access
 """
 
+import threading
 from contextlib import contextmanager
 
 from loom.fileio import ByteFileDB
@@ -60,6 +61,7 @@ class DB:
         auto_save_interval=100,
         cache_size=0,
         sync_writes=False,
+        multiprocess_safe=False,
     ):
         """Initialize database.
 
@@ -89,9 +91,29 @@ class DB:
                 may not be on disk immediately after each write.
                 For servers, prefer calling db.flush() periodically, or use
                 sync_writes=True for full durability.
+            multiprocess_safe: If True, acquire an exclusive fcntl.flock on a
+                companion <filename>.lock file for the duration of every write
+                operation.  Prevents concurrent writes from separate processes
+                and makes SWMR (single-writer / multiple-reader) safe on Linux.
+                Readers never block each other — Linux shared mmap pages give
+                immediate inter-process visibility without msync.
+                Cost: ~1-2 µs per write (flock syscall, uncontested).
         """
         self.filename = filename
         self.auto_save_interval = auto_save_interval
+
+        # Thread-safety: RLock allows re-entrant locking from the same thread
+        # (e.g. save() called inside a write operation).  Uncontested cost ~50 ns.
+        self._lock = threading.RLock()
+
+        # Process-safety (opt-in): exclusive flock on a companion lock file.
+        self._multiprocess_safe = multiprocess_safe
+        self._lockfile = None
+        if multiprocess_safe:
+            import fcntl as _fcntl  # noqa: F401 — validate availability early
+            lockpath = filename + ".lock"
+            self._lockfile = open(lockpath, "w")
+            self._fcntl = _fcntl
 
         # Shared cache: one LRU for the entire DB, namespaced per-structure
         if cache_size > 0:
@@ -113,6 +135,29 @@ class DB:
         # Auto-open by default for convenience
         if auto_open:
             self.open()
+
+    @contextmanager
+    def write_lock(self):
+        """Acquire the write lock for a compound operation.
+
+        Use this to make multi-step writes atomic:
+
+            with db.write_lock():
+                ds.insert(...)
+                bt[key] = val
+
+        Thread-safe (threading.RLock) in all modes.
+        Process-safe (fcntl.flock LOCK_EX) when multiprocess_safe=True.
+        Readers are never blocked — safe to read without the lock.
+        """
+        if self._multiprocess_safe:
+            self._fcntl.flock(self._lockfile, self._fcntl.LOCK_EX)
+        try:
+            with self._lock:
+                yield
+        finally:
+            if self._multiprocess_safe:
+                self._fcntl.flock(self._lockfile, self._fcntl.LOCK_UN)
 
     def open(self):
         """Open database and load dataset registry.
@@ -526,7 +571,7 @@ class DB:
     # HTTP server
     # -------------------------------------------------------------------------
 
-    def fastapi_app(self, *, title=None, dashboard=False):
+    def fastapi_app(self, *, title=None, dashboard=False, auth_token=None):
         """Return a FastAPI app exposing this DB over HTTP.
 
         Datastructures are auto-mounted with proper OpenAPI docs and
@@ -534,16 +579,23 @@ class DB:
         use `db.serve()` to run it directly.
 
         Requires `fastapi` (`pip install 'fastapi[standard]'`).
+        Pass `auth_token="..."` to protect the API, docs, and dashboard.
         """
         from loom.server import build_app
 
-        return build_app(self, title=title, dashboard=dashboard)
+        return build_app(
+            self,
+            title=title,
+            dashboard=dashboard,
+            auth_token=auth_token,
+        )
 
     def serve(
         self,
         host="127.0.0.1",
         port=8000,
         dashboard=False,
+        auth_token=None,
         **uvicorn_kwargs,
     ):
         """Run an HTTP server exposing this DB.
@@ -554,6 +606,7 @@ class DB:
         Blocking call.  Requires `fastapi` and `uvicorn`.
         Pass `dashboard=True` to also mount an optional integrated dashboard
         at `/dashboard` on the same server.
+        Pass `auth_token="..."` to protect the API, docs, and dashboard.
 
         Example:
             with DB("app.db") as db:
@@ -569,6 +622,7 @@ class DB:
             host=host,
             port=port,
             dashboard=dashboard,
+            auth_token=auth_token,
             **uvicorn_kwargs,
         )
 
