@@ -468,6 +468,20 @@ Per-call inserts already run at batch speed in loom (the flush is already lazy),
 | List | read[i] | 165 000 | 6 |
 | Queue | push (batch) | 220 000 | 5 |
 | Queue | pop | 260 000 | 4 |
+| BTree | insert | 229 000 | 4 |
+| BTree | lookup | 345 000 | 3 |
+| BTree | range (100 keys) | 342 000 calls/s | 3 (30 ns/key) |
+| Set | add | 73 000 | 14 |
+| Set | contains | 49 000 | 21 |
+| Set | remove | 55 000 | 18 |
+| LRUDict | set (no eviction) | 145 000 | 7 |
+| LRUDict | get (hit) | 115 000 | 9 |
+| LRUDict | set (with eviction) | 145 000 | 7 |
+| Graph | add_node | 25 000 | 40 |
+| Graph | add_edge | 2 900 | 345 |
+| Graph | get_node | 57 000 | 18 |
+| Graph | has_edge | 17 000 | 60 |
+| Graph | neighbors | 12 000 | 80 |
 
 ### `str` (text) fields — impact of variable-length blobs
 
