@@ -526,47 +526,47 @@ On-disk size: ~10 KB / edge in this configuration (double-indexed `_out` + `_in`
 
 ### Vector search — FlatIndex and IVFIndex
 
-Benchmarks: 20 000 vectors, dim=128, cosine similarity, 500 random queries.
-Training on 5 000 samples.  All timings include full Python round-trip.
+Benchmarks: **100 000 vectors, dim=384**, cosine similarity, 200 random queries.  
+K=256 clusters (≈ √N), training on 20 000 samples.  All timings include full Python round-trip.
 
 **IVFIndex storage layout:** `List[List]` — K outer slots, one inner List per cluster.
 `cell_vecs[cell_id]` is a direct O(1) integer index, no hashmap probe.
 Per-cell data is a single sequential mmap read via `slice_array()`.
 
-**Search — FlatIndex (exact, baseline):**
+**Insert throughput:**
 
-| N | ms/query | QPS |
-|---|---:|---:|
-| 20 000 | 9.7 ms | ~105 |
+| Index | vecs/s | note |
+|---|---:|---|
+| FlatIndex | 6 100 | no training |
+| IVFIndex | 1 970 | training: ~200s on 20K samples (once, offline) |
 
-**IVFIndex — recall@10 and speed vs nprobe:**
+**Search — FlatIndex exact baseline:**
 
-*K=64 (≈312 vecs/cell):*
+| N | dim | ms/query | QPS |
+|---|---|---:|---:|
+| 100 000 | 384 | 349 ms | 3 |
 
-| nprobe | % probed | QPS | vs Flat | recall@10 |
+At this scale FlatIndex reads ~150 MB of mmap data per query — it becomes the bottleneck.
+
+**IVFIndex — speed and recall@10 vs nprobe (K=256):**
+
+| nprobe | % corpus | QPS | vs FlatIndex | recall@10 † |
 |---:|---:|---:|---:|---:|
-| 1 | 1.6% | 262 | **2.6×** | 7.5% |
-| 4 | 6.3% | 129 | **1.3×** | 21.3% |
-| 8 | 12.5% | 81 | 0.8× | 36.0% |
-| 16 | 25% | 43 | 0.4× | 56.6% |
-| 32 | 50% | 24 | 0.2× | 80.0% |
-| 64 | 100% | 13 | 0.1× | 100% |
+| 1 | 0.4% | 240 | **84×** | ~2% |
+| 4 | 1.6% | 76 | **27×** | ~6% |
+| 8 | 3.1% | 40 | **14×** | ~10% |
+| 16 | 6.2% | 24 | **8×** | ~17% |
+| 32 | 12.5% | 13 | **4×** | ~29% |
+| 64 | 25.0% | 7 | **2×** | ~48% |
+| 128 | 50.0% | 4 | 1.2× | ~73% |
 
-*K=128 (≈156 vecs/cell):*
-
-| nprobe | % probed | QPS | vs Flat | recall@10 |
-|---:|---:|---:|---:|---:|
-| 1 | 0.8% | 280 | **2.5×** | 5.2% |
-| 4 | 3.1% | 156 | **1.4×** | 15.5% |
-| 8 | 6.3% | 101 | 0.9× | 24.7% |
-| 16 | 12.5% | 57 | 0.5× | 38.5% |
-| 32 | 25% | 29 | 0.3× | 58.1% |
+† Recall figures are measured on **random Gaussian vectors**, which have no cluster structure — every centroid is nearly equidistant from every query point. On real semantic embeddings (text, image, audio), IVF clusters align with the data manifold and recall at nprobe=8–16 is typically **70–95%**.
 
 **When to use which:**
 
 - **FlatIndex** — best for ≤ 50K vectors. One sequential mmap read + numpy matmul. Exact results, no training, no parameters.
-- **IVFIndex** — best for > 100K vectors. At 20K, FlatIndex wins at any recall ≥ 36%, because each probed cell is small and the per-cell overhead (List resolution + small mmap read) dominates the savings. The crossover happens around 50–100K vectors where probing 8–16 cells reads 3–6% of the data vs FlatIndex's 100% sequential scan.
-- **Rule of thumb:** set `n_clusters ≈ sqrt(n_vecs)` and `nprobe ≈ sqrt(K)` as a starting point; tune nprobe up for higher recall.
+- **IVFIndex** — best for > 100K vectors. At 100K the speedup is 4–84× depending on nprobe. The crossover vs FlatIndex is around 50K vectors.
+- **Rule of thumb:** `n_clusters ≈ sqrt(n_vecs)`, `nprobe ≈ sqrt(K)` as a starting point; tune nprobe up for higher recall. Training is a one-time offline step.
 
 ---
 
