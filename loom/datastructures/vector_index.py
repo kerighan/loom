@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from loom.datastructures.base import DataStructure
+from loom.datastructures.base import DataStructure, write_op
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
@@ -340,6 +340,7 @@ class FlatIndex(VectorIndex):
 
     # ── Public API ───────────────────────────────────────────────────────
 
+    @write_op
     def add(self, vector_id: str, vector: np.ndarray) -> None:
         self._ensure_rev()
         existing = self._rev.get(vector_id)
@@ -378,6 +379,7 @@ class FlatIndex(VectorIndex):
         for vid, vec in items:
             self.add(vid, vec)
 
+    @write_op
     def remove(self, vector_id: str) -> None:
         self._ensure_rev()
         ptr = self._rev.get(vector_id)
@@ -631,6 +633,7 @@ class IVFIndex(VectorIndex):
 
     # ── Training ─────────────────────────────────────────────────────────
 
+    @write_op
     def train(self, vectors: np.ndarray) -> None:
         """Train IVF centroids (and PQ codebooks if pq=True).
 
@@ -717,6 +720,7 @@ class IVFIndex(VectorIndex):
 
     # ── Insert ────────────────────────────────────────────────────────────
 
+    @write_op
     def add(self, vector_id: str, vector: np.ndarray) -> None:
         if not self._trained:
             raise RuntimeError("Call train() before adding vectors.")
@@ -744,6 +748,7 @@ class IVFIndex(VectorIndex):
         for vid, vec in items:
             self.add(vid, vec)
 
+    @write_op
     def remove(self, vector_id: str) -> None:
         """Soft-delete a vector (marks its slot invalid in both cell lists)."""
         self._ensure_cells()

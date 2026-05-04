@@ -2,7 +2,7 @@
 
 import struct
 import mmh3
-from loom.datastructures.base import DataStructure
+from loom.datastructures.base import DataStructure, write_op
 from loom.datastructures.template import DataStructureTemplate
 from loom.datastructures.counting_bloomfilter import CountingBloomFilter
 from loom.cache import LRUCache  # kept for Set.template usage in this module
@@ -717,6 +717,7 @@ class Dict(DataStructure):
                 }
         self._save_metadata(metadata)
 
+    @write_op
     def update_nested_ref(self, key, nested_item):
         """Update the stored reference for a nested structure after modification.
 
@@ -940,6 +941,7 @@ class Dict(DataStructure):
 
         self.save()
 
+    @write_op
     def __setitem__(self, key, value, atomic=False):
         """Set value for key.
 
@@ -1284,6 +1286,7 @@ class Dict(DataStructure):
             else:
                 raise
 
+    @write_op
     def __delitem__(self, key):
         """Delete key from dict (soft delete).
 

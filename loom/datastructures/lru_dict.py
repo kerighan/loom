@@ -36,7 +36,7 @@ in a plain List or Dict — consistent with how List adds a `valid` field.
 
 import numpy as np
 
-from loom.datastructures.base import DataStructure
+from loom.datastructures.base import DataStructure, write_op
 from loom.datastructures.dict import Dict
 
 
@@ -301,6 +301,7 @@ class LRUDict(DataStructure):
 
     # ── Public API ────────────────────────────────────────────────────────
 
+    @write_op
     def __setitem__(self, key, value: dict):
         if not isinstance(value, dict):
             raise TypeError(
@@ -359,6 +360,7 @@ class LRUDict(DataStructure):
         except KeyError:
             return default
 
+    @write_op
     def __delitem__(self, key):
         self._ensure_index()
         ikey = self._ikey(key)

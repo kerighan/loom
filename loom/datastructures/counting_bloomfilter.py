@@ -11,7 +11,7 @@ Perfect for hash tables and caches where items are added/removed frequently.
 """
 
 import mmh3
-from loom.datastructures.base import DataStructure
+from loom.datastructures.base import DataStructure, write_op
 
 
 class CounterOverflowError(Exception):
@@ -215,6 +215,7 @@ class CountingBloomFilter(DataStructure):
         if current > 0:
             self._set_counter(bucket_index, current - 1)
 
+    @write_op
     def add(self, item):
         """Add an item to the filter.
 
@@ -230,6 +231,7 @@ class CountingBloomFilter(DataStructure):
         self.num_items += 1
         self._auto_save_check()
 
+    @write_op
     def remove(self, item):
         """Remove an item from the filter.
 

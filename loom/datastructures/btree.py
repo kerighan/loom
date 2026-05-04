@@ -12,7 +12,7 @@ This implementation stores addresses (like Dict) rather than inline objects,
 allowing flexible value sizes and nested structures.
 """
 
-from .base import DataStructure
+from .base import DataStructure, write_op
 from loom.datastructures.template import DataStructureTemplate
 from loom.cache import LRUCache
 from loom.ref import Ref
@@ -829,6 +829,7 @@ class BTree(DataStructure):
 
     # ========== Public API ==========
 
+    @write_op
     def __setitem__(self, key, value):
         """Insert or update a key-value pair."""
         if not isinstance(key, str):
@@ -929,6 +930,7 @@ class BTree(DataStructure):
 
         return value_data
 
+    @write_op
     def update_nested_ref(self, key, nested_item):
         if not self._is_nested:
             return
@@ -942,6 +944,7 @@ class BTree(DataStructure):
         if self._node_cache:
             self._node_cache.invalidate(node["addr"])
 
+    @write_op
     def __delitem__(self, key):
         """Delete a key."""
         if not isinstance(key, str):

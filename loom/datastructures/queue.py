@@ -55,7 +55,7 @@ Performance
 
 import numpy as np
 
-from loom.datastructures.base import DataStructure
+from loom.datastructures.base import DataStructure, write_op
 
 
 class Queue(DataStructure):
@@ -222,6 +222,7 @@ class Queue(DataStructure):
         ):
             self._parent.update_nested_ref(self._parent_key, self)
 
+    @write_op
     def push(self, item: dict):
         """Enqueue an item at the tail.
 
@@ -247,6 +248,7 @@ class Queue(DataStructure):
         self._update_parent_ref()
         self._auto_save_check()
 
+    @write_op
     def pop(self) -> dict:
         """Dequeue and return the front item.
 
@@ -299,6 +301,7 @@ class Queue(DataStructure):
 
     # ── Batch push ────────────────────────────────────────────────────────────
 
+    @write_op
     def push_many(self, items):
         """Push multiple items efficiently using numpy bulk writes.
 

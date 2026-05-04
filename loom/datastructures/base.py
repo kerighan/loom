@@ -5,9 +5,28 @@ Provides common interface and utilities for building high-level
 data structures on top of Datasets.
 """
 
+import functools
 import json
 from abc import ABC, abstractmethod
 from loom.datastructures.template import DataStructureTemplate
+
+
+def write_op(fn):
+    """Decorate a DataStructure write method to acquire the DB write lock.
+
+    Ensures every public mutation (insert, delete, append, …) is atomic
+    at the operation level.  Re-entrant via threading.RLock, so nested
+    write calls (e.g. Dict.__setitem__ → nested List.append) never
+    deadlock.  Also acquires fcntl.flock when DB was opened with
+    multiprocess_safe=True.
+
+    Overhead: ~50-100 ns uncontested — negligible vs µs-scale mmap writes.
+    """
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._db.write_lock():
+            return fn(self, *args, **kwargs)
+    return wrapper
 
 # Global registry for DataStructure types (for reference reconstruction)
 _DS_REGISTRY = {}

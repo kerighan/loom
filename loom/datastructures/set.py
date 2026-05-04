@@ -6,7 +6,7 @@ Implemented as a thin wrapper around Dict.
 """
 
 from .dict import Dict
-from .base import DataStructure
+from .base import DataStructure, write_op
 from .template import DataStructureTemplate
 from loom.cache import LRUCache
 
@@ -392,6 +392,7 @@ class Set(DataStructure):
         ):
             self._parent.update_nested_ref(self._parent_key, self)
 
+    @write_op
     def add(self, item, atomic: bool = False):
         """Add an item to the set.
 
@@ -409,6 +410,7 @@ class Set(DataStructure):
         # Update reference in parent if nested
         self._update_parent_ref()
 
+    @write_op
     def remove(self, item):
         """Remove an item from the set.
 
@@ -435,6 +437,7 @@ class Set(DataStructure):
         except KeyError:
             pass
 
+    @write_op
     def pop(self):
         """Remove and return an arbitrary item.
 

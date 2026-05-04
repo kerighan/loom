@@ -9,7 +9,7 @@ via nested Dict[str, Dict[str, edge_attrs]]:
 Deletion is double: remove from both outgoing and incoming.
 """
 
-from .base import DataStructure
+from .base import DataStructure, write_op
 from .dict import Dict
 
 
@@ -169,6 +169,7 @@ class Graph(DataStructure):
 
     # ---- Node API ----
 
+    @write_op
     def add_node(self, node_id, **attrs):
         """Add a node with attributes."""
         self._ensure_loaded()
@@ -184,6 +185,7 @@ class Graph(DataStructure):
         self._ensure_loaded()
         return str(node_id) in self._nodes
 
+    @write_op
     def remove_node(self, node_id):
         """Remove a node and all its edges."""
         self._ensure_loaded()
@@ -225,6 +227,7 @@ class Graph(DataStructure):
 
     # ---- Edge API ----
 
+    @write_op
     def add_edge(self, src, dst, **attrs):
         """Add an edge from src to dst with attributes.
 
@@ -259,6 +262,7 @@ class Graph(DataStructure):
             return False
         return d in self._out[s]
 
+    @write_op
     def remove_edge(self, src, dst):
         """Remove an edge. Double deletion from both indexes."""
         self._ensure_loaded()
@@ -359,6 +363,7 @@ class Graph(DataStructure):
 
     # ---- Batch inserts ----
 
+    @write_op
     def add_nodes(self, nodes):
         """Bulk-add nodes, deferring all header flushes to a single flush at the end.
 
@@ -385,6 +390,7 @@ class Graph(DataStructure):
             for node_id, attrs in nodes:
                 self._nodes[str(node_id)] = attrs
 
+    @write_op
     def add_edges(self, edges):
         """Bulk-add edges, deferring all header flushes to a single flush at the end.
 

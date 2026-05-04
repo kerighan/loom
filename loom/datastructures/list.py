@@ -12,7 +12,7 @@ Features:
 
 import json
 
-from loom.datastructures.base import DataStructure
+from loom.datastructures.base import DataStructure, write_op
 from loom.datastructures.template import DataStructureTemplate
 from loom.cache import LRUCache
 
@@ -457,6 +457,7 @@ class List(DataStructure):
 
         return items
 
+    @write_op
     def append(self, item=None, atomic=False):
         """Append item to end of list.
 
@@ -505,6 +506,7 @@ class List(DataStructure):
 
             return item
 
+    @write_op
     def append_many(self, items, atomic=False):
         """Append multiple items.
 
@@ -930,6 +932,7 @@ class List(DataStructure):
 
         return items
 
+    @write_op
     def __setitem__(self, index, item):
         """Set item at index.
 
@@ -979,6 +982,7 @@ class List(DataStructure):
 
         self._auto_save_check()
 
+    @write_op
     def update_nested_ref(self, index, nested_item):
         """Update the stored reference for a nested structure.
 
@@ -1034,6 +1038,7 @@ class List(DataStructure):
             if cache_key in self._block_cache:
                 del self._block_cache[cache_key]
 
+    @write_op
     def __delitem__(self, index):
         """Delete item at index (soft delete).
 
@@ -1153,6 +1158,7 @@ class List(DataStructure):
                     else:
                         yield clean_item
 
+    @write_op
     def compact(self):
         """Compact list by removing deleted items.
 

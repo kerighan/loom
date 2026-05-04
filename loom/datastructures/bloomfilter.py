@@ -16,7 +16,7 @@ Modern optimizations:
 
 import mmh3
 import numpy as np
-from loom.datastructures.base import DataStructure
+from loom.datastructures.base import DataStructure, write_op
 
 
 class BloomFilter(DataStructure):
@@ -198,6 +198,7 @@ class BloomFilter(DataStructure):
         addr = self._bits_addr + bit_index * self._record_size
         self._db_raw.write(addr + 1, b"\x01")
 
+    @write_op
     def add(self, item):
         """Add an item to the Bloom filter.
 
