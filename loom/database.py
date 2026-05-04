@@ -526,7 +526,7 @@ class DB:
     # HTTP server
     # -------------------------------------------------------------------------
 
-    def fastapi_app(self, *, title=None):
+    def fastapi_app(self, *, title=None, dashboard=False):
         """Return a FastAPI app exposing this DB over HTTP.
 
         Datastructures are auto-mounted with proper OpenAPI docs and
@@ -537,15 +537,13 @@ class DB:
         """
         from loom.server import build_app
 
-        return build_app(self, title=title)
+        return build_app(self, title=title, dashboard=dashboard)
 
     def serve(
         self,
         host="127.0.0.1",
         port=8000,
         dashboard=False,
-        dashboard_port=8501,
-        dashboard_host=None,
         **uvicorn_kwargs,
     ):
         """Run an HTTP server exposing this DB.
@@ -554,8 +552,8 @@ class DB:
         a process-wide lock so the underlying mmap stays consistent.
 
         Blocking call.  Requires `fastapi` and `uvicorn`.
-        Pass `dashboard=True` to also start an optional Streamlit dashboard
-        backed by the HTTP API.
+        Pass `dashboard=True` to also mount an optional integrated dashboard
+        at `/dashboard` on the same server.
 
         Example:
             with DB("app.db") as db:
@@ -571,8 +569,6 @@ class DB:
             host=host,
             port=port,
             dashboard=dashboard,
-            dashboard_port=dashboard_port,
-            dashboard_host=dashboard_host,
             **uvicorn_kwargs,
         )
 
@@ -962,6 +958,7 @@ class DB:
         if not self._is_open:
             raise DatabaseNotOpenError()
         from loom.datastructures.vector_index import FlatIndex
+
         if name in self._datastructures:
             return self._datastructures[name]
         idx = FlatIndex(name, self, dim=dim, metric=metric)
@@ -970,8 +967,14 @@ class DB:
         return idx
 
     def create_ivf_index(
-        self, name, dim, metric="cosine",
-        n_clusters=256, pq=False, n_sub=16, n_bits=8,
+        self,
+        name,
+        dim,
+        metric="cosine",
+        n_clusters=256,
+        pq=False,
+        n_sub=16,
+        n_bits=8,
     ):
         """Create an IVFIndex for approximate vector similarity search.
 
@@ -996,11 +999,19 @@ class DB:
         if not self._is_open:
             raise DatabaseNotOpenError()
         from loom.datastructures.vector_index import IVFIndex
+
         if name in self._datastructures:
             return self._datastructures[name]
-        idx = IVFIndex(name, self, dim=dim, metric=metric,
-                       n_clusters=n_clusters, pq=pq,
-                       n_sub=n_sub, n_bits=n_bits)
+        idx = IVFIndex(
+            name,
+            self,
+            dim=dim,
+            metric=metric,
+            n_clusters=n_clusters,
+            pq=pq,
+            n_sub=n_sub,
+            n_bits=n_bits,
+        )
         self._datastructures[name] = idx
         self._save_datastructures_registry()
         return idx

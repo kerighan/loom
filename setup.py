@@ -14,6 +14,7 @@ setup(
         "mmh3>=4.0.0",
         "lru-dict>=1.2.0",
         "brotli>=1.0.0",
+        "requests>=2.0.0",
     ],
     extras_require={
         "dev": [

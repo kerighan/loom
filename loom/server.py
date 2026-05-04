@@ -1,8 +1,7 @@
 """HTTP server for loom databases.
 
-Exposes every dataset and datastructure registered on a `DB` as a clean
-REST API, with auto-generated OpenAPI docs and Pydantic-based request
-validation.
+Exposes every datastructure registered on a `DB` as a clean REST API,
+with auto-generated OpenAPI docs and Pydantic-based request validation.
 
 Concurrency model
 -----------------
@@ -148,8 +147,8 @@ def _to_jsonable(value):
 # ---------------------------------------------------------------------------
 
 
-def build_app(db, *, title: Optional[str] = None):
-    """Build a FastAPI app exposing every dataset/structure in `db`.
+def build_app(db, *, title: Optional[str] = None, dashboard: bool = False):
+    """Build a FastAPI app exposing loom data structures in `db`.
 
     The app is built once and resolves names lazily on every request, so
     structures created after `build_app()` are still reachable.
@@ -157,19 +156,20 @@ def build_app(db, *, title: Optional[str] = None):
     Args:
         db: a `loom.DB` instance (must be open).
         title: OpenAPI title (default: "loom: <filename>").
+        dashboard: mount an integrated FastAPI dashboard at `/dashboard`.
 
     Returns:
         A FastAPI application.
     """
     try:
-        from fastapi import FastAPI, HTTPException, Body, Path, Query
+        from fastapi import FastAPI, HTTPException, Body, Query
+        from fastapi.responses import HTMLResponse
     except ImportError as e:  # pragma: no cover
         raise RuntimeError(
             "FastAPI is required for `loom.server`. "
             "Install with: pip install 'fastapi[standard]'"
         ) from e
 
-    from loom.dataset import Dataset
     from loom.datastructures import (
         BloomFilter,
         CountingBloomFilter,
@@ -215,12 +215,6 @@ def build_app(db, *, title: Optional[str] = None):
         except Exception as e:
             raise HTTPException(status_code=422, detail=str(e))
 
-    def _get_dataset(name: str) -> Dataset:
-        ds = db._datasets.get(name)
-        if ds is None:
-            raise HTTPException(404, f"Dataset {name!r} not found")
-        return ds
-
     def _get_structure(name: str, expected_type):
         obj = db._datastructures.get(name)
         if obj is None or not isinstance(obj, expected_type):
@@ -240,84 +234,36 @@ def build_app(db, *, title: Optional[str] = None):
     @app.get(
         "/",
         tags=["meta"],
-        summary="List datasets, structures, and links to interactive docs",
+        summary="List structures and links to interactive docs",
     )
     def index():
         with lock:
+            docs = {
+                "swagger_ui": "/docs",
+                "redoc": "/redoc",
+                "openapi_schema": "/openapi.json",
+            }
+            if dashboard:
+                docs["dashboard"] = "/dashboard"
             return {
                 "filename": db.filename,
-                "datasets": list(db._datasets),
                 "structures": {
                     n: type(s).__name__ for n, s in db._datastructures.items()
                 },
-                "docs": {
-                    "swagger_ui": "/docs",
-                    "redoc": "/redoc",
-                    "openapi_schema": "/openapi.json",
-                },
+                "docs": docs,
             }
 
-    # ============================================================== datasets
-    @app.get("/datasets/{name}", tags=["datasets"], summary="Dataset schema")
-    def dataset_info(name: str):
-        with lock:
-            ds = _get_dataset(name)
-            return {
-                "name": ds.name,
-                "identifier": ds.identifier,
-                "schema": _dataset_schema(ds),
-                "record_size": ds.record_size,
-            }
+    if dashboard:
 
-    @app.post(
-        "/datasets/{name}/records",
-        tags=["datasets"],
-        summary="Insert a record (allocates a new address)",
-        status_code=201,
-    )
-    def dataset_insert(name: str, record: dict = Body(...)):
-        with lock:
-            ds = _get_dataset(name)
-            data = _validate("ds", name, record, _dataset_schema(ds))
-            ref = ds.insert(data)
-            return {"address": int(ref.addr)}
+        @app.get(
+            "/dashboard",
+            include_in_schema=False,
+            response_class=HTMLResponse,
+        )
+        def dashboard_page():
+            from loom.web_dashboard import render_dashboard_html
 
-    @app.get(
-        "/datasets/{name}/records/{address}",
-        tags=["datasets"],
-        summary="Read a record",
-    )
-    def dataset_read(name: str, address: int):
-        with lock:
-            ds = _get_dataset(name)
-            try:
-                return _to_jsonable(ds.read(address))
-            except Exception as e:
-                raise HTTPException(404, str(e))
-
-    @app.put(
-        "/datasets/{name}/records/{address}",
-        tags=["datasets"],
-        summary="Overwrite a record",
-    )
-    def dataset_write(name: str, address: int, record: dict = Body(...)):
-        with lock:
-            ds = _get_dataset(name)
-            data = _validate("ds", name, record, _dataset_schema(ds))
-            ds.write(address, **data)
-            return {"address": int(address)}
-
-    @app.delete(
-        "/datasets/{name}/records/{address}",
-        tags=["datasets"],
-        summary="Soft-delete a record",
-        status_code=204,
-    )
-    def dataset_delete(name: str, address: int):
-        with lock:
-            ds = _get_dataset(name)
-            ds.delete(address)
-            return None
+            return HTMLResponse(render_dashboard_html())
 
     # ================================================================== list
     @app.get("/lists/{name}", tags=["lists"], summary="List metadata")
@@ -643,6 +589,37 @@ def build_app(db, *, title: Optional[str] = None):
             return _to_jsonable(q.pop())
 
     # =========================================================== bloom & cbf
+    @app.get("/bloomfilters/{name}", tags=["bloomfilters"], summary="Bloom metadata")
+    def bloom_info(name: str):
+        with lock:
+            bf = _get_structure(name, BloomFilter)
+            return {
+                "name": bf.name,
+                "length": bf.num_items,
+                "expected_items": bf.expected_items,
+                "false_positive_rate": bf.false_positive_rate,
+                "num_bits": bf.num_bits,
+                "num_hashes": bf.num_hashes,
+            }
+
+    @app.get(
+        "/counting_bloomfilters/{name}",
+        tags=["counting_bloomfilters"],
+        summary="Counting Bloom metadata",
+    )
+    def counting_bloom_info(name: str):
+        with lock:
+            bf = _get_structure(name, CountingBloomFilter)
+            return {
+                "name": bf.name,
+                "length": bf.num_items,
+                "expected_items": bf.expected_items,
+                "false_positive_rate": bf.false_positive_rate,
+                "num_buckets": bf.num_buckets,
+                "num_hashes": bf.num_hashes,
+                "max_count": bf.max_count,
+            }
+
     def _bloom_routes(prefix: str, expected_cls):
         @app.post(
             f"/{prefix}/{{name}}/items",
@@ -745,7 +722,13 @@ def build_app(db, *, title: Optional[str] = None):
     return app
 
 
-def serve(db, host: str = "127.0.0.1", port: int = 8000, **uvicorn_kwargs):
+def serve(
+    db,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    dashboard: bool = False,
+    **uvicorn_kwargs,
+):
     """Run a uvicorn server exposing `db` over HTTP.
 
     Blocking call.  Single-writer / single-reader: all requests are
@@ -753,7 +736,8 @@ def serve(db, host: str = "127.0.0.1", port: int = 8000, **uvicorn_kwargs):
 
     Args:
         db: an open `loom.DB` instance.
-        host, port: bind address.
+        host, port: API bind address.
+        dashboard: mount an optional integrated dashboard at `/dashboard`.
         **uvicorn_kwargs: forwarded to `uvicorn.run`.
     """
     try:
@@ -764,5 +748,5 @@ def serve(db, host: str = "127.0.0.1", port: int = 8000, **uvicorn_kwargs):
             "Install with: pip install 'fastapi[standard]'"
         ) from e
 
-    app = build_app(db)
+    app = build_app(db, dashboard=dashboard)
     uvicorn.run(app, host=host, port=port, **uvicorn_kwargs)

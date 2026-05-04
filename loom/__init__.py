@@ -1,6 +1,14 @@
 """Loom - A persistent database that feels like Python."""
 
 from loom.database import DB
+from loom.client import (
+    LoomClient,
+    LoomClientError,
+    LoomHTTPError,
+    LoomNotFoundError,
+    LoomValidationError,
+    LoomConflictError,
+)
 from loom.dataset import Dataset
 from loom.datastructures import List, BloomFilter, CountingBloomFilter
 from loom.schema import dt_key, key_dt, dt_key_size, FixedStr, Vec, schema_from_model
@@ -23,14 +31,37 @@ from loom.errors import (
 
 __version__ = "0.1.0"
 __all__ = [
-    "DB", "Dataset", "List", "BloomFilter", "CountingBloomFilter",
+    "DB",
+    "Dataset",
+    "List",
+    "BloomFilter",
+    "CountingBloomFilter",
+    "LoomClient",
+    "LoomClientError",
+    "LoomHTTPError",
+    "LoomNotFoundError",
+    "LoomValidationError",
+    "LoomConflictError",
     # Exceptions
     "LoomError",
-    "DatabaseError", "DatabaseNotOpenError", "DuplicateNameError", "StructureNotFoundError",
-    "HeaderError", "HeaderTooLargeError",
-    "SchemaError", "InvalidIdentifierError", "UnknownDtypeError",
-    "RecordError", "DeletedRecordError", "WrongDatasetError",
+    "DatabaseError",
+    "DatabaseNotOpenError",
+    "DuplicateNameError",
+    "StructureNotFoundError",
+    "HeaderError",
+    "HeaderTooLargeError",
+    "SchemaError",
+    "InvalidIdentifierError",
+    "UnknownDtypeError",
+    "RecordError",
+    "DeletedRecordError",
+    "WrongDatasetError",
     "NestingNotSupportedError",
     # Datetime helpers
-    "dt_key", "key_dt", "dt_key_size", "FixedStr", "Vec", "schema_from_model",
+    "dt_key",
+    "key_dt",
+    "dt_key_size",
+    "FixedStr",
+    "Vec",
+    "schema_from_model",
 ]

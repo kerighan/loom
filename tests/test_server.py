@@ -2,6 +2,8 @@
 
 import os
 import tempfile
+from unittest.mock import Mock
+import sys
 
 import pytest
 from pydantic import BaseModel, Field
@@ -36,12 +38,20 @@ def test_index_lists_resources(db):
     r = client.get("/")
     assert r.status_code == 200
     body = r.json()
-    assert "users" in body["datasets"]
     assert body["structures"]["active"] == "Set"
     # Index should advertise the interactive docs.
     assert body["docs"]["swagger_ui"] == "/docs"
     assert body["docs"]["redoc"] == "/redoc"
     assert body["docs"]["openapi_schema"] == "/openapi.json"
+
+
+def test_index_lists_dashboard_doc_when_enabled(db):
+    db.create_dataset("users", User)
+    client = TestClient(db.fastapi_app(dashboard=True))
+
+    r = client.get("/")
+    assert r.status_code == 200
+    assert r.json()["docs"]["dashboard"] == "/dashboard"
 
 
 def test_interactive_docs_are_served(db):
@@ -64,52 +74,8 @@ def test_interactive_docs_are_served(db):
     assert r.status_code == 200
     spec = r.json()
     assert spec["openapi"].startswith("3.")
-    # Every dataset / dict / set / queue / btree route should be in there.
-    assert "/datasets/{name}/records" in spec["paths"]
-
-
-def test_dataset_crud(db):
-    users_ds = db.create_dataset("users", User)
-
-    client = TestClient(db.fastapi_app())
-
-    # info
-    r = client.get("/datasets/users")
-    assert r.status_code == 200
-    assert r.json()["schema"]["username"].endswith("U50")
-
-    # insert
-    r = client.post(
-        "/datasets/users/records",
-        json={"id": 1, "username": "alice", "age": 30, "premium": True},
-    )
-    assert r.status_code == 201
-    addr = r.json()["address"]
-
-    # read
-    r = client.get(f"/datasets/users/records/{addr}")
-    assert r.status_code == 200
-    rec = r.json()
-    assert rec["username"] == "alice"
-    assert rec["premium"] is True
-
-    # invalid: too long username (validation error)
-    r = client.post(
-        "/datasets/users/records",
-        json={"id": 2, "username": "x" * 100, "age": 1, "premium": False},
-    )
-    assert r.status_code == 422
-
-    # update
-    r = client.put(
-        f"/datasets/users/records/{addr}",
-        json={"id": 1, "username": "alice", "age": 31, "premium": False},
-    )
-    assert r.status_code == 200
-
-    # delete
-    r = client.delete(f"/datasets/users/records/{addr}")
-    assert r.status_code == 204
+    assert "/datasets/{name}/records" not in spec["paths"]
+    assert "/dicts/{name}/items/{key}" in spec["paths"]
 
 
 def test_dict_crud(db):
@@ -141,6 +107,10 @@ def test_dict_crud(db):
 def test_bloom(db):
     db.create_bloomfilter("seen", expected_items=100)
     client = TestClient(db.fastapi_app())
+
+    meta = client.get("/bloomfilters/seen")
+    assert meta.status_code == 200
+    assert meta.json()["expected_items"] == 100
 
     assert (
         client.post("/bloomfilters/seen/items", json={"item": "u1"}).status_code == 201
@@ -205,3 +175,27 @@ def test_nested_returns_422(db):
     client = TestClient(db.fastapi_app())
     r = client.get("/dicts/feeds/items/alice")
     assert r.status_code == 422
+
+
+def test_dashboard_route_is_served_when_enabled(db):
+    db.create_dataset("users", User)
+    client = TestClient(db.fastapi_app(dashboard=True))
+
+    r = client.get("/dashboard")
+    assert r.status_code == 200
+    assert "loom dashboard" in r.text.lower()
+
+
+def test_serve_mounts_optional_dashboard(monkeypatch, db):
+    import loom.server as server
+
+    app = Mock()
+    uvicorn = Mock()
+    build_app = Mock(return_value=app)
+    monkeypatch.setattr(server, "build_app", build_app)
+    monkeypatch.setitem(sys.modules, "uvicorn", uvicorn)
+
+    server.serve(db, host="127.0.0.1", port=8123, dashboard=True)
+
+    build_app.assert_called_once_with(db, dashboard=True)
+    uvicorn.run.assert_called_once_with(app, host="127.0.0.1", port=8123)
