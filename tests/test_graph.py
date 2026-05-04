@@ -130,3 +130,39 @@ def test_ba_graph_persists_across_reopen(db):
             assert g2.has_edge(str(u), str(v)), f"edge ({u},{v}) lost after reopen"
     finally:
         db2.close()
+
+
+def test_add_edges_batch_persists_and_last_duplicate_wins(db):
+    g = db.create_graph(
+        "g",
+        node_schema={"name": "U30"},
+        edge_schema={"weight": "float32"},
+        directed=True,
+    )
+    g.add_edges(
+        [
+            ("a", "b", {"weight": 1.0}),
+            ("a", "c", {"weight": 2.0}),
+            ("a", "b", {"weight": 3.0}),
+            ("d", "b", {"weight": 4.0}),
+        ]
+    )
+
+    assert g.has_edge("a", "b")
+    assert g.has_edge("a", "c")
+    assert g.has_edge("d", "b")
+    assert g.get_edge("a", "b")["weight"] == pytest.approx(3.0)
+    assert set(g.neighbors("a")) == {"b", "c"}
+    assert set(g.predecessors("b")) == {"a", "d"}
+
+    path = db.filename
+    db.close()
+
+    db2 = DB(path)
+    try:
+        g2 = db2._datastructures["g"]
+        assert g2.get_edge("a", "b")["weight"] == pytest.approx(3.0)
+        assert set(g2.neighbors("a")) == {"b", "c"}
+        assert set(g2.predecessors("b")) == {"a", "d"}
+    finally:
+        db2.close()

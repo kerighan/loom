@@ -51,8 +51,16 @@ class Graph(DataStructure):
         - remove_node:  O(degree)
     """
 
-    def __init__(self, name, db, node_schema, edge_schema, directed=True,
-                 node_id_max_len=50, _parent=None):
+    def __init__(
+        self,
+        name,
+        db,
+        node_schema,
+        edge_schema,
+        directed=True,
+        node_id_max_len=50,
+        _parent=None,
+    ):
         """
         Args:
             node_id_max_len: Max character length of node IDs (default 50).
@@ -79,6 +87,7 @@ class Graph(DataStructure):
             return schema_input
         # Pydantic model class
         from loom.schema import schema_from_model
+
         return schema_from_model(schema_input)
 
     def _initialize_graph(self, node_schema, edge_schema):
@@ -88,8 +97,11 @@ class Graph(DataStructure):
         # Node store
         node_ds = self._db.create_dataset(f"_graph_{self.name}_nodes", **node_dict)
         self._nodes = Dict(
-            f"_graph_{self.name}_node_dict", self._db, node_ds,
-            cache_size=1000, use_bloom=True,
+            f"_graph_{self.name}_node_dict",
+            self._db,
+            node_ds,
+            cache_size=1000,
+            use_bloom=True,
         )
 
         # Edge datasets (shared by nested dicts)
@@ -100,15 +112,23 @@ class Graph(DataStructure):
         # Outgoing adjacency: src -> {dst -> edge_attrs}
         out_template = Dict.template(edge_ds, cache_size=0)
         self._out = Dict(
-            f"_graph_{self.name}_out", self._db, out_template,
-            cache_size=1000, use_bloom=False, key_size=key_size,
+            f"_graph_{self.name}_out",
+            self._db,
+            out_template,
+            cache_size=1000,
+            use_bloom=False,
+            key_size=key_size,
         )
 
         # Incoming adjacency: dst -> {src -> edge_attrs}
         in_template = Dict.template(edge_ds, cache_size=0)
         self._in = Dict(
-            f"_graph_{self.name}_in", self._db, in_template,
-            cache_size=1000, use_bloom=False, key_size=key_size,
+            f"_graph_{self.name}_in",
+            self._db,
+            in_template,
+            cache_size=1000,
+            use_bloom=False,
+            key_size=key_size,
         )
 
         self._node_schema = node_dict
@@ -140,12 +160,14 @@ class Graph(DataStructure):
         self._in = self._db._datastructures[f"_graph_{self.name}_in"]
 
     def save(self, force=False):
-        self._save_metadata({
-            "node_schema": self._node_schema,
-            "edge_schema": self._edge_schema,
-            "directed": self._directed,
-            "node_id_max_len": self._node_id_max_len,
-        })
+        self._save_metadata(
+            {
+                "node_schema": self._node_schema,
+                "edge_schema": self._edge_schema,
+                "directed": self._directed,
+                "node_id_max_len": self._node_id_max_len,
+            }
+        )
 
     # ---- Registry protocol ----
 
@@ -160,7 +182,8 @@ class Graph(DataStructure):
     @classmethod
     def _from_registry_params(cls, name, db, params):
         return cls(
-            name, db,
+            name,
+            db,
             params["node_schema"],
             params["edge_schema"],
             directed=params.get("directed", True),
@@ -361,6 +384,104 @@ class Graph(DataStructure):
     def num_edges(self):
         return sum(1 for _ in self.edges())
 
+    def _bulk_insert_empty_adjacency(self, child, items):
+        if len(child) != 0 or child.next_data_offset != 0:
+            return False
+
+        dedup = {}
+        for key, value in items:
+            dedup[str(key)] = value
+        n_items = len(dedup)
+        if n_items == 0:
+            return True
+
+        target_capacity = max(8, n_items * 2)
+        target_p = (target_capacity - 1).bit_length()
+        capacity = child._get_capacity(target_p)
+        probe_range = min(child._get_probe_range(target_p), capacity)
+        used_positions = set()
+        planned = []
+
+        for key, value in dedup.items():
+            internal_key = child._to_internal_key(key)
+            key_hash = child._hash(internal_key)
+            bucket = key_hash % capacity
+            position = None
+            for offset in range(probe_range):
+                candidate = (bucket + offset) % capacity
+                if candidate not in used_positions:
+                    position = candidate
+                    used_positions.add(candidate)
+                    break
+            if position is None:
+                return False
+            planned.append((key, value, internal_key, key_hash, position))
+
+        if target_p != child._p_init:
+            table_addr = child._hash_table.allocate_block(capacity)
+            child._p_init = target_p
+            child.p_last = target_p
+            child.table_addrs = [int(table_addr)]
+        else:
+            table_addr = child.table_addrs[0]
+
+        if n_items > child.values_capacity:
+            child.values_block_addr = child._values_dataset.allocate_block(n_items)
+            child.values_capacity = n_items
+
+        value_record_size = child._values_dataset.record_size
+        hash_record_size = child._hash_table.record_size
+        value_addr = child.values_block_addr
+        has_stored_key = (
+            child._store_key and "_key" in child._values_dataset.user_schema.names
+        )
+
+        for index, (key, value, internal_key, key_hash, position) in enumerate(planned):
+            current_value_addr = value_addr + index * value_record_size
+            record = {"_key": key, **value} if has_stored_key else value
+            child._values_dataset.db.write(
+                current_value_addr,
+                child._values_dataset._serialize(**record),
+            )
+
+            if child._hash_keys:
+                hash_record = {
+                    "hash": key_hash,
+                    "key": internal_key,
+                    "value_addr": current_value_addr,
+                    "valid": True,
+                }
+            else:
+                hi, lo = internal_key
+                hash_record = {
+                    "hash_hi": hi,
+                    "hash_lo": lo,
+                    "value_addr": current_value_addr,
+                    "valid": True,
+                }
+            child._hash_table.db.write(
+                table_addr + position * hash_record_size,
+                child._hash_table._serialize(**hash_record),
+            )
+
+        child.next_data_offset = n_items
+        child.size = n_items
+        child._value_freelist = []
+        if (
+            child._parent is not None
+            and child._parent != "__nested__"
+            and child._parent_key is not None
+        ):
+            child._parent.update_nested_ref(child._parent_key, child)
+        child._auto_save_check()
+        return True
+
+    def _set_adjacency_batch(self, outer, grouped):
+        for node, items in grouped.items():
+            child = outer[node]
+            if not self._bulk_insert_empty_adjacency(child, items):
+                child.set_batch(items)
+
     # ---- Batch inserts ----
 
     @write_op
@@ -412,8 +533,8 @@ class Graph(DataStructure):
         self._ensure_loaded()
         from collections import defaultdict
 
-        by_src = defaultdict(list)   # src  -> [(dst, attrs), ...]
-        by_dst = defaultdict(list)   # dst  -> [(src, attrs), ...]
+        by_src = defaultdict(list)  # src  -> [(dst, attrs), ...]
+        by_dst = defaultdict(list)  # dst  -> [(src, attrs), ...]
 
         for src, dst, attrs in edges:
             s, d = str(src), str(dst)
@@ -424,13 +545,8 @@ class Graph(DataStructure):
                 by_dst[s].append((d, attrs))
 
         with self._db.batch():
-            # Outgoing: one set_batch per source node
-            for s, neighbors in by_src.items():
-                self._out[s].set_batch(neighbors)
-
-            # Incoming: one set_batch per dest node
-            for d, predecessors in by_dst.items():
-                self._in[d].set_batch(predecessors)
+            self._set_adjacency_batch(self._out, by_src)
+            self._set_adjacency_batch(self._in, by_dst)
 
     # ---- Query ----
 
@@ -448,15 +564,19 @@ class Graph(DataStructure):
             g.query("MATCH (a)->(b) WHERE a.name == 'Alice' RETURN b")
         """
         from loom.query import execute_query
+
         return list(execute_query(self, cypher_str))
 
     def query_iter(self, cypher_str):
         """Like query() but returns a lazy iterator (low memory)."""
         from loom.query import execute_query
+
         return execute_query(self, cypher_str)
 
     def __repr__(self):
-        return f"Graph('{self.name}', nodes={self.num_nodes}, directed={self._directed})"
+        return (
+            f"Graph('{self.name}', nodes={self.num_nodes}, directed={self._directed})"
+        )
 
     def __len__(self):
         return self.num_nodes
