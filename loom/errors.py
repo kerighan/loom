@@ -42,6 +42,11 @@ class DatabaseNotOpenError(DatabaseError):
         super().__init__(msg)
 
 
+class ReadOnlyError(DatabaseError):
+    def __init__(self, msg="Database is open in read-only mode"):
+        super().__init__(msg)
+
+
 class DuplicateNameError(DatabaseError):
     """A dataset or data structure with this name already exists.
 
@@ -109,9 +114,7 @@ class InvalidIdentifierError(SchemaError):
     """Dataset identifier is outside the valid range 1..127."""
 
     def __init__(self, identifier: int):
-        super().__init__(
-            f"Dataset identifier must be in 1..127, got {identifier}"
-        )
+        super().__init__(f"Dataset identifier must be in 1..127, got {identifier}")
         self.identifier = identifier
 
 

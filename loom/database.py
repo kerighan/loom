@@ -19,6 +19,7 @@ from loom.blob import BlobStore
 from loom.errors import (
     DatabaseNotOpenError,
     DuplicateNameError,
+    ReadOnlyError,
     StructureNotFoundError,
 )
 
@@ -62,6 +63,7 @@ class DB:
         cache_size=0,
         sync_writes=False,
         multiprocess_safe=False,
+        flag="r+",
     ):
         """Initialize database.
 
@@ -100,6 +102,8 @@ class DB:
                 Cost: ~1-2 µs per write (flock syscall, uncontested).
         """
         self.filename = filename
+        self.flag = flag
+        self.read_only = flag == "r"
         self.auto_save_interval = auto_save_interval
 
         # Thread-safety: RLock allows re-entrant locking from the same thread
@@ -111,6 +115,7 @@ class DB:
         self._lockfile = None
         if multiprocess_safe:
             import fcntl as _fcntl  # noqa: F401 — validate availability early
+
             lockpath = filename + ".lock"
             self._lockfile = open(lockpath, "w")
             self._fcntl = _fcntl
@@ -123,7 +128,11 @@ class DB:
         else:
             self._shared_cache = None
         self._db = ByteFileDB(
-            filename, initial_size, header_size, sync_writes=sync_writes
+            filename,
+            initial_size,
+            header_size,
+            sync_writes=sync_writes,
+            flag=flag,
         )
         self._datasets = {}  # name -> Dataset instance
         self._datastructures = {}  # name -> DataStructure instance
@@ -150,6 +159,8 @@ class DB:
         Process-safe (fcntl.flock LOCK_EX) when multiprocess_safe=True.
         Readers are never blocked — safe to read without the lock.
         """
+        if self.read_only:
+            raise ReadOnlyError()
         if self._multiprocess_safe:
             self._fcntl.flock(self._lockfile, self._fcntl.LOCK_EX)
         try:
@@ -185,23 +196,27 @@ class DB:
         if self._blob_store is None:
             self._blob_store = BlobStore(self._db, compression=self._blob_compression)
             # Save compression setting
-            self._db.set_header_field(self.BLOB_COMPRESSION_KEY, self._blob_compression)
+            if not self.read_only:
+                self._db.set_header_field(
+                    self.BLOB_COMPRESSION_KEY, self._blob_compression
+                )
         return self._blob_store
 
     def close(self):
         """Close database and save all data structures."""
         if self._is_open:
-            # Auto-save all data structures before closing
-            for ds in self._datastructures.values():
-                if hasattr(ds, "save"):
-                    try:
-                        ds.save(force=True)
-                    except TypeError:
-                        ds.save()
+            if not self.read_only:
+                # Auto-save all data structures before closing
+                for ds in self._datastructures.values():
+                    if hasattr(ds, "save"):
+                        try:
+                            ds.save(force=True)
+                        except TypeError:
+                            ds.save()
 
-            # Save blob freelist before closing
-            if self._blob_store is not None:
-                self._blob_store._save_freelist()
+                # Save blob freelist before closing
+                if self._blob_store is not None:
+                    self._blob_store._save_freelist()
 
             self._db.close()
             self._is_open = False
@@ -222,6 +237,7 @@ class DB:
         Returns:
             Tuple of (offset, n_slots) to store in dataset record
         """
+        self._ensure_writable()
         return self.blob_store.write(data)
 
     def read_blob(self, offset: int) -> bytes:
@@ -242,6 +258,7 @@ class DB:
             offset: Blob offset
             n_slots: Number of slots (from write_blob)
         """
+        self._ensure_writable()
         self.blob_store.delete(offset, n_slots)
 
     def _load_registry(self):
@@ -284,6 +301,7 @@ class DB:
 
     def _save_registry(self):
         """Save dataset registry to header."""
+        self._ensure_writable()
         registry = {}
         for name, dataset in self._datasets.items():
             # Store schema as field_name -> dtype_string mapping.
@@ -313,6 +331,7 @@ class DB:
         """Save data structures registry to header (generic — no per-type switch)."""
         if self._loading_registry:
             return
+        self._ensure_writable()
 
         ds_registry = {}
         for name, ds in self._datastructures.items():
@@ -327,6 +346,7 @@ class DB:
 
     def _get_next_identifier(self):
         """Get next available identifier and increment."""
+        self._ensure_writable()
         next_id = self._db.get_header_field(self.NEXT_ID_KEY, 1)
         if next_id > 127:
             raise ValueError("Maximum number of datasets (127) reached")
@@ -351,9 +371,13 @@ class DB:
         """
         if not self._is_open:
             return
-        if self._blob_store is not None:
+        if self._blob_store is not None and not self.read_only:
             self._blob_store._save_freelist()
         self._db.flush()
+
+    def _ensure_writable(self):
+        if self.read_only:
+            raise ReadOnlyError()
 
     @contextmanager
     def batch(self):
@@ -370,6 +394,7 @@ class DB:
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
+        self._ensure_writable()
         self._db.begin_batch()
         try:
             yield
@@ -379,6 +404,7 @@ class DB:
     def apply_writes(self, writes):
         if not self._is_open:
             raise DatabaseNotOpenError()
+        self._ensure_writable()
 
         if not writes:
             return
@@ -389,6 +415,7 @@ class DB:
     def write_batch(self):
         if not self._is_open:
             raise DatabaseNotOpenError()
+        self._ensure_writable()
 
         writes = []
         try:
@@ -423,15 +450,16 @@ class DB:
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
+        self._ensure_writable()
 
-        # Accept Pydantic model as positional arg
+        # Convert Pydantic model to schema if provided
         if model is not None and not schema:
             from loom.schema import schema_from_model
 
             schema = schema_from_model(model)
 
         if dataset_name in self._datasets:
-            raise DuplicateNameError(dataset_name)
+            raise DuplicateNameError(dataset_name, "Dataset")
 
         # Get next identifier
         identifier = self._get_next_identifier()
@@ -647,6 +675,7 @@ class DB:
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
+        self._ensure_writable()
 
         # Return existing if already loaded
         if name in self._datastructures:
@@ -678,6 +707,7 @@ class DB:
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
+        self._ensure_writable()
 
         # Return existing if already loaded
         if name in self._datastructures:
@@ -715,6 +745,7 @@ class DB:
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
+        self._ensure_writable()
 
         # Return existing if already loaded
         if name in self._datastructures:
@@ -762,6 +793,7 @@ class DB:
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
+        self._ensure_writable()
 
         from loom.datastructures.dict import Dict
 
@@ -806,6 +838,7 @@ class DB:
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
+        self._ensure_writable()
 
         # Return existing if already loaded
         if name in self._datastructures:
@@ -848,6 +881,7 @@ class DB:
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
+        self._ensure_writable()
 
         from loom.datastructures.btree import BTree
 
@@ -890,6 +924,7 @@ class DB:
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
+        self._ensure_writable()
 
         from loom.datastructures.graph import Graph
 
@@ -933,6 +968,7 @@ class DB:
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
+        self._ensure_writable()
 
         from loom.datastructures.queue import Queue
 
@@ -976,6 +1012,7 @@ class DB:
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
+        self._ensure_writable()
 
         from loom.datastructures.lru_dict import LRUDict
 
@@ -1011,6 +1048,7 @@ class DB:
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
+        self._ensure_writable()
         from loom.datastructures.vector_index import FlatIndex
 
         if name in self._datastructures:
@@ -1052,6 +1090,7 @@ class DB:
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
+        self._ensure_writable()
         from loom.datastructures.vector_index import IVFIndex
 
         if name in self._datastructures:

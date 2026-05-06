@@ -3,6 +3,8 @@ import mmap
 import pickle
 import numpy as np
 
+from loom.errors import ReadOnlyError
+
 
 class ByteFileDB:
     # Double-buffer header layout:
@@ -11,14 +13,26 @@ class ByteFileDB:
     #   [slot_size+1 : header_size]  slot B  — same layout
     # If crash during write to inactive slot, active slot is still intact.
 
-    def __init__(self, filename, initial_size=1024, header_size=32768, sync_writes=False):
+    def __init__(
+        self,
+        filename,
+        initial_size=1024,
+        header_size=32768,
+        sync_writes=False,
+        flag="r+",
+    ):
+        if flag not in ("r", "r+", "w", "rw"):
+            raise ValueError("flag must be one of 'r', 'r+', 'w', or 'rw'")
         self.filename = filename
         self.log_filename = self.filename + ".log"
         self.initial_size = initial_size
         self.header_size = header_size
         self._slot_size = (header_size - 1) // 2  # usable bytes per slot
         self.sync_writes = sync_writes  # if True, flush after every header save
-        self.ensure_file_size(max(self.initial_size, self.header_size))
+        self.flag = flag
+        self.read_only = flag == "r"
+        if not self.read_only:
+            self.ensure_file_size(max(self.initial_size, self.header_size))
         self.mapped_file = None
         self.file_handle = None
 
@@ -44,21 +58,35 @@ class ByteFileDB:
                 f.truncate(size)
 
     def open(self):
-        self.ensure_file_size(max(self.initial_size, self.header_size))
-        self.file_handle = open(self.filename, "r+b")
-        self.mapped_file = mmap.mmap(self.file_handle.fileno(), 0)
-        self.recover_from_log()
+        if self.read_only:
+            if not os.path.exists(self.filename):
+                raise FileNotFoundError(self.filename)
+            if os.path.exists(self.log_filename) and os.path.getsize(self.log_filename):
+                raise ReadOnlyError(
+                    "Cannot open read-only database with a pending WAL log; "
+                    "reopen it writable once to recover"
+                )
+            self.file_handle = open(self.filename, "rb")
+            self.mapped_file = mmap.mmap(
+                self.file_handle.fileno(), 0, access=mmap.ACCESS_READ
+            )
+        else:
+            self.ensure_file_size(max(self.initial_size, self.header_size))
+            self.file_handle = open(self.filename, "r+b")
+            self.mapped_file = mmap.mmap(self.file_handle.fileno(), 0)
+            self.recover_from_log()
         self._load_header()
 
     def close(self):
         if self.mapped_file:
-            # Persist freelist if dirty
-            if self._freelist_dirty:
-                self._save_freelist()
-            # Final header save + flush to guarantee on-disk durability
-            if self._header_dirty:
-                self._save_header()
-            self.mapped_file.flush()
+            if not self.read_only:
+                # Persist freelist if dirty
+                if self._freelist_dirty:
+                    self._save_freelist()
+                # Final header save + flush to guarantee on-disk durability
+                if self._header_dirty:
+                    self._save_header()
+                self.mapped_file.flush()
             self.mapped_file.close()
             self.mapped_file = None
         if self.file_handle:
@@ -67,6 +95,7 @@ class ByteFileDB:
 
     def _remap(self, min_size):
         """Grow file and re-create mmap. Flushes before closing."""
+        self._ensure_writable()
         if self._header_dirty:
             self._save_header()
         if self.mapped_file:
@@ -77,10 +106,11 @@ class ByteFileDB:
 
     def write(self, address, data):
         assert self.mapped_file, "DB is not open. Call open() first."
+        self._ensure_writable()
         end = address + len(data)
         if end > len(self.mapped_file):
             self._remap(end)
-        self.mapped_file[address : end] = data
+        self.mapped_file[address:end] = data
 
     def read(self, address, size):
         assert self.mapped_file, "DB is not open. Call open() first."
@@ -119,6 +149,7 @@ class ByteFileDB:
             self.clear_log()
 
     def transaction(self, writes):
+        self._ensure_writable()
         with open(self.log_filename, "ab") as log:
             for address, data in writes:
                 self.log_write(log, address, data)
@@ -130,6 +161,7 @@ class ByteFileDB:
         self.clear_log()
 
     def clear_log(self):
+        self._ensure_writable()
         with open(self.log_filename, "wb") as log:
             pass
 
@@ -170,6 +202,10 @@ class ByteFileDB:
         if data is None:
             data = self._read_slot(1 - active)
         if data is None:
+            if self.read_only:
+                raise ReadOnlyError(
+                    "Cannot initialize a missing header in read-only mode"
+                )
             self._initialize_header()
             return
 
@@ -179,6 +215,7 @@ class ByteFileDB:
 
     def _initialize_header(self):
         """Initialize a fresh header."""
+        self._ensure_writable()
         self._header_data = {
             self._is_initialized_key: True,
             self._allocation_index_key: self.header_size,
@@ -198,6 +235,7 @@ class ByteFileDB:
 
         if data_size > max_data:
             from loom.errors import HeaderTooLargeError
+
             raise HeaderTooLargeError(data_size, max_data)
 
         slot_bytes = b"LOOM" + np.uint32(data_size).tobytes() + pickled_data
@@ -220,6 +258,7 @@ class ByteFileDB:
         - Data durability is guaranteed by close() which calls flush().
         """
         assert self.mapped_file, "DB is not open. Call open() first."
+        self._ensure_writable()
 
         active = self.mapped_file[0]
         if active not in (0, 1):
@@ -244,7 +283,7 @@ class ByteFileDB:
         Call explicitly when you need immediate on-disk durability
         (e.g. before an expected hard shutdown).
         """
-        if self.mapped_file:
+        if self.mapped_file and not self.read_only:
             self.mapped_file.flush()
 
     def set_header_field(self, name, value):
@@ -258,6 +297,7 @@ class ByteFileDB:
             value: Any picklable Python object
         """
         assert self.mapped_file, "DB is not open. Call open() first."
+        self._ensure_writable()
         self._header_data[name] = value
         if self._batch_mode:
             self._header_dirty = True
@@ -266,6 +306,7 @@ class ByteFileDB:
 
     def begin_batch(self):
         """Enter batch mode: defer header writes until end_batch()."""
+        self._ensure_writable()
         self._batch_mode = True
 
     def end_batch(self):
@@ -297,6 +338,7 @@ class ByteFileDB:
 
     def delete_header_field(self, name):
         """Delete a header field."""
+        self._ensure_writable()
         if name in self._header_data:
             del self._header_data[name]
             self._save_header()
@@ -330,6 +372,7 @@ class ByteFileDB:
             address: Start address of the block
             size: Size in bytes
         """
+        self._ensure_writable()
         if size <= 0:
             return
 
@@ -414,6 +457,10 @@ class ByteFileDB:
             self._save_header()
 
         return current_index
+
+    def _ensure_writable(self):
+        if self.read_only:
+            raise ReadOnlyError()
 
     def get_allocation_index(self):
         """Get the current allocation index (write head position)."""

@@ -13,7 +13,12 @@ import os
 import tempfile
 import pytest
 from loom.database import DB
-from loom.errors import DuplicateNameError, StructureNotFoundError, DatabaseNotOpenError
+from loom.errors import (
+    DatabaseNotOpenError,
+    DuplicateNameError,
+    ReadOnlyError,
+    StructureNotFoundError,
+)
 
 
 class TestDatabaseBasics:
@@ -50,6 +55,31 @@ class TestDatabaseBasics:
 
             # Should be closed after context
             assert not db._is_open
+        finally:
+            if os.path.exists(filename):
+                os.remove(filename)
+
+
+class TestReadOnlyMode:
+    def test_read_only_mode_allows_reads_and_rejects_writes(self):
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            filename = tmp.name
+
+        try:
+            with DB(filename) as db:
+                users = db.create_dataset("users", id="uint64", name="U50")
+                by_name = db.create_dict("by_name", users)
+                by_name["alice"] = {"id": 1, "name": "Alice"}
+
+            with DB(filename, flag="r") as db:
+                assert db.read_only is True
+                assert db["by_name"]["alice"]["name"] == "Alice"
+
+                with pytest.raises(ReadOnlyError):
+                    db.create_dataset("events", id="uint64")
+
+                with pytest.raises(ReadOnlyError):
+                    db["by_name"]["bob"] = {"id": 2, "name": "Bob"}
         finally:
             if os.path.exists(filename):
                 os.remove(filename)

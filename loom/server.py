@@ -226,6 +226,7 @@ def build_app(
     lock = db._lock  # reuse DB's RLock — same thread-safety, enables write_lock() interop
     _model_cache: dict[tuple[str, str], Any] = {}
     auth_enabled = bool(auth_token)
+    read_only = bool(getattr(db, "read_only", False))
 
     if auth_token is not None and not str(auth_token):
         raise ValueError("auth_token must be a non-empty string when provided")
@@ -268,6 +269,19 @@ def build_app(
   </form>
 </body>
 </html>"""
+
+    if read_only:
+
+        @app.middleware("http")
+        async def _read_only_middleware(request: Request, call_next):
+            if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path != "/dashboard/login":
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse(
+                    {"detail": "Database is open in read-only mode"},
+                    status_code=403,
+                )
+            return await call_next(request)
 
     if auth_enabled:
 
@@ -359,6 +373,7 @@ def build_app(
                 docs["dashboard"] = "/dashboard"
             return {
                 "filename": db.filename,
+                "read_only": read_only,
                 "structures": {
                     n: type(s).__name__ for n, s in db._datastructures.items()
                 },
@@ -857,6 +872,31 @@ def build_app(
             except KeyError:
                 raise HTTPException(404, f"key {key!r} not found")
             return None
+
+    if read_only:
+
+        def _read_only_openapi():
+            if app.openapi_schema:
+                return app.openapi_schema
+            from fastapi.openapi.utils import get_openapi
+
+            schema = get_openapi(
+                title=app.title,
+                version=app.version,
+                description=(app.description or "")
+                + "\n\n**Read-only mode**: mutating endpoints are disabled and hidden from this schema.",
+                routes=app.routes,
+            )
+            for path, path_item in list(schema.get("paths", {}).items()):
+                for method in list(path_item.keys()):
+                    if method.lower() not in {"get", "head", "options"}:
+                        del path_item[method]
+                if not path_item:
+                    del schema["paths"][path]
+            app.openapi_schema = schema
+            return app.openapi_schema
+
+        app.openapi = _read_only_openapi
 
     return app
 

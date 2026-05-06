@@ -349,8 +349,9 @@ class LRUDict(DataStructure):
 
         addr = int(ptr["record_addr"])
         rec  = self._items_ds.read(addr)
-        self._move_to_head(addr)
-        self._auto_save_check()
+        if not getattr(self._db, "read_only", False):
+            self._move_to_head(addr)
+            self._auto_save_check()
 
         return {k: v for k, v in rec.items() if not k.startswith("_lru_")}
 

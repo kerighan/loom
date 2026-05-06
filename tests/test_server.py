@@ -104,6 +104,51 @@ def test_dict_crud(db):
     assert r.status_code == 404
 
 
+def test_read_only_api_hides_write_endpoints_and_rejects_mutations():
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "srv_ro.db")
+
+    with DB(path) as writable:
+        users_ds = writable.create_dataset("users", User)
+        by_username = writable.create_dict("by_username", users_ds)
+        by_username["alice"] = {
+            "id": 1,
+            "username": "alice",
+            "age": 30,
+            "premium": True,
+        }
+        writable.create_set("active")
+
+    db_ro = DB(path, flag="r")
+    try:
+        client = TestClient(db_ro.fastapi_app())
+
+        index = client.get("/")
+        assert index.status_code == 200
+        assert index.json()["read_only"] is True
+
+        spec = client.get("/openapi.json").json()
+        dict_item_path = spec["paths"]["/dicts/{name}/items/{key}"]
+        assert "get" in dict_item_path
+        assert "put" not in dict_item_path
+        assert "delete" not in dict_item_path
+
+        r = client.get("/dicts/by_username/items/alice")
+        assert r.status_code == 200
+        assert r.json()["username"] == "alice"
+
+        r = client.put(
+            "/dicts/by_username/items/bob",
+            json={"id": 2, "username": "bob", "age": 31, "premium": False},
+        )
+        assert r.status_code == 403
+        assert "read-only" in r.json()["detail"]
+
+        assert client.post("/sets/active/members", json={"item": "alice"}).status_code == 403
+    finally:
+        db_ro.close()
+
+
 def test_bloom(db):
     db.create_bloomfilter("seen", expected_items=100)
     client = TestClient(db.fastapi_app())
