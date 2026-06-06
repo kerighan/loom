@@ -133,7 +133,9 @@ def _topk(scores: np.ndarray, k: int, higher_is_better: bool = True):
         idx = np.argpartition(scores, -k)[-k:]
         idx = idx[np.argsort(scores[idx])[::-1]]
     else:
-        idx = np.argpartition(scores, k)[:k]
+        # kth must stay within [0, len-1]; k-1 partitions so [:k] holds the
+        # k smallest (k == len(scores) would otherwise raise out-of-bounds).
+        idx = np.argpartition(scores, k - 1)[:k]
         idx = idx[np.argsort(scores[idx])]
     return idx, scores[idx]
 
@@ -417,9 +419,10 @@ class FlatIndex(VectorIndex):
         if len(vecs) == 0:
             return []
 
-        higher = self.metric in ("cosine", "dot")
+        # _scores() already returns higher-is-better for every metric
+        # (l2 is negated), so top-k is always "largest score".
         scores = self._scores(q, vecs)
-        top_idx, top_scores = _topk(scores, k, higher_is_better=higher)
+        top_idx, top_scores = _topk(scores, k, higher_is_better=True)
 
         results = []
         for i, s in zip(top_idx, top_scores):
@@ -787,8 +790,9 @@ class IVFIndex(VectorIndex):
             probe_cells = np.argpartition(cent_dists, nprobe)[:nprobe]
 
         # Step 2: load only the probed cells — one mmap read per cell
-        # Collect (local_score, global_cid, local_idx) tuples
-        higher      = self.metric in ("cosine", "dot")
+        # Collect (local_score, global_cid, local_idx) tuples.
+        # _scores() / -ADC both return higher-is-better for every metric.
+        higher      = True
         heap_scores : list[float] = []
         heap_meta   : list[tuple[int,int]] = []  # (cell_id, local_idx)
 

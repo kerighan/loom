@@ -18,6 +18,14 @@ Pattern
     (a)-[*3]->(b)           exactly 3 hops
     (a)-[*2..5]->(b)        2..5 hops
 
+    Variable-length hops use shortest-path BFS: a destination node is
+    reported once, at its MINIMUM hop distance from the source.  So
+    "[*N]" means "nodes whose shortest path is exactly N", not "every
+    endpoint of an N-step walk" — a node reachable in 1 hop never shows up
+    under [*2], and [*2] can be empty even when 2-hop paths exist.  For the
+    whole neighbourhood within N hops, use "[*1..N]".  This is intentional
+    (no path explosion) and differs from Neo4j path-enumeration semantics.
+
 WHERE
     a.field == value         attribute comparison
     a.field != value
@@ -112,6 +120,9 @@ _EDGE_RE = re.compile(
 
 _NODE_BARE_RE  = re.compile(r"\((\w+)\)")
 _NODE_PROPS_RE = re.compile(r"\((\w+)\s*\{([^}]*)\}\s*\)")
+# Full node: (var), (var:Label), (var {props}), (var:Label {props})
+_NODE_RE = re.compile(r"\(\s*(\w+)?\s*(?::\s*(\w+))?\s*(\{[^}]*\})?\s*\)")
+_LABEL_CALL_RE = re.compile(r"label\(\s*(\w+)\s*\)")
 
 
 def _parse_props(props_str: str) -> dict[str, Any]:
@@ -143,87 +154,110 @@ def _parse_quantifier(q: str | None) -> tuple[int, int]:
     return (1, 1)
 
 
-def parse_pattern(s: str) -> dict:
-    """
-    Returns {
-        src_var, src_props,
-        edge_var, direction, min_hops, max_hops,
-        dst_var, dst_props
+def _parse_edge_token(edge_txt: str) -> dict:
+    """Parse one edge token into {var, direction, min_hops, max_hops}."""
+    if edge_txt.startswith("<-"):
+        direction = "in"
+        m = re.match(r"<-\[(\w*)\s*([*+?]?[0-9.]*(?:\.\.[0-9]+)?)?\s*\]-", edge_txt)
+    elif "->" in edge_txt:
+        direction = "out"
+        m = re.match(r"-\[(\w*)\s*([*+?][0-9.]*(?:\.\.[0-9]+)?)?\s*\]->", edge_txt)
+    else:
+        direction = "both"
+        m = re.match(r"-\[(\w*)\s*([*+?][0-9.]*(?:\.\.[0-9]+)?)?\s*\]-", edge_txt)
+
+    edge_var = m.group(1) if m else ""
+    quant_str = m.group(2) if (m and m.group(2)) else None
+    min_hops, max_hops = _parse_quantifier(quant_str)
+    return {
+        "var": edge_var or None,
+        "direction": direction,
+        "min_hops": min_hops,
+        "max_hops": max_hops,
     }
+
+
+def parse_pattern(s: str) -> dict:
+    """Parse a node/edge chain.
+
+    Returns {"nodes": [{var, label, props}, ...],
+             "edges": [{var, direction, min_hops, max_hops}, ...]}
+    with len(edges) == len(nodes) - 1.  Supports N-node chains
+    ``(a)-[r]->(b)->(c)`` and per-node labels ``(a:Category)``.
     """
     s = s.strip()
-
-    # Attempt node-edge-node decomposition
-    # Find all node parts (with or without inline props)
-    nodes = []
-    edges_raw = []
+    nodes: list[dict] = []
+    edges: list[dict] = []
 
     pos = 0
     while pos < len(s):
-        # Skip spaces
         while pos < len(s) and s[pos] == " ":
             pos += 1
         if pos >= len(s):
             break
 
         if s[pos] == "(":
-            # Try props first, then bare
-            mp = _NODE_PROPS_RE.match(s, pos)
-            mb = _NODE_BARE_RE.match(s, pos)
-            m = mp if mp else mb
+            m = _NODE_RE.match(s, pos)
             if not m:
                 raise ValueError(f"Bad node at pos {pos}: {s[pos:pos+20]}")
-            props = _parse_props(m.group(2)) if mp else {}
-            nodes.append((m.group(1), props))
+            var, label, props = m.group(1), m.group(2), m.group(3)
+            nodes.append({
+                "var": var or f"_n{len(nodes)}",
+                "label": label,
+                "props": _parse_props(props[1:-1]) if props else {},
+            })
             pos = m.end()
         else:
-            # Edge
             me = _EDGE_RE.match(s, pos)
             if not me:
                 raise ValueError(f"Bad edge at pos {pos}: {s[pos:pos+20]}")
-            edges_raw.append(me.group(0))
+            edges.append(_parse_edge_token(me.group(0)))
             pos = me.end()
 
-    if len(nodes) < 2 or len(edges_raw) < 1:
-        raise ValueError(f"Pattern must have at least 2 nodes and 1 edge: {s}")
+    if len(nodes) < 2 or len(edges) != len(nodes) - 1:
+        raise ValueError(
+            f"Pattern must alternate N nodes and N-1 edges: {s!r}"
+        )
 
-    # Only 1-hop patterns supported for now (2 nodes, 1 edge)
-    (src_var, src_props), (dst_var, dst_props) = nodes[0], nodes[1]
-    edge_txt = edges_raw[0]
+    return {"nodes": nodes, "edges": edges}
 
-    # Determine direction and quantifier
-    if edge_txt.startswith("<-"):
-        direction = "in"
-        m = re.match(r"<-\[(\w*)\s*([*+?]?[0-9.]*(?:\.\.[0-9]+)?)?\s*\]-", edge_txt)
-        edge_var = m.group(1) if m else ""
-        quant_str = m.group(2) if (m and m.group(2)) else None
-    elif "->" in edge_txt:
-        direction = "out"
-        m = re.match(r"-\[(\w*)\s*([*+?][0-9.]*(?:\.\.[0-9]+)?)?\s*\]->", edge_txt)
-        edge_var = m.group(1) if m else ""
-        quant_str = m.group(2) if (m and m.group(2)) else None
-    else:
-        direction = "both"
-        m = re.match(r"-\[(\w*)\s*([*+?][0-9.]*(?:\.\.[0-9]+)?)?\s*\]-", edge_txt)
-        edge_var = m.group(1) if m else ""
-        quant_str = m.group(2) if (m and m.group(2)) else None
 
-    if not edge_var and not quant_str:
-        # shorthand: -> or <- or --
-        quant_str = None
+def _subst_label_calls(s: str | None, label_field: str) -> str | None:
+    """Rewrite label(x) sugar to x.<label_field> for WHERE/RETURN parsing."""
+    if not s:
+        return s
+    return _LABEL_CALL_RE.sub(rf"\1.{label_field}", s)
 
-    min_hops, max_hops = _parse_quantifier(quant_str)
 
-    return {
-        "src_var": src_var or "_src",
-        "src_props": src_props,
-        "edge_var": edge_var or None,
-        "direction": direction,
-        "min_hops": min_hops,
-        "max_hops": max_hops,
-        "dst_var": dst_var or "_dst",
-        "dst_props": dst_props,
-    }
+def _node_matches(node: dict, attrs: dict, label_field) -> bool:
+    """True if a node's attrs satisfy the pattern node's label + inline props."""
+    if node["label"]:
+        v = attrs.get(label_field)
+        if hasattr(v, "item"):
+            v = v.item()
+        if str(v) != node["label"]:
+            return False
+    for k, val in node["props"].items():
+        av = attrs.get(k)
+        if hasattr(av, "item"):
+            av = av.item()
+        if av != val:
+            return False
+    return True
+
+
+def _first_node_seeds(graph, node0: dict, where_str, label_field) -> list | None:
+    """Seed IDs for the chain's first node, or None for a full scan.
+
+    Priority: an explicit ``id(var)==``/``IN`` in WHERE (most selective),
+    then the node label via the in-memory label index.
+    """
+    ids = _extract_src_seeds(where_str, node0["var"])
+    if ids is not None:
+        return ids
+    if node0["label"] and label_field:
+        return graph.nodes_with_label(node0["label"])
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +397,12 @@ def _extract_src_seeds(where_str: str | None, src_var: str) -> list[str] | None:
     Other conditions require a full scan and return None.
     """
     if not where_str:
+        return None
+
+    # An OR means the seeds of one branch don't constrain the others;
+    # grabbing the first id() match would silently drop the other branches.
+    # Fall back to a full scan (the WHERE function still filters correctly).
+    if re.search(r"\bOR\b", where_str, re.IGNORECASE):
         return None
 
     # id(var) == "value" — single node
@@ -574,42 +614,78 @@ def execute_query(graph, query_str: str) -> Iterator[dict]:
 
     pattern_str, where_str, return_str = m.groups()
 
-    pat = parse_pattern(pattern_str)
+    label_field = getattr(graph, "_label_field", None)
+    # label(x) sugar → x.<label_field>
+    if label_field:
+        where_str = _subst_label_calls(where_str, label_field)
+        return_str = _subst_label_calls(return_str, label_field)
 
-    # Inline props from pattern become implicit WHERE conditions
-    # We pass them separately so they're evaluated early (no attr dict lookup needed)
-    inline_where = {}
-    if pat["src_props"]:
-        inline_where[pat["src_var"]] = pat["src_props"]
-    if pat["dst_props"]:
-        inline_where[pat["dst_var"]] = pat["dst_props"]
+    chain = parse_pattern(pattern_str)
+    nodes, edges = chain["nodes"], chain["edges"]
+
+    for nd in nodes:
+        if nd["label"] and not label_field:
+            raise ValueError(
+                f"Pattern uses label '({nd['var']}:{nd['label']})' but the graph "
+                f"was created without label_field=... (pass it to create_graph)."
+            )
 
     where_func = parse_where(where_str)
 
-    # Seed extraction: if WHERE pins id(src_var), skip full node scan
-    src_seeds = _extract_src_seeds(where_str, pat["src_var"])
+    if len(nodes) == 2:
+        # Two-node patterns keep the dedicated 1-hop / variable-length paths
+        # (those support the [*], [+], [?] quantifiers).
+        n0, n1 = nodes
+        e = edges[0]
+        src_props = dict(n0["props"])
+        dst_props = dict(n1["props"])
+        if n0["label"]:
+            src_props[label_field] = n0["label"]
+        if n1["label"]:
+            dst_props[label_field] = n1["label"]
+        pat = {
+            "src_var": n0["var"], "src_props": src_props,
+            "edge_var": e["var"], "direction": e["direction"],
+            "min_hops": e["min_hops"], "max_hops": e["max_hops"],
+            "dst_var": n1["var"], "dst_props": dst_props,
+        }
+        inline_where = {}
+        if src_props:
+            inline_where[n0["var"]] = src_props
+        if dst_props:
+            inline_where[n1["var"]] = dst_props
+        src_seeds = _first_node_seeds(graph, n0, where_str, label_field)
 
-    is_1hop = (pat["min_hops"] == 1 and pat["max_hops"] == 1)
-    is_optional = (pat["min_hops"] == 0 and pat["max_hops"] == 1)
-
-    if is_1hop:
-        gen = _execute_1hop(graph, pat, where_func, return_str, inline_where,
-                            src_seeds=src_seeds)
-    elif is_optional:
-        # 0..1 hop: include both self-match and 1-hop matches
-        pat0 = {**pat, "min_hops": 0, "max_hops": 0}
-        pat1 = {**pat, "min_hops": 1, "max_hops": 1}
-        gen = (
-            r for g in (
-                _execute_nhop(graph, pat0, where_func, return_str, inline_where,
-                              src_seeds=src_seeds),
-                _execute_1hop(graph, pat1, where_func, return_str, inline_where,
-                              src_seeds=src_seeds),
-            ) for r in g
-        )
+        is_1hop = (e["min_hops"] == 1 and e["max_hops"] == 1)
+        is_optional = (e["min_hops"] == 0 and e["max_hops"] == 1)
+        if is_1hop:
+            gen = _execute_1hop(graph, pat, where_func, return_str, inline_where,
+                                src_seeds=src_seeds)
+        elif is_optional:
+            pat0 = {**pat, "min_hops": 0, "max_hops": 0}
+            pat1 = {**pat, "min_hops": 1, "max_hops": 1}
+            gen = (
+                r for g in (
+                    _execute_nhop(graph, pat0, where_func, return_str, inline_where,
+                                  src_seeds=src_seeds),
+                    _execute_1hop(graph, pat1, where_func, return_str, inline_where,
+                                  src_seeds=src_seeds),
+                ) for r in g
+            )
+        else:
+            gen = _execute_nhop(graph, pat, where_func, return_str, inline_where,
+                                src_seeds=src_seeds)
     else:
-        gen = _execute_nhop(graph, pat, where_func, return_str, inline_where,
-                            src_seeds=src_seeds)
+        # Multi-node chain: only fixed single-hop edges are supported.
+        for e in edges:
+            if not (e["min_hops"] == 1 and e["max_hops"] == 1):
+                raise ValueError(
+                    "Variable-length edges ([*], [+], [*a..b], [?]) are only "
+                    "supported in two-node patterns, not multi-hop chains."
+                )
+        seeds = _first_node_seeds(graph, nodes[0], where_str, label_field)
+        gen = _execute_chain(graph, nodes, edges, where_func, return_str,
+                             seeds, label_field)
 
     count = 0
     for result in gen:
@@ -617,3 +693,57 @@ def execute_query(graph, query_str: str) -> Iterator[dict]:
         count += 1
         if limit is not None and count >= limit:
             return
+
+
+def _execute_chain(graph, nodes, edges, where_func, return_str, seeds,
+                   label_field) -> Iterator[dict]:
+    """Execute a fixed single-hop chain (a)->(b)->(c)->...  of any length.
+
+    Expands a frontier hop by hop, binding each node/edge variable and
+    filtering on per-node label + inline props.  WHERE is applied once a
+    full binding exists.  When ``seeds`` is given (id- or label-anchored),
+    node attrs are resolved with per-node lookups; otherwise the whole node
+    set is bulk-loaded once for the opening full scan.
+    """
+    node_store = graph._nodes
+    all_nodes = node_store.to_dict() if seeds is None else None
+
+    def attrs_of(nid):
+        if all_nodes is not None:
+            return all_nodes.get(nid, {}) or {}
+        return node_store.get(nid, {}) or {}
+
+    n0 = nodes[0]
+    if seeds is not None:
+        seed_iter = ((nid, attrs_of(nid)) for nid in seeds)
+    else:
+        seed_iter = all_nodes.items()
+
+    # frontier entries: (current_node_id, bindings, node_ids)
+    frontier = []
+    for nid, attrs in seed_iter:
+        if _node_matches(n0, attrs, label_field):
+            frontier.append((nid, {n0["var"]: attrs}, {n0["var"]: nid}))
+
+    for ei, edge in enumerate(edges):
+        nxt = nodes[ei + 1]
+        new_frontier = []
+        for cur_id, bindings, node_ids in frontier:
+            for nb_id, edge_attrs in _iter_neighbors(graph, cur_id, edge["direction"]):
+                nb_attrs = attrs_of(nb_id)
+                if not _node_matches(nxt, nb_attrs, label_field):
+                    continue
+                b2 = dict(bindings)
+                i2 = dict(node_ids)
+                b2[nxt["var"]] = nb_attrs
+                i2[nxt["var"]] = nb_id
+                if edge["var"]:
+                    b2[edge["var"]] = edge_attrs
+                new_frontier.append((nb_id, b2, i2))
+        frontier = new_frontier
+        if not frontier:
+            return
+
+    for _cur_id, bindings, node_ids in frontier:
+        if where_func(bindings, node_ids):
+            yield parse_return(return_str, bindings, node_ids)

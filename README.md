@@ -297,6 +297,115 @@ for row in g.query_iter("MATCH (a)-[+]->(b) WHERE id(a)=='alice' RETURN id(b)"):
     process(row)
 ```
 
+> **Variable-length hop semantics.** Quantifiers (`[*N]`, `[*lo..hi]`, `[+]`, `[*]`)
+> use **shortest-path BFS**: each destination node is reported once, at its
+> *minimum* hop distance from the source. So `[*N]` means "nodes whose shortest
+> path is exactly N hops" — **not** "every endpoint of an N-step walk". A node
+> reachable in both 1 and 2 hops appears only for `[*1]`, and `[*2]` may return
+> nothing even when 2-hop paths exist. To get the **whole neighbourhood within N
+> hops**, use a range from 1: `MATCH (a)-[*1..N]->(b)`. This is a deliberate
+> design choice (cheap, no path explosion); it is not Neo4j's path-enumeration
+> semantics.
+
+#### Knowledge graphs — node labels and multi-hop chains
+
+Declare a `label_field` (a node-schema field that holds each node's type) to
+unlock label syntax and multi-hop pattern chains — enough to model a typed
+knowledge graph like `category → company → employee`:
+
+```python
+g = db.create_graph(
+    "kg",
+    node_schema={"type": "U20", "name": "U40", "sector": "U20"},
+    edge_schema={"rel": "U20"},
+    directed=True,
+    label_field="type",          # ← which field is the node label
+)
+
+g.add_nodes([
+    ("tech",   {"type": "category", "name": "Tech"}),
+    ("acme",   {"type": "company",  "name": "Acme",  "sector": "SaaS"}),
+    ("alice",  {"type": "employee", "name": "Alice"}),
+])
+g.add_edges([("tech", "acme", {"rel": "has"}), ("acme", "alice", {"rel": "emp"})])
+
+# Label filter:  (var:Label)  →  fast, seeded via an in-memory label→nodes index
+g.query("MATCH (a:company)->(b:employee) RETURN id(a), id(b)")
+
+# Multi-hop chain with a per-hop constraint on the *intermediate* node
+g.query("""
+    MATCH (a:category)->(b:company)->(c:employee)
+    WHERE b.sector == 'SaaS'
+    RETURN id(c), c.name
+""")
+
+# label(x) sugar in WHERE / RETURN; direct lookup of all nodes of a class
+g.query("MATCH (a)->(b) WHERE label(a) == 'company' RETURN id(b)")
+g.nodes_with_label("company")        # ['acme', ...]
+```
+
+Notes:
+- `(a:Label)` compiles to a filter on `label_field`; when it anchors the first
+  node of a pattern, the query is **seeded** from the label index (no full
+  scan). The index is in-memory, built lazily on first use, and rebuilt after
+  node mutations — it is a cache, never persisted.
+- Chains `(a)->(b)->(c)->…` bind and constrain every node and edge along the
+  path. They support fixed single-hop edges only; the `[*]`/`[+]`/`[*a..b]`/`[?]`
+  quantifiers remain available for two-node patterns.
+- Nodes are heterogeneous via the shared `node_schema` (a union of fields);
+  unused fields stay empty per node.
+
+---
+
+## Collection — a record store with attached indexes
+
+Looking records up by more than one field normally means maintaining a second
+`Dict` by hand and keeping it in sync. A `Collection` does that for you: the
+record lives **once** in a primary index (keyed by your primary key), and you
+**attach** secondary indexes that map another field → the primary key. Every
+insert / update / delete updates all of them under one lock.
+
+```python
+from pydantic import BaseModel, Field
+
+class User(BaseModel):
+    username: str = Field(max_length=30)
+    email:    str = Field(max_length=40)
+    city:     str = Field(max_length=20)
+
+users = db.collection(
+    "users", User,
+    key="username",                       # primary key field
+    indexes={
+        "email":    "email",              # field name → persisted, auto-restored
+        "city":     "city",
+        "email_lc": lambda r: r["email"].lower(),  # computed key → re-supply on reopen
+    },
+)
+
+users.insert({"username": "alice", "email": "Alice@x.com", "city": "NYC"})
+
+users["alice"]                    # primary lookup
+users.get("email", "Alice@x.com") # secondary lookup → full record
+users.get("email_lc", "alice@x.com")
+users.get_pk("city", "NYC")       # → "alice"  (primary key only, no record read)
+
+users.update("alice", email="new@x.com")  # re-indexes the email automatically
+users.delete("alice")                      # removed from every index
+```
+
+`indexes` can also be a plain list of field names: `indexes=["email", "city"]`.
+
+- **No duplication.** Secondary indexes store the *primary key*, not a copy of
+  the record — a secondary lookup is one extra hop (`index → pk → record`).
+- **Persistence.** Field-name indexes are saved with the collection, so
+  `db.collection("users")` (no model) reopens it and rebuilds them
+  automatically. Lambda/computed indexes can't be serialised — re-pass them in
+  `indexes=` on reopen.
+- **Atomicity.** Writes touch all indexes under `db.write_lock()` + `db.batch()`
+  (serialised, grouped). This is not a full crash-atomic WAL across indexes; if
+  a crash ever desyncs an index, call `users.reindex()` to rebuild it.
+
 ---
 
 ## Nesting
@@ -456,7 +565,7 @@ LoomError
 
 All benchmarks: modern laptop (Linux, SSD), `sync_writes=False` (default — durable on `close()`).
 
-All numbers below come from `benchmarks/readme_benchmark.py` (run it yourself with `PYTHONPATH=. python benchmarks/readme_benchmark.py`). Figures are rounded; expect ±10% run-to-run variance from page-cache warmup and CPU frequency.
+Dict, List, Queue, BTree and Graph numbers come from `benchmarks/readme_benchmark.py` (run it yourself with `PYTHONPATH=. python benchmarks/readme_benchmark.py`); Set and LRUDict come from their dedicated `benchmarks/benchmark_*.py`. Figures are rounded; expect ±10% run-to-run variance from page-cache warmup and CPU frequency. **All point-op numbers are measured with `cache_size=0`** (cold mmap on every op) so structures are compared on equal footing — see the BTree note below for how much an LRU cache changes things.
 
 ### loom vs SqliteDict — 10 000 ops, fixed schema
 
@@ -485,9 +594,10 @@ Per-call inserts already run at batch speed in loom (the flush is already lazy),
 | List | read[i] | 165 000 | 6 |
 | Queue | push (batch) | 220 000 | 5 |
 | Queue | pop | 260 000 | 4 |
-| BTree | insert | 229 000 | 4 |
-| BTree | lookup | 345 000 | 3 |
-| BTree | range (100 keys) | 342 000 calls/s | 3 (30 ns/key) |
+| BTree | insert | 2 700 | 374 |
+| BTree | read | 6 800 | 147 |
+| BTree | contains | 6 600 | 151 |
+| BTree | keys() [sorted] | 368 000 | 3 |
 | Set | add | 73 000 | 14 |
 | Set | contains | 49 000 | 21 |
 | Set | remove | 55 000 | 18 |
@@ -499,6 +609,10 @@ Per-call inserts already run at batch speed in loom (the flush is already lazy),
 | Graph | get_node | 57 000 | 18 |
 | Graph | has_edge | 17 000 | 60 |
 | Graph | neighbors | 12 000 | 80 |
+
+**Dict vs BTree — pick the right tool.** For point operations the hash-based `Dict` is **far** faster than the `BTree`: at `cache_size=0` Dict inserts ~9× faster and reads ~8× faster (O(1) slot vs O(log n) node traversal, each node a cold mmap read). The BTree earns its keep only when you need **ordered iteration, range, or prefix queries** — `keys()` comes out already sorted at ~370k keys/s, and `range()`/`prefix()` walk a contiguous key span without scanning the whole structure.
+
+The BTree is far more cache-sensitive than the Dict, because a B-tree relies on keeping its handful of internal nodes hot. The table above uses `cache_size=0` (cold) for an apples-to-apples comparison, but the **default is `cache_size=1024`** — with that default the same `read` jumps to ~125 000 ops/s and `contains` to ~280 000 ops/s (internal nodes served from RAM, one leaf read), while a `Dict` barely changes with caching. Net: at *equal* cache settings the `Dict` wins point ops; the BTree's strength is ordering/range, and you should leave its node cache enabled (or raise it) for random-lookup workloads.
 
 ### `str` (text) fields — impact of variable-length blobs
 

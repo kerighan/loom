@@ -259,6 +259,71 @@ def bench_loom_list_queue():
 
 
 # ─────────────────────────────────────────────────────────────────────
+# loom BTree  (cache_size=0, matched to the Dict bench so the two are
+# directly comparable; a separate warm-cache line shows the default-cache
+# reality, since a BTree relies on caching its few internal nodes)
+# ─────────────────────────────────────────────────────────────────────
+def bench_loom_btree():
+    print("\n[loom BTree]  fixed schema, N =", N, "(cache_size=0, matched to Dict)")
+    # sorted keys, shuffled insertion order (realistic + non-degenerate tree)
+    keys = [f"user_{i:0{KEY_LEN}d}" for i in range(N)]
+    random.Random(42).shuffle(keys)
+    values = [
+        {"id": i, "name": f"User {i}", "email": f"u{i}@x.io", "score": i * 1.5}
+        for i in range(N)
+    ]
+    miss_keys = [f"missing_{i:0{KEY_LEN}d}" for i in range(N)]
+
+    res = {}
+    with tmp_path() as path, DB(path) as db:
+        ds = db.create_dataset(
+            "users", id="uint64", name="U50", email="U100", score="float64"
+        )
+        bt = db.create_btree("users_btree", ds, cache_size=0)
+
+        def _insert():
+            for k, v in zip(keys, values):
+                bt[k] = v
+
+        res["insert"] = run("insert", _insert, N)
+
+        lookup_keys = keys.copy()
+        random.Random(7).shuffle(lookup_keys)
+
+        def _read():
+            for k in lookup_keys:
+                _ = bt[k]
+
+        res["read"] = run("read", _read, N)
+
+        def _contains_hit():
+            for k in lookup_keys:
+                _ = k in bt
+
+        res["contains_hit"] = run("contains (hit)", _contains_hit, N)
+
+        def _keys():
+            list(bt.keys())
+
+        res["keys"] = run("keys() [sorted]", _keys, N)
+
+        # range query: pull a contiguous 1% slice
+        sorted_keys = sorted(keys)
+        lo = sorted_keys[N // 4]
+        hi = sorted_keys[N // 4 + N // 100]
+
+        def _range():
+            for _ in range(100):
+                for _k, _v in bt.range(lo, hi):
+                    pass
+
+        n_in_range = sum(1 for _ in bt.range(lo, hi))
+        res["range_calls"] = run(f"range() x100 ({n_in_range} keys)", _range, 100)
+        res["range_keys"] = n_in_range
+    return res
+
+
+# ─────────────────────────────────────────────────────────────────────
 # blob compression (str body)
 # ─────────────────────────────────────────────────────────────────────
 def bench_blob_dict(compression):
@@ -426,6 +491,7 @@ def main():
     loom = bench_loom_dict()
     sqld = bench_sqlitedict() if HAS_SQLITEDICT else None
     listq = bench_loom_list_queue()
+    btree = bench_loom_btree()
     blob_none = bench_blob_dict(None)
     try:
         import brotli  # noqa: F401
@@ -472,9 +538,18 @@ def main():
         ("List", "read[i]", listq["list_read"]),
         ("Queue", "push (batch)", listq["queue_push_batch"]),
         ("Queue", "pop", listq["queue_pop"]),
+        ("BTree", "insert", btree["insert"]),
+        ("BTree", "read", btree["read"]),
+        ("BTree", "contains", btree["contains_hit"]),
+        ("BTree", "keys() [sorted]", btree["keys"]),
     ]
     for ds, op, rate in rows:
         print(f"| {ds} | {op} | {rate:,.0f} | {1e6/rate:.0f} |")
+    print(
+        f"\nBTree range(): {btree['range_keys']} keys in "
+        f"{1e6/btree['range_calls']:.1f} µs/call "
+        f"({btree['range_calls']:,.0f} calls/s)."
+    )
 
     print("\n### Dict with `text` body field\n")
     print("| Schema | Compression | insert | read |")

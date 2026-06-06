@@ -1,6 +1,7 @@
 """Loom - A persistent database that feels like Python."""
 
 from loom.database import DB
+from loom.collection import Collection
 from loom.client import (
     LoomClient,
     LoomClientError,
@@ -32,6 +33,7 @@ from loom.errors import (
 __version__ = "0.1.0"
 __all__ = [
     "DB",
+    "Collection",
     "Dataset",
     "List",
     "BloomFilter",

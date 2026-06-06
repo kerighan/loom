@@ -849,7 +849,7 @@ class DB:
         self._save_datastructures_registry()  # Persist registry
         return s
 
-    def create_btree(self, name, dataset, key_size=50, cache_size=100):
+    def create_btree(self, name, dataset, key_size=50, cache_size=1024):
         """Create a persistent BTree with ordered keys.
 
         BTree provides O(log n) operations with ordered iteration
@@ -895,7 +895,8 @@ class DB:
         return btree
 
     def create_graph(
-        self, name, node_schema, edge_schema, directed=True, node_id_max_len=50
+        self, name, node_schema, edge_schema, directed=True, node_id_max_len=50,
+        label_field=None,
     ):
         """Create a persistent Graph.
 
@@ -938,6 +939,7 @@ class DB:
             edge_schema,
             directed=directed,
             node_id_max_len=node_id_max_len,
+            label_field=label_field,
         )
         self._datastructures[name] = g
         self._save_datastructures_registry()
@@ -1108,3 +1110,97 @@ class DB:
         self._datastructures[name] = idx
         self._save_datastructures_registry()
         return idx
+
+    def collection(self, name, model=None, key=None, indexes=None, key_size=64):
+        """Create or reopen a Collection: a record store with attached indexes.
+
+        The record lives once in a primary Dict (keyed by ``key``); each
+        attached index maps a field/derived value → the primary key and is
+        kept in sync on insert/update/delete.  Secondary lookups resolve
+        through the primary key, so there is no record duplication.
+
+        Args:
+            name:    Unique collection name.
+            model:   Pydantic model or dict schema for the record.  Omit to
+                     reopen an existing collection from its persisted config.
+            key:     Primary-key field name (required when creating).
+            indexes: Attached indexes — either a list of field names
+                     ``["email", "phone"]`` or a dict ``{index_name:
+                     field_name_or_callable}``.  Field names are persisted and
+                     auto-restored on reopen; callables (computed keys) must be
+                     re-supplied each session.
+            key_size: Max length of the primary-key string (default 64).
+
+        Example:
+            users = db.collection("users", User, key="username",
+                                  indexes={"email": "email"})
+            users.insert({"username": "alice", "email": "a@x.com"})
+            users["alice"]                  # primary lookup
+            users.get("email", "a@x.com")  # secondary lookup → record
+        """
+        if not self._is_open:
+            raise DatabaseNotOpenError()
+        from loom.collection import Collection, _make_extractor
+
+        # Normalise indexes spec → {index_name: field_or_callable}
+        supplied = indexes or {}
+        if isinstance(supplied, (list, tuple)):
+            supplied = {f: f for f in supplied}
+
+        cfg_key = f"__collection__::{name}"
+        cfg = self._db.get_header_field(cfg_key)
+
+        if model is None:
+            # ── Reopen from persisted config ────────────────────────────
+            if not cfg:
+                raise StructureNotFoundError(name)
+            dataset = self.get_dataset(cfg["dataset"])
+            primary = self._datastructures[cfg["primary_dict"]]
+            key_field = cfg["key_field"]
+            idx_objs = {}
+            for idx_name, idx_cfg in cfg["indexes"].items():
+                idx_dict = self._datastructures[idx_cfg["dict"]]
+                field = idx_cfg["field"]
+                if field is not None:
+                    extractor, _fname = _make_extractor(field)
+                elif idx_name in supplied:
+                    extractor, _fname = _make_extractor(supplied[idx_name])
+                else:
+                    raise ValueError(
+                        f"index {idx_name!r} was defined with a callable and "
+                        f"cannot be auto-restored; re-supply it in indexes=..."
+                    )
+                idx_objs[idx_name] = (idx_dict, extractor, field)
+            return Collection(self, name, dataset, primary, key_field, idx_objs)
+
+        # ── Create (idempotent — reuses existing structures) ────────────
+        self._ensure_writable()
+        if key is None:
+            raise ValueError(
+                "key=<primary-key field> is required when creating a collection"
+            )
+        if isinstance(model, dict):
+            dataset = self.create_dataset(f"{name}__data", **model)
+        else:
+            dataset = self.create_dataset(f"{name}__data", model)
+        primary = self.create_dict(f"{name}__primary", dataset, key_size=key_size)
+        idx_objs = {}
+        cfg_indexes = {}
+        for idx_name, spec in supplied.items():
+            extractor, field = _make_extractor(spec)
+            idx_ds = self.create_dataset(f"{name}__ix_{idx_name}", pk=f"U{key_size}")
+            idx_dict = self.create_dict(
+                f"{name}__ix_{idx_name}__d", idx_ds, key_size=key_size
+            )
+            idx_objs[idx_name] = (idx_dict, extractor, field)
+            cfg_indexes[idx_name] = {
+                "dict": idx_dict.name, "ds": idx_ds.name, "field": field,
+            }
+        self._db.set_header_field(cfg_key, {
+            "dataset": dataset.name,
+            "primary_dict": primary.name,
+            "key_field": key,
+            "key_size": key_size,
+            "indexes": cfg_indexes,
+        })
+        return Collection(self, name, dataset, primary, key, idx_objs)

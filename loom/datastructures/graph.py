@@ -59,6 +59,7 @@ class Graph(DataStructure):
         edge_schema,
         directed=True,
         node_id_max_len=50,
+        label_field=None,
         _parent=None,
     ):
         """
@@ -66,12 +67,23 @@ class Graph(DataStructure):
             node_id_max_len: Max character length of node IDs (default 50).
                 Use a smaller value to save disk space when IDs are short
                 (e.g., 10 for numeric IDs "0"–"999999").
+            label_field: Name of the node-schema field that holds each node's
+                label / type (e.g. "type").  When set, query patterns may use
+                the ``(a:Category)`` syntax and ``label(a)`` in WHERE, and
+                label-anchored queries are seeded through an in-memory
+                label→node-ids index instead of scanning every node.
         """
         self._directed = directed
         self._node_id_max_len = node_id_max_len
+        self._label_field = label_field
         self._node_schema_input = node_schema
         self._edge_schema_input = edge_schema
         self.item_schema = None  # set after init
+        # Lazy in-memory label index {label_value: [node_id, ...]}, built on
+        # first label-anchored query and invalidated on node mutation.  Not
+        # persisted: it is a pure cache, fully rebuildable from the node store
+        # in one scan, so we avoid paying an index write on every add_node.
+        self._label_index = None
 
         super().__init__(name, db, _parent=_parent)
 
@@ -145,6 +157,8 @@ class Graph(DataStructure):
         self._edge_schema = metadata["edge_schema"]
         self._directed = metadata["directed"]
         self._node_id_max_len = metadata.get("node_id_max_len", 50)
+        self._label_field = metadata.get("label_field", None)
+        self._label_index = None
         # Inner structures are loaded lazily — they may not be in
         # _datastructures yet if the registry loop hasn't reached them.
         self._nodes = None
@@ -166,6 +180,7 @@ class Graph(DataStructure):
                 "edge_schema": self._edge_schema,
                 "directed": self._directed,
                 "node_id_max_len": self._node_id_max_len,
+                "label_field": self._label_field,
             }
         )
 
@@ -177,6 +192,7 @@ class Graph(DataStructure):
             "edge_schema": self._edge_schema,
             "directed": self._directed,
             "node_id_max_len": self._node_id_max_len,
+            "label_field": self._label_field,
         }
 
     @classmethod
@@ -188,7 +204,41 @@ class Graph(DataStructure):
             params["edge_schema"],
             directed=params.get("directed", True),
             node_id_max_len=params.get("node_id_max_len", 50),
+            label_field=params.get("label_field", None),
         )
+
+    # ---- Label index (in-memory, lazy) ----
+
+    def _ensure_label_index(self):
+        """Build the {label: [node_id, ...]} index from the node store.
+
+        Lazy and cached for the session; rebuilt after any node mutation.
+        Requires ``label_field`` to be set at graph creation.
+        """
+        if self._label_field is None:
+            raise ValueError(
+                "This graph has no label_field; pass label_field=... to "
+                "create_graph() to use label-anchored queries."
+            )
+        if self._label_index is not None:
+            return self._label_index
+        self._ensure_loaded()
+        index = {}
+        lf = self._label_field
+        for nid, attrs in self._nodes.to_dict().items():
+            label = attrs.get(lf)
+            if label is None:
+                continue
+            index.setdefault(str(label), []).append(nid)
+        self._label_index = index
+        return index
+
+    def nodes_with_label(self, label):
+        """Return the list of node IDs whose label_field equals ``label``."""
+        return list(self._ensure_label_index().get(str(label), []))
+
+    def _invalidate_label_index(self):
+        self._label_index = None
 
     # ---- Node API ----
 
@@ -197,6 +247,7 @@ class Graph(DataStructure):
         """Add a node with attributes."""
         self._ensure_loaded()
         self._nodes[str(node_id)] = attrs
+        self._invalidate_label_index()
 
     def get_node(self, node_id):
         """Get node attributes."""
@@ -240,6 +291,7 @@ class Graph(DataStructure):
         # Remove node itself
         if nid in self._nodes:
             del self._nodes[nid]
+        self._invalidate_label_index()
 
     def __getitem__(self, node_id):
         """Get node attributes via g[node_id]."""
@@ -510,6 +562,7 @@ class Graph(DataStructure):
         with self._db.batch():
             for node_id, attrs in nodes:
                 self._nodes[str(node_id)] = attrs
+        self._invalidate_label_index()
 
     @write_op
     def add_edges(self, edges):

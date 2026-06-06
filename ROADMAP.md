@@ -5,7 +5,24 @@ Not a commitment to timeline — just a shared backlog.
 
 ---
 
-## 1. Multi-indexation / Collection
+## 1. Multi-indexation / Collection — ✅ DONE (2026-06-06)
+
+Implemented as `db.collection(name, model, key, indexes=...)` → `loom/collection.py`.
+A record store with attached indexes: the record lives once in a primary Dict
+(keyed by `key`); each attached index maps a field **or a lambda** → the primary
+key (reference indexes, no duplication) and is kept in sync on insert/update/
+delete under `write_lock()` + `batch()`. Field-name indexes persist and
+auto-restore on reopen (`db.collection(name)`); lambda indexes re-supply each
+session. `get(index, key)`, `get_pk`, `update` (re-indexes), `delete`, `reindex`,
+`insert_many`. Tested in `tests/test_collection.py`.
+
+Note vs. the original design below: secondary lookups resolve **through the
+primary key**, not via raw record addresses (the record lives inside the primary
+Dict, so the primary key is the stable handle). Atomicity is lock+batch
+best-effort, not a full cross-index WAL (the Dict/BTree write path doesn't expose
+plan-then-apply). `reindex()` repairs a desynced index.
+
+<details><summary>Original design sketch</summary>
 
 **Problem:** looking up records by a non-primary field requires maintaining
 a second Dict manually and keeping it in sync by hand.
@@ -36,9 +53,11 @@ the same lambdas.  The underlying Dicts persist independently.
 
 **Atomicity:** insert/delete batches all index writes in one WAL transaction.
 
+</details>
+
 ---
 
-## 2. Vector / Embedding support
+## 2. Vector / Embedding support — ✅ DONE
 
 **Problem:** no vector dtype; storing embeddings requires raw bytes (`blob`)
 with manual encode/decode.  No approximate nearest-neighbour search.
@@ -78,7 +97,7 @@ a regular Dict; store the embedding as `Vec(dim)` in the record.
 
 ---
 
-## 3. Multi-writer with file locking
+## 3. Multi-writer with file locking — ✅ DONE (threading.RLock + fcntl.flock SWMR, `multiprocess_safe=True`)
 
 **Problem:** only one process can write; multiple pipelines or workers
 writing to the same store require external coordination.
@@ -147,7 +166,7 @@ file, then atomically swaps.  O(n) but safe.
 
 ---
 
-## 6. Read-only mode
+## 6. Read-only mode — ✅ DONE (`DB(path, ...)` read-only flag)
 
 **Problem:** opening a DB for reading requires `r+b` (read-write).  No way
 to enforce that a session cannot write.

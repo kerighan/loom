@@ -68,7 +68,7 @@ class BTree(DataStructure):
         db,
         dataset_or_template=None,
         key_size: int = 50,
-        cache_size: int = 100,
+        cache_size: int = 1024,
         auto_save_interval: int = None,
         _parent=None,
     ):
@@ -603,17 +603,14 @@ class BTree(DataStructure):
             "num_keys": node["num_keys"],
         }
 
-        for i in range(self.ORDER - 1):
-            if i < len(node["keys"]):
-                node_data[f"key_{i}"] = node["keys"][i]
-            else:
-                node_data[f"key_{i}"] = ""
-
-        for i in range(self.ORDER):
-            if i < len(node["children"]):
-                node_data[f"child_{i}"] = node["children"][i]
-            else:
-                node_data[f"child_{i}"] = 0
+        # Only set the used slots.  _serialize() starts from a fully zeroed
+        # record, so unused key slots become "" and unused child slots 0
+        # without us touching them — this skips ORDER-(used) redundant numpy
+        # string assignments per write (the dominant insert cost).
+        for i, key in enumerate(node["keys"]):
+            node_data[f"key_{i}"] = key
+        for i, child in enumerate(node["children"]):
+            node_data[f"child_{i}"] = child
 
         self._node_dataset[addr] = node_data
 

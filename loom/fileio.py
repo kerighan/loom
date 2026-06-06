@@ -238,11 +238,14 @@ class ByteFileDB:
 
             raise HeaderTooLargeError(data_size, max_data)
 
+        # Write only the marker + length prefix + payload.  The reader keys
+        # off the 4-byte length, so trailing bytes from a previous (possibly
+        # larger) write are ignored — no need to zero-pad the whole slot,
+        # which would copy megabytes per call on large headers.
         slot_bytes = b"LOOM" + np.uint32(data_size).tobytes() + pickled_data
-        slot_bytes += b"\x00" * (self._slot_size - len(slot_bytes))
 
         offset = self._slot_offset(slot)
-        self.mapped_file[offset : offset + self._slot_size] = slot_bytes
+        self.mapped_file[offset : offset + len(slot_bytes)] = slot_bytes
 
     def _save_header(self):
         """Persist header via double-buffer: write inactive slot, flip.

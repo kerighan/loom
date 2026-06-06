@@ -188,12 +188,10 @@ class Dataset:
                     arr[field] = np.asarray(value, dtype=self.user_schema.fields[field][0].base)
                 else:
                     arr[field] = value
-            else:
-                # Default: zeros already set; only need to handle strings
-                dtype = self.user_schema.fields[field][0]
-                if dtype.kind == "U":
-                    arr[field] = ""
-                # blob/text and array defaults (zeros) are already in place
+            # else: field absent — np.zeros already encodes the correct
+            # default (empty string for U, 0 for numeric, NULL for blob/text),
+            # so no assignment is needed.  Skipping it makes sparse records
+            # (e.g. half-full BTree nodes) much cheaper to serialize.
         return arr.tobytes()
 
     def _deserialize(self, data):
