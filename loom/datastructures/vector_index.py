@@ -763,6 +763,17 @@ class IVFIndex(VectorIndex):
         del self._cell_vecs[cell_id][list_idx]
         del self._cell_ids[cell_id][list_idx]
         del self._rev[vector_id]
+        # Re-pack the cell so search's slice_array fast path (which rejects
+        # lists with holes) keeps working, then rebuild this cell's reverse
+        # pointers to the new compacted positions.  Cells are ~sqrt(n) so this
+        # is cheap.  (Vecs and ids are deleted+compacted in lockstep, so they
+        # stay aligned.)
+        self._cell_vecs[cell_id].compact()
+        self._cell_ids[cell_id].compact()
+        for new_idx, idrec in enumerate(self._cell_ids[cell_id]):
+            self._rev[str(idrec["ext_id"])] = {
+                "cell_id": cell_id, "list_idx": new_idx
+            }
         self._n_vecs -= 1
         self._auto_save_check()
 

@@ -252,12 +252,6 @@ class TestIVFSearch:
         res = ivf.search(data[0], k=5)  # nprobe defaults to ~sqrt(K)
         assert 1 <= len(res) <= 5
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="IVFIndex.remove only decrements the counter; the vector stays "
-               "in its cell list (nested-List soft-delete does not persist) "
-               "and is still returned by search.",
-    )
     def test_remove(self, db):
         ivf = db.create_ivf_index("v", dim=8, n_clusters=8, metric="cosine")
         rng = np.random.RandomState(9)

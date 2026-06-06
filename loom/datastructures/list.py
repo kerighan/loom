@@ -1091,6 +1091,17 @@ class List(DataStructure):
 
         self._auto_save_check()
 
+        # Nested list: push the updated length/valid_count back to the parent's
+        # stored ref, exactly like append() does — otherwise the soft delete is
+        # lost when the parent re-materialises this list from a stale ref (the
+        # reconstructed list would see valid_count == length and skip filtering).
+        if (
+            self._parent is not None
+            and self._parent != "__nested__"
+            and self._parent_key is not None
+        ):
+            self._parent.update_nested_ref(self._parent_key, self)
+
     def _find_nth_valid_item_address(self, n):
         """Find the address of the nth valid item.
 
@@ -1203,6 +1214,15 @@ class List(DataStructure):
             self._items_dataset.db.free(block_addr, capacity * record_size)
 
         self.save()
+
+        # Nested list: the rebuild changed length + block layout, so push the
+        # new ref to the parent (same propagation gap as __delitem__ had).
+        if (
+            self._parent is not None
+            and self._parent != "__nested__"
+            and self._parent_key is not None
+        ):
+            self._parent.update_nested_ref(self._parent_key, self)
 
     def _get_ref_fields(self):
         """Get List-specific reference fields (for top-level lists)."""

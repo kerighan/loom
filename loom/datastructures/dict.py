@@ -1351,6 +1351,16 @@ class Dict(DataStructure):
             del self._cache[key]
         self._auto_save_check()
 
+        # Nested dict: propagate the updated size / freelist to the parent's
+        # stored ref (like __setitem__ does), else len() stays stale and the
+        # freed value slot leaks after the parent re-materialises this dict.
+        if (
+            self._parent is not None
+            and self._parent != "__nested__"
+            and self._parent_key is not None
+        ):
+            self._parent.update_nested_ref(self._parent_key, self)
+
     def __contains__(self, key):
         key = self._to_internal_key(key)
         # Check cache first
