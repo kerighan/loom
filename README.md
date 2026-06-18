@@ -354,6 +354,10 @@ Notes:
   quantifiers remain available for two-node patterns.
 - Nodes are heterogeneous via the shared `node_schema` (a union of fields);
   unused fields stay empty per node.
+- **Use stable node ids.** Edges are keyed by node id (there is no `rename` —
+  changing an id would orphan its edges), so give each entity a permanent id
+  up front (its natural key, a hash, etc.) rather than a label you might later
+  want to change. Mutable attributes belong in the node's fields.
 
 ---
 
@@ -565,7 +569,7 @@ LoomError
 
 All benchmarks: modern laptop (Linux, SSD), `sync_writes=False` (default — durable on `close()`).
 
-Dict, List, Queue, BTree and Graph numbers come from `benchmarks/readme_benchmark.py` (run it yourself with `PYTHONPATH=. python benchmarks/readme_benchmark.py`); Set and LRUDict come from their dedicated `benchmarks/benchmark_*.py`. Figures are rounded; expect ±10% run-to-run variance from page-cache warmup and CPU frequency. **All point-op numbers are measured with `cache_size=0`** (cold mmap on every op) so structures are compared on equal footing — see the BTree note below for how much an LRU cache changes things.
+Dict, List, Queue and BTree numbers come from `benchmarks/readme_benchmark.py` (run it yourself with `PYTHONPATH=. python benchmarks/readme_benchmark.py`); Set and LRUDict from their dedicated `benchmarks/benchmark_*.py`; and **Graph from `benchmarks/benchmark_graph_kg.py` on FB15k** (the reference graph benchmark — see its section below). Figures are rounded; expect ±10% run-to-run variance from page-cache warmup and CPU frequency. The Dict/List/Queue/BTree point-op numbers are measured with `cache_size=0` (cold mmap on every op) so those structures are compared on equal footing — see the BTree note below for how much an LRU cache changes things; Graph uses its default cache.
 
 ### loom vs SqliteDict — 10 000 ops, fixed schema
 
@@ -604,11 +608,13 @@ Per-call inserts already run at batch speed in loom (the flush is already lazy),
 | LRUDict | set (no eviction) | 145 000 | 7 |
 | LRUDict | get (hit) | 115 000 | 9 |
 | LRUDict | set (with eviction) | 145 000 | 7 |
-| Graph | add_node | 25 000 | 40 |
-| Graph | add_edge | 2 900 | 345 |
-| Graph | get_node | 57 000 | 18 |
-| Graph | has_edge | 17 000 | 60 |
-| Graph | neighbors | 12 000 | 80 |
+| Graph | add_nodes / add_edges (bulk) | 26 000 | 38 |
+| Graph | add_edge (per-call) | 1 650 | 606 |
+| Graph | get_node | 54 000 | 18 |
+| Graph | has_edge | 16 000 | 63 |
+| Graph | neighbors | 166 000 edges/s | 6 |
+
+Graph rows are the **FB15k knowledge-graph reference benchmark** (`benchmarks/benchmark_graph_kg.py`), not `cache_size=0` — see the dedicated section below.
 
 **Dict vs BTree — pick the right tool.** For point operations the hash-based `Dict` is **far** faster than the `BTree`: at `cache_size=0` Dict inserts ~9× faster and reads ~8× faster (O(1) slot vs O(log n) node traversal, each node a cold mmap read). The BTree earns its keep only when you need **ordered iteration, range, or prefix queries** — `keys()` comes out already sorted at ~370k keys/s, and `range()`/`prefix()` walk a contiguous key span without scanning the whole structure.
 
@@ -628,32 +634,60 @@ The BTree is far more cache-sensitive than the Dict, because a B-tree relies on 
 - `"brotli"` — 3–5× compression on natural language, but ~20× slower inserts; pick when storage > write throughput.
 - `Field(max_length=N)` — keeps the field in the fixed record, no BlobStore at all.
 
-### Graph — Barabási-Albert scale-free network (m=2, 20 000 nodes / 39 996 edges, directed)
+### Graph — FB15k knowledge graph (reference benchmark)
 
-Build phase (write):
+The reference graph benchmark is **FB15k** (a Freebase subset): 14,951 typed
+entities, 1,345 relation types, **483,142 directed edges** (avg degree ~65).
+Each node carries a `type` label (relation domain) and relations are interned
+to a `uint16`. Reproduce with `PYTHONPATH=. python benchmarks/benchmark_graph_kg.py`
+(downloads the dataset once; see the script header).
 
-| Operation | ops/s | µs/op |
+Build (write):
+
+| Operation | rate | µs/op |
 |---|---:|---:|
-| `add_node` | 25 000 | 40 |
-| `add_edge` (per-call) | 2 900 | 345 |
-| `add_edges` (bulk, in `db.batch()`) | 3 300 | 305 |
+| `add_nodes` (bulk) | 26 000 nodes/s | 38 |
+| `add_edges` (bulk) | 26 000 edges/s | 38 |
+| `add_edge` (per-call) | 1 650 edges/s | 606 |
 
-Each `add_edge` does two double-indexed nested-Dict writes (`_out[src][dst]` and `_in[dst][src]`); each of those probes the parent's hash table, finds / grows the child's slot block, writes the value record, and rewrites the parent's ref. Bulk insertion via `g.add_edges([...])` is ~15 % faster — most of the difference is one deferred header save per `db.allocate()` (`db.batch()` accumulates them).
+`add_edges` groups edges by source for `_out` and by target for `_in`, then
+bulk-inserts each node's whole adjacency sub-dict in one shot (one allocation
++ one parent-ref update per node) — ~16× faster than per-call `add_edge`.
+**Load all edges in a single `add_edges` call** so each node hits this fast
+path (re-inserting into an already-populated node falls back to a slower path).
 
-Read phase, point queries (10 000 random samples):
+Read (10 000 random samples):
 
-| Operation | ops/s | µs/op |
+| Operation | rate | µs/op |
 |---|---:|---:|
-| `g[node_id]` (`get_node`) | 57 000 | 18 |
-| `has_edge` (hit) | 17 000 | 60 |
-| `has_edge` (miss) | 16 000 | 60 |
-| `get_edge` | 19 000 | 52 |
-| `out_degree` | 20 000 | 50 |
-| `neighbors(node_id)` (per source) | 12 000 | 80 |
+| `g[node_id]` (`get_node`) | 54 000 ops/s | 18 |
+| `has_edge` (hit) | 16 000 ops/s | 63 |
+| `get_edge` | 18 000 ops/s | 55 |
+| `out_degree` | 17 000 ops/s | 59 |
+| `neighbors` (iterate) | **166 000 edges/s** | 6 |
 
-`neighbors()` visits edges at **~25 000 edges/s** when iterating the full neighbour list of each sampled node — useful for BFS / PageRank style passes.
+Query engine (Cypher):
 
-On-disk size: ~10 KB / edge in this configuration (double-indexed `_out` + `_in` plus per-source nested-Dict overhead — each new source allocates an 8-slot hash block + 8-slot values block, which doubles on demand). The dominant cost is the per-source nested table; sparser graphs (low average degree) pay a higher per-edge constant than dense ones.
+| Query | rate |
+|---|---:|
+| label-seeded 1-hop `(a:Type)->(b) LIMIT 50` | 560 queries/s |
+| 2-hop chain `(a)->(b)->(c) LIMIT 100` | 300 queries/s |
+| 1-hop from a hub `id(a)=='X'` (all neighbours) | 85 queries/s |
+| variable-length `(a)-[*2]->(b) LIMIT 100` | 28 queries/s |
+
+The label index (`nodes_with_label`, used to seed `(a:Type)…` queries) builds
+in ~90 ms for 15k nodes and then serves ~37 000 lookups/s. Reopen is ~1 ms.
+
+On-disk: **~820 bytes/edge** at this density (379 MB for 483k edges,
+double-indexed `_out` + `_in`). The dominant cost is *not* the node-id strings
+but the per-source nested hash table + values block (each rounds up to a power
+of two, and hubs grow through several tables). Sparser graphs (low average
+degree) pay a higher per-edge constant; denser graphs amortise it better.
+
+> **Node ids are the adjacency key — pick stable ids.** Edges are keyed by node
+> id, so there is no `rename`: changing a node's id would orphan its edges.
+> Assign each entity a stable id up front (its own key, a hash, etc.) and keep
+> it for the node's lifetime.
 
 ### Vector search — FlatIndex and IVFIndex
 
