@@ -682,11 +682,12 @@ Query engine (Cypher):
 The label index (`nodes_with_label`, used to seed `(a:Type)…` queries) builds
 in ~90 ms for 15k nodes and then serves ~37 000 lookups/s. Reopen is ~1 ms.
 
-On-disk: **~820 bytes/edge** at this density (379 MB for 483k edges,
-double-indexed `_out` + `_in`). The dominant cost is *not* the node-id strings
-but the per-source nested hash table + values block (each rounds up to a power
-of two, and hubs grow through several tables). Sparser graphs (low average
-degree) pay a higher per-edge constant; denser graphs amortise it better.
+On-disk: **~575 bytes/edge** (277 MB for 483k edges, double-indexed `_out` +
+`_in`). What's left is mostly the live edge records (each direction stores the
+edge once) plus the per-source nested hash tables; the node-id strings are a
+minor part. Graphs with few nodes benefit even more from the small default
+values-block (see note) — a sparse graph that used to be ~3× this size is now
+close to its live data.
 
 > **Node ids are the adjacency key — pick stable ids.** Edges are keyed by node
 > id, so there is no `rename`: changing a node's id would orphan its edges.

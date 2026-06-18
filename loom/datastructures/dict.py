@@ -111,7 +111,14 @@ class Dict(DataStructure):
 
     # Default capacities - can be tuned for storage vs performance
     DEFAULT_KEY_SIZE = 50  # Max key length in characters (was 100)
-    DEFAULT_INITIAL_CAPACITY = 100000  # Initial values block size
+    # Initial values-block size.  The old default (100 000) pre-allocated
+    # megabytes that most Dicts never use — every graph container Dict reserved
+    # 100k record slots up front, which dominated on-disk size.  Keep it modest:
+    # the block grows on demand (amortised doubling), and bulk paths pre-size in
+    # one shot via set_batch, so a small default barely affects throughput while
+    # cutting per-Dict footprint by ~100×.  (Going too low is counterproductive:
+    # more doublings leak more abandoned blocks.)
+    DEFAULT_INITIAL_CAPACITY = 1024
 
     def __init__(
         self,
@@ -224,20 +231,23 @@ class Dict(DataStructure):
                 self._value_freelist = []
             self._value_freelist.append(addr)
 
-    def _grow_values_block(self):
+    def _grow_values_block(self, min_cap=0):
         """Allocate a larger values block, copy existing records, rewrite
         slot ``value_addr``s to point into the new block.
 
         Called from ``_alloc_value_addr`` when the current block is full.
         Doubles the capacity (with a sane minimum) so growth is amortised
-        O(1) per insert.
+        O(1) per insert; pass ``min_cap`` to size it for a known bulk insert.
         """
         old_addr = int(self.values_block_addr)
         old_cap = int(self.values_capacity)
         record_size = int(self._values_dataset.record_size)
 
-        # Double capacity (minimum bump of 8 to avoid degenerate growth)
-        new_cap = max(old_cap * 2, old_cap + 8)
+        # Double capacity (minimum bump of 8 to avoid degenerate growth).
+        # `min_cap` lets a bulk insert jump straight to the size it needs in a
+        # single allocation instead of doubling N times (each doubling leaks
+        # its predecessor and bumps the file's high-water mark).
+        new_cap = max(old_cap * 2, old_cap + 8, int(min_cap))
         new_addr = int(self._values_dataset.allocate_block(new_cap))
 
         # Copy old block contents byte-for-byte (preserves prefix + payload).
@@ -264,11 +274,21 @@ class Dict(DataStructure):
             mask = (arr["_prefix"] == ht.identifier) & arr["valid"]
             mask &= (arr["value_addr"] >= old_addr) & (arr["value_addr"] < old_end)
             if mask.any():
-                arr["value_addr"][mask] += delta
+                # delta may be negative when the new block reuses a freed,
+                # lower-addressed slot — do the arithmetic signed, then store
+                # back as uint64 (a bare ``+= delta`` would up-cast to float).
+                arr["value_addr"][mask] = (
+                    arr["value_addr"][mask].astype(np.int64) + delta
+                ).astype(np.uint64)
                 ht.db.write(table_addr, arr.tobytes())
 
         self.values_block_addr = new_addr
         self.values_capacity = new_cap
+        # NB: the old block is intentionally not free()d here — the file-level
+        # freelist lives in the (bounded) header, and freeing many scattered
+        # blocks overflows it.  Growth is kept rare instead: a small initial
+        # capacity + bulk pre-sizing (set_batch) mean blocks are sized close to
+        # final in one shot, so the leaked predecessors are few and small.
 
     # ── Hash table schema helpers ─────────────────────────────────────────
 
@@ -800,6 +820,14 @@ class Dict(DataStructure):
         Args:
             items: iterable of (key, value) pairs
         """
+        items = list(items)
+        # Size the values block for the whole batch in one allocation so the
+        # per-item inserts below never trigger repeated doubling (each of which
+        # leaks its old block — the dominant source of graph on-disk waste).
+        needed = self.next_data_offset + len(items)
+        if needed > self.values_capacity:
+            self._grow_values_block(min_cap=needed)
+
         self._defer_parent_update = True
         try:
             for key, value in items:
