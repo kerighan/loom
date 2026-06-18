@@ -15,7 +15,11 @@ class Dict(DataStructure):
     GROWTH_FACTOR = 2
     P_INIT = 10
     MAX_TABLES = 32
-    MAX_TABLES_NESTED = 8  # Nested dicts use fewer tables (still ~65K items)
+    # Nested dicts grow one table per doubling.  With a tiny p_init (scale-free
+    # graphs start adjacency dicts at 2 slots), a high-degree hub can span many
+    # levels, and every table address must fit in the ref — so keep generous
+    # headroom (24 tables ⇒ top table 2^24 slots, far beyond any real degree).
+    MAX_TABLES_NESTED = 24
     PROBE_FACTOR = 0.5
 
     # Nesting compatibility
@@ -85,9 +89,12 @@ class Dict(DataStructure):
     def _get_nested_ref_schema(cls):
         """Compact binary schema for nested Dict references.
 
-        Total size: ~150 bytes per reference (vs ~2000+ bytes with JSON)
+        Holds up to MAX_TABLES_NESTED table addresses.  Generated from the
+        constant so the schema, to_ref and from_ref stay in lockstep — a
+        small p_init makes hubs span more tables, and the ref must persist
+        every one of them (truncation = IndexError on reload).
         """
-        return {
+        schema = {
             # Core metadata
             "size": "uint32",  # 4 bytes
             "p_last": "uint8",  # 1 byte
@@ -95,18 +102,11 @@ class Dict(DataStructure):
             "next_data_offset": "uint32",  # 4 bytes
             "values_block_addr": "uint64",  # 8 bytes
             "values_capacity": "uint32",  # 4 bytes — actual allocated slots
-            # 8 table addresses × 8 bytes = 64 bytes
-            "table_0": "uint64",
-            "table_1": "uint64",
-            "table_2": "uint64",
-            "table_3": "uint64",
-            "table_4": "uint64",
-            "table_5": "uint64",
-            "table_6": "uint64",
-            "table_7": "uint64",
-            # Config
-            "cache_size": "uint16",  # 2 bytes
         }
+        for i in range(cls.MAX_TABLES_NESTED):
+            schema[f"table_{i}"] = "uint64"
+        schema["cache_size"] = "uint16"  # 2 bytes
+        return schema
         # Total: 1(valid) + 4 + 1 + 1 + 4 + 8 + 64 + 2 = 85 bytes
 
     # Default capacities - can be tuned for storage vs performance
@@ -363,14 +363,17 @@ class Dict(DataStructure):
             self.item_schema = {k: v for k, v in sch.items() if k != "_key"}
 
             # Allocate our own block in the shared hash table.
-            # Start very small (8 slots, 2^3) — most nodes in real-world graphs
-            # have low degree (power-law). Grows on demand via _create_new_table.
-            self._p_init = 3  # 2^3 = 8 slots
+            # Start as small as possible (2 slots, 2^1).  Real-world graphs are
+            # scale-free: the overwhelming majority of nodes have degree 1–2,
+            # so a fresh adjacency dict should be tiny and only the rare hubs
+            # should grow (on demand, doubling via _create_new_table).  An
+            # 8-slot floor wasted ~4× the space on every low-degree node.
+            self._p_init = 1  # 2^1 = 2 slots
             capacity = self._get_capacity(self._p_init)
             first_table_addr = self._hash_table.allocate_block(capacity)
 
-            # Same for the values block: start small, grow on demand
-            initial_values_capacity = 8
+            # Same for the values block: start at 2 records, grow on demand.
+            initial_values_capacity = 2
             self.values_block_addr = self._values_dataset.allocate_block(
                 initial_values_capacity
             )

@@ -122,6 +122,9 @@ class Graph(DataStructure):
         key_size = self._node_id_max_len
 
         # Outgoing adjacency: src -> {dst -> edge_attrs}
+        # max_key_len drives the stored `_key` (destination id) width in the
+        # shared values dataset — size it to node ids, not the U100 default,
+        # or every edge record carries a 400-byte key.
         out_template = Dict.template(edge_ds, cache_size=0)
         self._out = Dict(
             f"_graph_{self.name}_out",
@@ -130,6 +133,7 @@ class Graph(DataStructure):
             cache_size=1000,
             use_bloom=False,
             key_size=key_size,
+            max_key_len=key_size,
         )
 
         # Incoming adjacency: dst -> {src -> edge_attrs}
@@ -141,6 +145,7 @@ class Graph(DataStructure):
             cache_size=1000,
             use_bloom=False,
             key_size=key_size,
+            max_key_len=key_size,
         )
 
         self._node_schema = node_dict

@@ -699,11 +699,14 @@ def _execute_chain(graph, nodes, edges, where_func, return_str, seeds,
                    label_field) -> Iterator[dict]:
     """Execute a fixed single-hop chain (a)->(b)->(c)->...  of any length.
 
-    Expands a frontier hop by hop, binding each node/edge variable and
-    filtering on per-node label + inline props.  WHERE is applied once a
-    full binding exists.  When ``seeds`` is given (id- or label-anchored),
-    node attrs are resolved with per-node lookups; otherwise the whole node
-    set is bulk-loaded once for the opening full scan.
+    Depth-first so LIMIT short-circuits: complete bindings are yielded one at
+    a time and the caller (execute_query) stops pulling once the limit is hit
+    — crucial on hubs, where a breadth-first frontier would materialise the
+    entire 2-hop neighbourhood before the limit ever applied.  Each node is
+    filtered on its label + inline props during expansion; the WHERE clause is
+    applied on the complete binding.  When ``seeds`` is given (id- or
+    label-anchored) attrs are resolved per node; otherwise the whole node set
+    is bulk-loaded once for the opening full scan.
     """
     node_store = graph._nodes
     all_nodes = node_store.to_dict() if seeds is None else None
@@ -713,37 +716,31 @@ def _execute_chain(graph, nodes, edges, where_func, return_str, seeds,
             return all_nodes.get(nid, {}) or {}
         return node_store.get(nid, {}) or {}
 
+    def expand(level, cur_id, bindings, node_ids):
+        if level == len(edges):
+            if where_func(bindings, node_ids):
+                yield parse_return(return_str, bindings, node_ids)
+            return
+        edge = edges[level]
+        nxt = nodes[level + 1]
+        for nb_id, edge_attrs in _iter_neighbors(graph, cur_id, edge["direction"]):
+            nb_attrs = attrs_of(nb_id)
+            if not _node_matches(nxt, nb_attrs, label_field):
+                continue
+            b2 = dict(bindings)
+            i2 = dict(node_ids)
+            b2[nxt["var"]] = nb_attrs
+            i2[nxt["var"]] = nb_id
+            if edge["var"]:
+                b2[edge["var"]] = edge_attrs
+            yield from expand(level + 1, nb_id, b2, i2)
+
     n0 = nodes[0]
     if seeds is not None:
         seed_iter = ((nid, attrs_of(nid)) for nid in seeds)
     else:
         seed_iter = all_nodes.items()
 
-    # frontier entries: (current_node_id, bindings, node_ids)
-    frontier = []
     for nid, attrs in seed_iter:
         if _node_matches(n0, attrs, label_field):
-            frontier.append((nid, {n0["var"]: attrs}, {n0["var"]: nid}))
-
-    for ei, edge in enumerate(edges):
-        nxt = nodes[ei + 1]
-        new_frontier = []
-        for cur_id, bindings, node_ids in frontier:
-            for nb_id, edge_attrs in _iter_neighbors(graph, cur_id, edge["direction"]):
-                nb_attrs = attrs_of(nb_id)
-                if not _node_matches(nxt, nb_attrs, label_field):
-                    continue
-                b2 = dict(bindings)
-                i2 = dict(node_ids)
-                b2[nxt["var"]] = nb_attrs
-                i2[nxt["var"]] = nb_id
-                if edge["var"]:
-                    b2[edge["var"]] = edge_attrs
-                new_frontier.append((nb_id, b2, i2))
-        frontier = new_frontier
-        if not frontier:
-            return
-
-    for _cur_id, bindings, node_ids in frontier:
-        if where_func(bindings, node_ids):
-            yield parse_return(return_str, bindings, node_ids)
+            yield from expand(0, nid, {n0["var"]: attrs}, {n0["var"]: nid})
