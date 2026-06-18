@@ -186,20 +186,43 @@ class Dict(DataStructure):
     def _alloc_value_addr(self):
         """Allocate a value address, reusing freed slots first.
 
+        Freed slots form an *intrusive singly-linked list*: each free slot
+        stores, in its own first 8 bytes, the address of the next free slot.
+        The header keeps only the list head (one uint64), so it never grows
+        with the number of deletions.  Records smaller than 8 bytes can't hold
+        a pointer, so those fall back to an in-memory (non-persisted) list.
+
         Grows the values block in place (×2) when capacity is exceeded so
         nested children with many entries don't trample neighbouring
         allocations.
         """
-        if hasattr(self, "_value_freelist") and self._value_freelist:
+        rs = self._values_dataset.record_size
+        if rs >= 8:
+            head = getattr(self, "_value_freelist_head", 0)
+            if head:
+                nxt = struct.unpack("<Q", self._values_dataset.db.read(int(head), 8))[0]
+                self._value_freelist_head = nxt
+                return int(head)
+        elif getattr(self, "_value_freelist", None):
             return self._value_freelist.pop()
+
         if self.next_data_offset >= self.values_capacity:
             self._grow_values_block()
-        addr = (
-            self.values_block_addr
-            + self.next_data_offset * self._values_dataset.record_size
-        )
+        addr = self.values_block_addr + self.next_data_offset * rs
         self.next_data_offset += 1
         return addr
+
+    def _free_value_addr(self, addr):
+        """Return a value slot to the freelist (intrusive list head push)."""
+        addr = int(addr)
+        if self._values_dataset.record_size >= 8:
+            prev_head = int(getattr(self, "_value_freelist_head", 0))
+            self._values_dataset.db.write(addr, struct.pack("<Q", prev_head))
+            self._value_freelist_head = addr
+        else:
+            if not hasattr(self, "_value_freelist"):
+                self._value_freelist = []
+            self._value_freelist.append(addr)
 
     def _grow_values_block(self):
         """Allocate a larger values block, copy existing records, rewrite
@@ -425,7 +448,8 @@ class Dict(DataStructure):
 
         # Track next free slot within the block
         self.next_data_offset = 0
-        self._value_freelist = []
+        self._value_freelist = []          # in-memory fallback (records < 8 bytes)
+        self._value_freelist_head = 0      # intrusive list head (records >= 8 bytes)
 
         self.p_last = self._p_init
         self.size = 0
@@ -464,7 +488,12 @@ class Dict(DataStructure):
         self.values_block_addr = metadata.get("values_block_addr", 0)
         self.values_capacity = metadata.get("values_capacity", 0)
         self.next_data_offset = metadata.get("next_data_offset", 0)
-        self._value_freelist = metadata.get("value_freelist", [])
+        # Intrusive freelist head (records >= 8 bytes). Any legacy in-header
+        # "value_freelist" list is intentionally ignored — those few freed
+        # slots simply won't be reused (no corruption); the head-based scheme
+        # keeps the header bounded from now on.
+        self._value_freelist = []
+        self._value_freelist_head = metadata.get("value_freelist_head", 0)
         self.use_bloom = metadata["use_bloom"]
         self._is_nested = metadata.get("is_nested", False)
         self._key_size = metadata.get("key_size", self.DEFAULT_KEY_SIZE)
@@ -697,7 +726,7 @@ class Dict(DataStructure):
             "is_nested": self._is_nested,
             "key_size": self._key_size,
             "initial_capacity": self._initial_capacity,
-            "value_freelist": getattr(self, "_value_freelist", []),
+            "value_freelist_head": int(getattr(self, "_value_freelist_head", 0)),
             "hash_keys": getattr(self, "_hash_keys", False),
             "hash_bits": getattr(self, "_hash_bits", 128),
             "store_key": getattr(self, "_store_key", True),
@@ -1340,11 +1369,8 @@ class Dict(DataStructure):
         if self._blooms and table_idx < len(self._blooms):
             self._blooms[table_idx].remove(key)
 
-        # Return value slot to internal freelist for reuse
-        value_addr = int(entry["value_addr"])
-        if not hasattr(self, "_value_freelist"):
-            self._value_freelist = []
-        self._value_freelist.append(value_addr)
+        # Return value slot to the intrusive freelist for reuse
+        self._free_value_addr(int(entry["value_addr"]))
 
         self.size -= 1
         if self._cache and key in self._cache:
