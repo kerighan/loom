@@ -1059,8 +1059,13 @@ class Dict(DataStructure):
                     entry["value_addr"] = value_addr
                     self._hash_table[entry_addr] = entry
                 else:
-                    # Update in place in user's dataset
-                    self._values_dataset[value_addr] = value
+                    # Update in place — re-inject `_key` so iteration can still
+                    # recover the key (omitting it on update zeroed the stored
+                    # key, silently breaking keys()/items() for that entry).
+                    if self._store_key:
+                        self._values_dataset[value_addr] = {"_key": orig_key, **value}
+                    else:
+                        self._values_dataset[value_addr] = value
         else:
             # Insert new item - use append() to get next free address
             if self._is_nested:
