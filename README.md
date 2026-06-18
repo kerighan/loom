@@ -569,7 +569,7 @@ LoomError
 
 All benchmarks: modern laptop (Linux, SSD), `sync_writes=False` (default — durable on `close()`).
 
-Dict, List, Queue and BTree numbers come from `benchmarks/readme_benchmark.py` (run it yourself with `PYTHONPATH=. python benchmarks/readme_benchmark.py`); Set and LRUDict from their dedicated `benchmarks/benchmark_*.py`; and **Graph from `benchmarks/benchmark_graph_kg.py` on FB15k** (the reference graph benchmark — see its section below). Figures are rounded; expect ±10% run-to-run variance from page-cache warmup and CPU frequency. The Dict/List/Queue/BTree point-op numbers are measured with `cache_size=0` (cold mmap on every op) so those structures are compared on equal footing — see the BTree note below for how much an LRU cache changes things; Graph uses its default cache.
+Dict, List, Queue and BTree numbers come from `benchmarks/readme_benchmark.py` (run it yourself with `PYTHONPATH=. python benchmarks/readme_benchmark.py`); Set and LRUDict from their dedicated `benchmarks/benchmark_*.py`; and **Graph from `benchmarks/benchmark_graph_kg.py` on FB15k** (the reference graph benchmark — see its section below). Figures are rounded; expect ±10% run-to-run variance from page-cache warmup and CPU frequency. The Dict/List/Queue point-op numbers are measured with `cache_size=0` (cold mmap on every op) so those structures are compared on equal footing; BTree uses its default `cache_size=1024` (it is meaningless at zero cache — see the note below) and Graph uses its default cache.
 
 ### loom vs SqliteDict — 10 000 ops, fixed schema
 
@@ -598,9 +598,9 @@ Per-call inserts already run at batch speed in loom (the flush is already lazy),
 | List | read[i] | 165 000 | 6 |
 | Queue | push (batch) | 220 000 | 5 |
 | Queue | pop | 260 000 | 4 |
-| BTree | insert | 2 700 | 374 |
-| BTree | read | 6 800 | 147 |
-| BTree | contains | 6 600 | 151 |
+| BTree | insert | 13 000 | 77 |
+| BTree | read | 131 000 | 8 |
+| BTree | contains | 280 000 | 4 |
 | BTree | keys() [sorted] | 368 000 | 3 |
 | Set | add | 73 000 | 14 |
 | Set | contains | 49 000 | 21 |
@@ -614,11 +614,15 @@ Per-call inserts already run at batch speed in loom (the flush is already lazy),
 | Graph | has_edge | 16 000 | 63 |
 | Graph | neighbors | 166 000 edges/s | 6 |
 
-Graph rows are the **FB15k knowledge-graph reference benchmark** (`benchmarks/benchmark_graph_kg.py`), not `cache_size=0` — see the dedicated section below.
+The Dict/List/Queue/Set/LRUDict rows are `cache_size=0` (cold). The **BTree rows use its default `cache_size=1024`** — running a B-tree at `cache_size=0` is pathological (every node a cold mmap read) and unrepresentative; Graph rows are the FB15k reference benchmark below.
 
-**Dict vs BTree — pick the right tool.** For point operations the hash-based `Dict` is **far** faster than the `BTree`: at `cache_size=0` Dict inserts ~9× faster and reads ~8× faster (O(1) slot vs O(log n) node traversal, each node a cold mmap read). The BTree earns its keep only when you need **ordered iteration, range, or prefix queries** — `keys()` comes out already sorted at ~370k keys/s, and `range()`/`prefix()` walk a contiguous key span without scanning the whole structure.
+**Dict vs BTree — pick the right tool.** The B-tree is far more cache-sensitive than the Dict, because it relies on keeping its handful of internal nodes hot. At its default cache its random `read` (~131k/s) and `contains` (~280k/s) actually *beat* the Dict — the few internal nodes live in RAM, so a lookup is one leaf read; at `cache_size=0` the same `read` collapses to ~6 800/s. The Dict, by contrast, barely changes with caching (~55k read either way). So:
 
-The BTree is far more cache-sensitive than the Dict, because a B-tree relies on keeping its handful of internal nodes hot. The table above uses `cache_size=0` (cold) for an apples-to-apples comparison, but the **default is `cache_size=1024`** — with that default the same `read` jumps to ~125 000 ops/s and `contains` to ~280 000 ops/s (internal nodes served from RAM, one leaf read), while a `Dict` barely changes with caching. Net: at *equal* cache settings the `Dict` wins point ops; the BTree's strength is ordering/range, and you should leave its node cache enabled (or raise it) for random-lookup workloads.
+- **Insert**: Dict wins (~27k vs ~13k/s) — O(1) slot vs O(log n) node path.
+- **Random read / contains**: BTree wins *with a warm node cache*, Dict wins at zero cache; the Dict is the safe choice when you can't keep a cache hot.
+- **Ordered iteration / range / prefix**: BTree only — `keys()` comes out sorted at ~370k/s and `range()`/`prefix()` walk a contiguous key span without scanning everything.
+
+Bottom line: use a `Dict` for pure point access, a `BTree` when you need ordering or range queries (and leave its node cache enabled).
 
 ### `str` (text) fields — impact of variable-length blobs
 
