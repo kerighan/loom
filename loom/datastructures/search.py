@@ -279,40 +279,43 @@ class SearchIndex(DataStructure):
         return bytes(out), last
 
     def flush(self):
-        """Materialise buffered docs + postings to disk (one blob write/term)."""
+        """Materialise buffered docs + postings to disk (one blob write/term).
+
+        Records are written with set_batch / append_many — one contiguous
+        arena + a single parent-ref update per structure — instead of
+        per-item inserts, which dominates a bulk build.
+        """
         if not self._dirty:
             return
         blobs = self._db.blob_store
 
-        # documents (+ dense per-doc length list, scored)
-        total_add = 0
-        for doc_id, doc_json, dl in self._buf_docs:
-            self._docs[str(doc_id)] = {"doc": doc_json}
-            if self._scored:
-                self._lengths.append({"dl": dl})   # appended in doc_id order
-                total_add += dl
+        # documents (+ dense per-doc length list, scored) — batched
+        self._docs.set_batch(
+            (str(doc_id), {"doc": doc_json}) for doc_id, doc_json, _ in self._buf_docs
+        )
+        if self._scored:
+            self._lengths.append_many({"dl": dl} for _, _, dl in self._buf_docs)
+            total_add = sum(dl for _, _, dl in self._buf_docs)
 
-        # postings: append-encode into each term's blob (rewrite once per flush)
+        # postings: append-encode into each term's blob (rewrite once per
+        # flush), then bulk-insert all term records in one shot.
+        records = []
         for term, items in self._buf_post.items():
             if term in self._postings:
                 rec = self._postings[term]
-                last0 = int(rec["last"])
                 off0, ns0 = int(rec["off"]), int(rec["nslots"])
                 old = blobs.read(off0) if ns0 else b""
-                add_bytes, last = self._encode(items, last0)
+                add_bytes, last = self._encode(items, int(rec["last"]))
                 off, ns = blobs.write(old + add_bytes)
                 if ns0:
                     blobs.delete(off0, ns0)
-                self._postings[term] = {
-                    "df": int(rec["df"]) + len(items), "last": last,
-                    "off": off, "nslots": ns,
-                }
+                df = int(rec["df"]) + len(items)
             else:
                 add_bytes, last = self._encode(items, 0)
                 off, ns = blobs.write(add_bytes)
-                self._postings[term] = {
-                    "df": len(items), "last": last, "off": off, "nslots": ns,
-                }
+                df = len(items)
+            records.append((term, {"df": df, "last": last, "off": off, "nslots": ns}))
+        self._postings.set_batch(records)
 
         if self._scored:
             self._meta["total_len"] = {"v": int(self._meta["total_len"]["v"]) + total_add}
