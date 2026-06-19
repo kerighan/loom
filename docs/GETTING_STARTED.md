@@ -227,7 +227,7 @@ with DB("cache.db") as db:
     )
     
     # Create dict with large cache
-    cache = db.create_dict("cache", cache_ds, cache_size=10000)
+    cache = db.create_dict("cache", cache_ds)
     
     # Fast writes (no atomic overhead for cache)
     cache["user:1:profile"] = {
@@ -285,10 +285,10 @@ users = db.create_dict("users", user_ds, bloom_size=100000)
 
 ```python
 # Hot data: large cache
-active = db.create_dict("active", ds, cache_size=10000)
+active = db.create_dict("active", ds)
 
 # Cold data: small cache
-archived = db.create_dict("archived", ds, cache_size=10)
+archived = db.create_dict("archived", ds)
 ```
 
 ### 3. Batch Atomic Operations
@@ -363,7 +363,7 @@ db.close()  # Important!
 
 ```python
 # 1. Increase cache size
-users = db.create_dict("users", user_ds, cache_size=10000)
+users = db.create_dict("users", user_ds)
 
 # 2. Use bloom filters
 users = db.create_dict("users", user_ds, bloom_size=100000)

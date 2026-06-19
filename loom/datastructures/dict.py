@@ -5,7 +5,6 @@ import mmh3
 from loom.datastructures.base import DataStructure, write_op
 from loom.datastructures.template import DataStructureTemplate
 from loom.datastructures.counting_bloomfilter import CountingBloomFilter
-from loom.cache import LRUCache  # kept for Set.template usage in this module
 from loom.ref import Ref
 
 
@@ -32,7 +31,7 @@ class Dict(DataStructure):
 
     @classmethod
     def _get_ref_config_schema(cls):
-        return {"cache_size": "uint32", "use_bloom": "bool", "p_init": "uint32"}
+        return {"use_bloom": "bool", "p_init": "uint32"}
 
     @classmethod
     def get_shared_dataset_specs(cls, parent_name, inner_schema, key_size=50):
@@ -105,9 +104,8 @@ class Dict(DataStructure):
         }
         for i in range(cls.MAX_TABLES_NESTED):
             schema[f"table_{i}"] = "uint64"
-        schema["cache_size"] = "uint16"  # 2 bytes
         return schema
-        # Total: 1(valid) + 4 + 1 + 1 + 4 + 8 + 64 + 2 = 85 bytes
+        # Total: 1(valid) + 4 + 1 + 1 + 4 + 8 + 8 + 4 + 64 = 95 bytes
 
     # Default capacities - can be tuned for storage vs performance
     DEFAULT_KEY_SIZE = 50  # Max key length in characters (was 100)
@@ -125,7 +123,6 @@ class Dict(DataStructure):
         name,
         db,
         dataset_or_template,
-        cache_size=1000,
         use_bloom=True,
         auto_save_interval=None,
         key_size=None,  # kept for legacy compat only, ignored in new code
@@ -137,7 +134,6 @@ class Dict(DataStructure):
         max_key_len=100,  # used when key_dtype is None → auto "U{max_key_len}"
         _parent=None,
     ):
-        self.cache_size = cache_size
         self._store_key = store_key
         self._hash_keys = hash_keys  # legacy
         self._hash_bits = hash_bits  # legacy
@@ -188,7 +184,17 @@ class Dict(DataStructure):
         else:
             self._initialize()
 
-        self._cache = self._make_cache("values", cache_size)
+        self._cache = self._make_cache("values")
+
+    def _cache_namespace(self):
+        # Nested dicts have an id-derived name (re-materialised per parent
+        # lookup), so key the cache by the first hash-table address instead —
+        # stable across re-materialisation and globally unique per dict.
+        if self._parent is not None:
+            ta = getattr(self, "table_addrs", None)
+            if ta:
+                return f"nd{int(ta[0])}"
+        return self.name
 
     def _alloc_value_addr(self):
         """Allocate a value address, reusing freed slots first.
@@ -587,7 +593,6 @@ class Dict(DataStructure):
         """Get Dict-specific reference fields (for top-level dicts)."""
         return {
             "ref_dataset_name": self._values_dataset.name,
-            "cache_size": self.cache_size,
             "use_bloom": self.use_bloom,
             "p_init": self.P_INIT,
         }
@@ -615,9 +620,6 @@ class Dict(DataStructure):
                 ref[f"table_{i}"] = (
                     self.table_addrs[i] if i < len(self.table_addrs) else 0
                 )
-
-            # Config
-            ref["cache_size"] = self.cache_size
 
             return ref
         else:
@@ -660,8 +662,7 @@ class Dict(DataStructure):
             instance._template = None
             instance._shared_hash_table = None
             instance._shared_values_dataset = None
-            instance.cache_size = int(ref["cache_size"])
-            instance._cache = instance._make_cache("values", instance.cache_size)
+            instance._cache = instance._make_cache("values")
             instance._blooms = []
             instance.use_bloom = False
             instance._auto_save_interval = 0
@@ -697,7 +698,6 @@ class Dict(DataStructure):
             ds_name,
             db,
             None,  # None triggers load from metadata
-            cache_size=ref["cache_size"],
             use_bloom=ref["use_bloom"],
         )
 
@@ -1246,9 +1246,15 @@ class Dict(DataStructure):
             if self._blooms and table_idx < len(self._blooms):
                 self._blooms[table_idx].add(key)
 
-        # Cache the actual value (not the address!)
-        if self._cache:
-            self._cache[key] = value if self._is_nested else int(value_addr)
+        # Populate the cache (key → address for non-nested, → object for nested).
+        # Skipped during set_batch (`_defer_parent_update`): a bulk load reads
+        # nothing back immediately, so writing every item would just churn the
+        # shared LRU (and on a load larger than the cap, evict itself). Cold
+        # reads warm the cache lazily instead. Use the same cache_k form as
+        # __getitem__/__contains__ so insert-warmed entries are actually hit.
+        if self._cache and not getattr(self, "_defer_parent_update", False):
+            cache_k = key if self._store_key else (key[0] << 64 | key[1])
+            self._cache[cache_k] = value if self._is_nested else int(value_addr)
 
         self._auto_save_check()
 
@@ -1385,8 +1391,10 @@ class Dict(DataStructure):
         self._free_value_addr(int(entry["value_addr"]))
 
         self.size -= 1
-        if self._cache and key in self._cache:
-            del self._cache[key]
+        if self._cache:
+            cache_k = key if self._store_key else (key[0] << 64 | key[1])
+            if cache_k in self._cache:
+                del self._cache[cache_k]
         self._auto_save_check()
 
         # Nested dict: propagate the updated size / freelist to the parent's
@@ -1401,13 +1409,19 @@ class Dict(DataStructure):
 
     def __contains__(self, key):
         key = self._to_internal_key(key)
-        # Check cache first
-        if self._cache and self._cache.get(key) is not None:
+        cache_k = key if self._store_key else (key[0] << 64 | key[1])
+        # Check cache first (same key form as __getitem__/__setitem__)
+        if self._cache and self._cache.get(cache_k) is not None:
             return True
         # Direct hash table probe
         key_hash = self._hash(key)
         try:
-            self._find_slot(key, key_hash, for_insert=False)
+            p, table_addr, position, entry = self._find_slot(
+                key, key_hash, for_insert=False
+            )
+            # Warm the address cache so a follow-up read skips the slot scan.
+            if self._cache and not self._is_nested:
+                self._cache[cache_k] = int(entry["value_addr"])
             return True
         except KeyError:
             return False
@@ -1547,7 +1561,6 @@ class Dict(DataStructure):
             return None
         return {
             "schema": self.item_schema,
-            "cache_size": self.cache_size,
             "use_bloom": self.use_bloom,
             "store_key": getattr(self, "_store_key", True),
         }
@@ -1558,7 +1571,6 @@ class Dict(DataStructure):
             name,
             db,
             params["schema"],
-            cache_size=params.get("cache_size", 1000),
             use_bloom=params.get("use_bloom", True),
             store_key=params.get("store_key", True),
         )

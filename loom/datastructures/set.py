@@ -8,7 +8,6 @@ Implemented as a thin wrapper around Dict.
 from .dict import Dict
 from .base import DataStructure, write_op
 from .template import DataStructureTemplate
-from loom.cache import LRUCache
 
 
 class Set(DataStructure):
@@ -59,7 +58,7 @@ class Set(DataStructure):
     _inner_types_supported = ()  # Set items are strings, not structures
 
     @classmethod
-    def template(cls, key_size=50, use_bloom=False, cache_size=0):
+    def template(cls, key_size=50, use_bloom=False):
         """Create a template for nested Sets.
 
         Unlike List and Dict, Set doesn't need a dataset since it only stores keys.
@@ -67,7 +66,6 @@ class Set(DataStructure):
         Args:
             key_size: Maximum length of string keys (default: 50)
             use_bloom: Whether to use bloom filter (default: False for nested)
-            cache_size: LRU cache size (default: 0)
 
         Returns:
             SetTemplate instance
@@ -76,9 +74,7 @@ class Set(DataStructure):
             TagSet = Set.template(key_size=50)
             user_tags = db.create_dict('user_tags', TagSet)
         """
-        return SetTemplate(
-            cls, key_size=key_size, use_bloom=use_bloom, cache_size=cache_size
-        )
+        return SetTemplate(cls, key_size=key_size, use_bloom=use_bloom)
 
     @classmethod
     def _get_nested_ref_schema(cls):
@@ -104,7 +100,6 @@ class Set(DataStructure):
             "table_7": "uint64",
             # Config
             "key_size": "uint16",  # 2 bytes
-            "cache_size": "uint16",  # 2 bytes
         }
 
     @classmethod
@@ -146,7 +141,6 @@ class Set(DataStructure):
         db,
         key_size: int = 50,
         use_bloom: bool = True,
-        cache_size: int = 0,  # No cache needed for sets
         _load_existing: bool = False,
         _parent=None,
     ):
@@ -157,13 +151,11 @@ class Set(DataStructure):
             db: Database instance
             key_size: Maximum length of string keys (default: 50)
             use_bloom: Whether to use bloom filter for fast lookups (default: True)
-            cache_size: LRU cache size (default: 0, disabled for sets)
             _load_existing: If True, load existing set from disk
             _parent: Parent data structure if this is nested (internal use)
         """
         self._key_size = key_size
         self._use_bloom = use_bloom
-        self._cache_size = cache_size
         self._parent_key = None  # Key in parent dict (set by parent for Dict[Set])
         self._dict = None  # Will be set by _initialize or _initialize_nested
 
@@ -193,7 +185,6 @@ class Set(DataStructure):
             dataset_or_template=dummy_ds,
             key_size=self._key_size,
             use_bloom=self._use_bloom,
-            cache_size=self._cache_size,
         )
         self.save()
 
@@ -202,7 +193,6 @@ class Set(DataStructure):
         metadata = self._load_metadata() or {}
         self._key_size = metadata.get("key_size", 50)
         self._use_bloom = metadata.get("use_bloom", True)
-        self._cache_size = metadata.get("cache_size", 0)
 
         # Load internal dict
         self._dict = Dict(
@@ -218,7 +208,6 @@ class Set(DataStructure):
                 "type": "Set",
                 "key_size": self._key_size,
                 "use_bloom": self._use_bloom,
-                "cache_size": self._cache_size,
                 "dict_name": f"_set_{self.name}_dict",
             }
         )
@@ -237,7 +226,6 @@ class Set(DataStructure):
             dataset_or_template=self._shared_values_dataset,
             key_size=self._key_size,
             use_bloom=self._use_bloom,
-            cache_size=self._cache_size,
             _parent=self._parent,  # Pass parent so Dict uses shared datasets
         )
 
@@ -284,7 +272,6 @@ class Set(DataStructure):
 
             # Config
             ref["key_size"] = self._key_size
-            ref["cache_size"] = self._cache_size
 
             return ref
         else:
@@ -307,7 +294,6 @@ class Set(DataStructure):
             instance._parent = "__nested__"
             instance._key_size = int(ref.get("key_size", 50))
             instance._use_bloom = False  # No bloom for nested
-            instance._cache_size = int(ref.get("cache_size", 0))
             instance._parent_key = None
             instance._auto_save_interval = 0
             instance._ops_since_save = 0
@@ -338,12 +324,7 @@ class Set(DataStructure):
                 else:
                     break
 
-            dict_instance.cache_size = instance._cache_size
-            dict_instance._cache = (
-                LRUCache(dict_instance.cache_size)
-                if dict_instance.cache_size > 0
-                else None
-            )
+            dict_instance._cache = dict_instance._make_cache("values")
             dict_instance._blooms = []
             dict_instance.use_bloom = False
             dict_instance._auto_save_interval = 0
@@ -377,7 +358,6 @@ class Set(DataStructure):
             db,
             key_size=ref.get("key_size", 50),
             use_bloom=ref.get("use_bloom", True),
-            cache_size=ref.get("cache_size", 0),
             _load_existing=True,
         )
 
@@ -557,7 +537,6 @@ class Set(DataStructure):
             cls,
             key_size=template_config.get("key_size", 50),
             use_bloom=template_config.get("use_bloom", False),
-            cache_size=template_config.get("cache_size", 0),
         )
 
 
@@ -572,14 +551,13 @@ class SetTemplate(DataStructureTemplate):
         user_tags = db.create_dict('user_tags', TagSet)
     """
 
-    def __init__(self, ds_class, key_size=50, use_bloom=False, cache_size=0):
+    def __init__(self, ds_class, key_size=50, use_bloom=False):
         """Initialize template.
 
         Args:
             ds_class: Set class
             key_size: Maximum length of string keys
             use_bloom: Whether to use bloom filter
-            cache_size: LRU cache size
         """
         # Create a dummy dataset for compatibility with parent class
         dummy_dataset = _DummyDataset(Set._DUMMY_SCHEMA)
@@ -587,7 +565,6 @@ class SetTemplate(DataStructureTemplate):
         config = {
             "key_size": key_size,
             "use_bloom": use_bloom,
-            "cache_size": cache_size,
         }
 
         # Call parent constructor

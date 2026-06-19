@@ -54,7 +54,7 @@ def benchmark_loom_dict(num_items, value_size=50):
         # Disable bloom filter for large dicts (>50K) due to known scaling issue
         use_bloom = num_items <= 50000
         d = db.create_dict(
-            "benchmark_dict", dataset, cache_size=10000, use_bloom=use_bloom
+            "benchmark_dict", dataset, use_bloom=use_bloom
         )
 
         # Generate test data

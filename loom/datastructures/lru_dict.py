@@ -141,7 +141,6 @@ class LRUDict(DataStructure):
             key_size=ks,
             initial_capacity=max(self.capacity * 2, 64),
             use_bloom=False,
-            cache_size=min(self.capacity, 2000),
         )
 
         self._head      = _NULL   # most recently used record addr

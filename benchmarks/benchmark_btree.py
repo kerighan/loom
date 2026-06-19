@@ -112,8 +112,8 @@ def run_benchmarks(n_items=10000):
             dict_ds = db.create_dataset("dict_users", id="uint32", name="U50")
 
             # Create structures
-            btree = db.create_btree("users_btree", btree_ds, cache_size=1000)
-            dct = db.create_dict("users_dict", dict_ds, cache_size=1000)
+            btree = db.create_btree("users_btree", btree_ds)
+            dct = db.create_dict("users_dict", dict_ds)
 
             # ========== INSERT BENCHMARK ==========
             print("INSERT PERFORMANCE")

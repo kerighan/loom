@@ -429,7 +429,7 @@ def benchmark_cache_impact():
 
         # Prepare data
         with DB(filename) as db:
-            lst = db.create_list("test", {"id": "uint64"}, cache_size=0)
+            lst = db.create_list("test", {"id": "uint64"})
             for i in range(n_items):
                 lst.append({"id": i})
 
@@ -437,7 +437,7 @@ def benchmark_cache_impact():
         print(f"\nWithout cache:")
         print("-" * 50)
         with DB(filename) as db:
-            lst = db.create_list("test", {"id": "uint64"}, cache_size=0)
+            lst = db.create_list("test", {"id": "uint64"})
 
             # Hot access pattern (80/20 rule)
             hot_indices = list(range(100))  # 100 hot items
@@ -462,7 +462,7 @@ def benchmark_cache_impact():
         print(f"\nWith cache (10 blocks):")
         print("-" * 50)
         with DB(filename) as db:
-            lst = db.create_list("test", {"id": "uint64"}, cache_size=10)
+            lst = db.create_list("test", {"id": "uint64"})
 
             start = time.time()
             for idx in indices:

@@ -263,7 +263,7 @@ class TestAutoSaveInterval:
         try:
             # Create list with auto-save every 100 items
             with DB(filename) as db:
-                lst = db.create_list("test", {"id": "uint64"}, cache_size=10)
+                lst = db.create_list("test", {"id": "uint64"})
                 # Note: auto_save_interval is set in DataStructure base class
                 lst._auto_save_interval = 100
 

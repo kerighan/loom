@@ -60,7 +60,7 @@ class DB:
         auto_open=True,
         blob_compression=None,
         auto_save_interval=100,
-        cache_size=0,
+        cache_size=200_000,
         sync_writes=False,
         multiprocess_safe=False,
         flag="r+",
@@ -720,13 +720,12 @@ class DB:
         self._save_datastructures_registry()  # Persist registry
         return cbf
 
-    def create_list(self, name, dataset_or_template, cache_size=10):
+    def create_list(self, name, dataset_or_template):
         """Create a persistent List.
 
         Args:
             name: Unique name for this list
             dataset_or_template: Dataset (for regular list) or DataStructureTemplate (for nested list)
-            cache_size: Number of blocks to cache (0 to disable)
 
         Returns:
             List instance
@@ -751,7 +750,7 @@ class DB:
         if name in self._datastructures:
             return self._datastructures[name]
 
-        lst = List(name, self, dataset_or_template, cache_size)
+        lst = List(name, self, dataset_or_template)
         self._datastructures[name] = lst  # Register for caching and auto-save
         self._save_datastructures_registry()  # Persist registry
         return lst
@@ -760,7 +759,6 @@ class DB:
         self,
         name,
         dataset_or_template,
-        cache_size=1000,
         use_bloom=True,
         key_size=None,
         initial_capacity=None,
@@ -773,7 +771,6 @@ class DB:
         Args:
             name: Unique name for this dict
             dataset_or_template: Dataset (for regular dict) or DataStructureTemplate (for nested dict)
-            cache_size: Number of keys to cache (0 to disable)
             use_bloom: Whether to use bloom filters for acceleration
 
         Returns:
@@ -805,7 +802,6 @@ class DB:
             name,
             self,
             dataset_or_template,
-            cache_size=cache_size,
             use_bloom=use_bloom,
             key_size=key_size,
             initial_capacity=initial_capacity,
@@ -849,7 +845,7 @@ class DB:
         self._save_datastructures_registry()  # Persist registry
         return s
 
-    def create_btree(self, name, dataset, key_size=50, cache_size=1024):
+    def create_btree(self, name, dataset, key_size=50):
         """Create a persistent BTree with ordered keys.
 
         BTree provides O(log n) operations with ordered iteration
@@ -859,7 +855,6 @@ class DB:
             name: Unique name for this BTree
             dataset: Dataset for storing values
             key_size: Maximum length of string keys (default: 50)
-            cache_size: Number of nodes to cache (default: 100)
 
         Returns:
             BTree instance
@@ -889,7 +884,7 @@ class DB:
         if name in self._datastructures:
             return self._datastructures[name]
 
-        btree = BTree(name, self, dataset, key_size=key_size, cache_size=cache_size)
+        btree = BTree(name, self, dataset, key_size=key_size)
         self._datastructures[name] = btree  # Register for caching and auto-save
         self._save_datastructures_registry()  # Persist registry
         return btree

@@ -12,13 +12,13 @@ class DataStructureTemplate:
     A template encapsulates:
     - The data structure class (List, Dict, etc.)
     - The dataset to use for storage
-    - Configuration parameters (growth_factor, cache_size, etc.)
+    - Configuration parameters (growth_factor, p_init, etc.)
 
     Templates enable nested structures like List[List[User]].
 
     Example:
         # Create template
-        UserList = List.template(user_dataset, cache_size=10)
+        UserList = List.template(user_dataset)
 
         # Create list of lists
         teams = db.create_list('teams', UserList)

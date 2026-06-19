@@ -89,30 +89,28 @@ Delete a dataset.
 
 **Raises**: `KeyError` if dataset doesn't exist
 
-#### `create_dict(name, dataset, bloom_size=None, cache_size=100)`
+#### `create_dict(name, dataset, bloom_size=None)`
 Create a persistent dictionary.
 
 **Parameters**:
 - `name` (str): Unique dict name
 - `dataset` (Dataset): Dataset defining value schema
 - `bloom_size` (int, optional): Bloom filter size for fast lookups
-- `cache_size` (int, optional): LRU cache size (default: 100)
 
 **Returns**: `Dict` instance
 
 **Example**:
 ```python
 user_ds = db.create_dataset("users", id="uint64", name="U50")
-users = db.create_dict("users_dict", user_ds, cache_size=1000)
+users = db.create_dict("users_dict", user_ds)
 ```
 
-#### `create_list(name, dataset, cache_size=100)`
+#### `create_list(name, dataset)`
 Create a persistent list.
 
 **Parameters**:
 - `name` (str): Unique list name
 - `dataset` (Dataset): Dataset defining item schema
-- `cache_size` (int, optional): LRU cache size (default: 100)
 
 **Returns**: `List` instance
 
@@ -157,7 +155,7 @@ addr = dataset.allocate_block(count=100)
 
 ## Dict
 
-### `Dict(name, db, dataset, bloom_size=None, cache_size=100)`
+### `Dict(name, db, dataset, bloom_size=None)`
 
 Persistent hash table with automatic growth.
 
@@ -274,7 +272,7 @@ Save metadata to disk.
 ```python
 # Create nested dict template
 user_ds = db.create_dataset("users", id="uint32", name="U50")
-UserDict = Dict.template(user_ds, cache_size=10)
+UserDict = Dict.template(user_ds)
 
 # Create parent dict
 teams = db.create_dict("teams", UserDict)
@@ -302,7 +300,7 @@ print(teams["engineering"]["alice"]["name"])  # "Alice"
 
 ## List
 
-### `List(name, db, dataset, cache_size=100)`
+### `List(name, db, dataset)`
 
 Persistent list with automatic block allocation.
 
@@ -591,10 +589,10 @@ db.open()
 
 ```python
 # Small dataset, frequent access
-users = db.create_dict("users", user_ds, cache_size=1000)
+users = db.create_dict("users", user_ds)
 
 # Large dataset, infrequent access
-logs = db.create_list("logs", log_ds, cache_size=10)
+logs = db.create_list("logs", log_ds)
 ```
 
 ### 3. Use Atomic Operations for Critical Data
@@ -630,7 +628,7 @@ if items.deleted_count > 1000:
 
 ```python
 # Good: shared datasets for nested structures
-UserDict = Dict.template(user_ds, cache_size=10)
+UserDict = Dict.template(user_ds)
 teams = db.create_dict("teams", UserDict)
 
 # Avoid: creating separate datasets for each nested structure
@@ -695,10 +693,10 @@ items.append_many(items_list, atomic=True)
 
 ```python
 # Hot data: large cache
-active_users = db.create_dict("active", user_ds, cache_size=10000)
+active_users = db.create_dict("active", user_ds)
 
 # Cold data: small cache
-archived = db.create_dict("archived", user_ds, cache_size=10)
+archived = db.create_dict("archived", user_ds)
 ```
 
 ### 3. Avoid Unnecessary Saves

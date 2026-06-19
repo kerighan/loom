@@ -14,7 +14,6 @@ allowing flexible value sizes and nested structures.
 
 from .base import DataStructure, write_op
 from loom.datastructures.template import DataStructureTemplate
-from loom.cache import LRUCache
 from loom.ref import Ref
 
 
@@ -68,7 +67,6 @@ class BTree(DataStructure):
         db,
         dataset_or_template=None,
         key_size: int = 50,
-        cache_size: int = 1024,
         auto_save_interval: int = None,
         _parent=None,
     ):
@@ -79,11 +77,9 @@ class BTree(DataStructure):
             db: Database instance
             dataset_or_template: Dataset for values, or None to load existing
             key_size: Maximum length of string keys (default: 50)
-            cache_size: Number of nodes to cache (default: 100)
             auto_save_interval: Save metadata every N operations
         """
         self._key_size = key_size
-        self.cache_size = cache_size
         self._parent_key = None
 
         if isinstance(dataset_or_template, DataStructureTemplate):
@@ -117,7 +113,15 @@ class BTree(DataStructure):
             self._initialize()
 
         # Node cache for performance
-        self._node_cache = self._make_cache("nodes", cache_size)
+        self._node_cache = self._make_cache("nodes")
+
+    def _should_cache(self):
+        # The node cache stores mutable node *contents*.  A nested btree is
+        # re-materialised on every parent lookup, so a cached node could be
+        # served stale after another materialisation mutated it.  Only cache a
+        # long-lived top-level btree.  (Matches the old behaviour, where the
+        # nested node cache was effectively unused.)
+        return self._parent is None
 
     @classmethod
     def _get_nested_ref_schema(cls):
@@ -134,7 +138,6 @@ class BTree(DataStructure):
             "current_values_block_capacity": "uint32",
             "current_values_block_offset": "uint32",
             "key_size": "uint16",
-            "cache_size": "uint16",
         }
 
     def _allocate_value_addr(self):
@@ -339,7 +342,6 @@ class BTree(DataStructure):
         metadata = self._load_metadata()
 
         self._key_size = metadata.get("key_size", 50)
-        self.cache_size = metadata.get("cache_size", self.cache_size)
         self.root_addr = metadata.get("root_addr", 0)
         self.size = metadata.get("size", 0)
         self.height = metadata.get("height", 0)
@@ -407,7 +409,6 @@ class BTree(DataStructure):
         """Save BTree metadata."""
         metadata = {
             "key_size": self._key_size,
-            "cache_size": self.cache_size,
             "root_addr": self.root_addr,
             "size": self.size,
             "height": self.height,
@@ -464,7 +465,6 @@ class BTree(DataStructure):
                     getattr(self, "current_values_block_offset", 0)
                 ),
                 "key_size": int(self._key_size),
-                "cache_size": int(self.cache_size),
             }
         return super().to_ref()
 
@@ -492,7 +492,6 @@ class BTree(DataStructure):
                 ref.get("current_values_block_offset", 0)
             )
             instance._key_size = int(ref.get("key_size", 50))
-            instance.cache_size = int(ref.get("cache_size", 0))
 
             instance.name = f"_nested_btree_{id(instance)}"
             instance._db = db
@@ -526,7 +525,7 @@ class BTree(DataStructure):
                 instance._legacy_values_block_addrs = None
 
             instance._initial_capacity = 0
-            instance._node_cache = instance._make_cache("nodes", instance.cache_size)
+            instance._node_cache = instance._make_cache("nodes")
 
             return instance
 
@@ -534,7 +533,6 @@ class BTree(DataStructure):
             ref["ds_name"],
             db,
             None,
-            cache_size=ref["cache_size"],
             key_size=ref["key_size"],
         )
 
@@ -1220,7 +1218,6 @@ class BTree(DataStructure):
         return {
             "schema": self.item_schema,
             "key_size": self._key_size,
-            "cache_size": self.cache_size,
         }
 
     @classmethod
@@ -1228,5 +1225,4 @@ class BTree(DataStructure):
         return cls(
             name, db, None,
             key_size=params.get("key_size", 50),
-            cache_size=params.get("cache_size", 100),
         )

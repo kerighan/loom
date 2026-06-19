@@ -94,7 +94,7 @@ def bench_loom_dict():
         ds = db.create_dataset(
             "users", id="uint64", name="U50", email="U100", score="float64"
         )
-        d = db.create_dict("users_dict", ds, cache_size=0)
+        d = db.create_dict("users_dict", ds)
 
         def _insert():
             for k, v in zip(keys, values):
@@ -136,7 +136,7 @@ def bench_loom_dict():
         ds = db.create_dataset(
             "users", id="uint64", name="U50", email="U100", score="float64"
         )
-        d = db.create_dict("users_dict", ds, cache_size=0)
+        d = db.create_dict("users_dict", ds)
 
         def _batch_insert():
             with db.batch():
@@ -259,12 +259,12 @@ def bench_loom_list_queue():
 
 
 # ─────────────────────────────────────────────────────────────────────
-# loom BTree  (cache_size=0, matched to the Dict bench so the two are
-# directly comparable; a separate warm-cache line shows the default-cache
-# reality, since a BTree relies on caching its few internal nodes)
+# loom BTree  (uses the DB's default shared cache, like every other
+# structure here — a BTree especially relies on caching its few internal
+# nodes, so this reflects real default-cache throughput)
 # ─────────────────────────────────────────────────────────────────────
 def bench_loom_btree():
-    print("\n[loom BTree]  fixed schema, N =", N, "(cache_size=0, matched to Dict)")
+    print("\n[loom BTree]  fixed schema, N =", N, "(default shared cache)")
     # sorted keys, shuffled insertion order (realistic + non-degenerate tree)
     keys = [f"user_{i:0{KEY_LEN}d}" for i in range(N)]
     random.Random(42).shuffle(keys)
@@ -279,7 +279,7 @@ def bench_loom_btree():
         ds = db.create_dataset(
             "users", id="uint64", name="U50", email="U100", score="float64"
         )
-        bt = db.create_btree("users_btree", ds, cache_size=0)
+        bt = db.create_btree("users_btree", ds)
 
         def _insert():
             for k, v in zip(keys, values):
@@ -343,7 +343,7 @@ def bench_blob_dict(compression):
                 id="uint64",
                 body="text",
             )
-            d = db.create_dict("docs_dict", ds, cache_size=0)
+            d = db.create_dict("docs_dict", ds)
 
             def _insert():
                 # text fields benefit a lot from batch (single BlobStore flush)

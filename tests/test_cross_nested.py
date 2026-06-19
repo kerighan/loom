@@ -38,7 +38,7 @@ class TestListOfDicts:
         )
 
         # Create template for nested dicts
-        UserDict = Dict.template(user_dataset, cache_size=10)
+        UserDict = Dict.template(user_dataset)
 
         # Create list of dicts
         teams = db.create_list("teams", UserDict)
@@ -55,7 +55,7 @@ class TestListOfDicts:
         user_dataset = db.create_dataset(
             "users", id="uint32", name="U50", score="float32"
         )
-        UserDict = Dict.template(user_dataset, cache_size=10)
+        UserDict = Dict.template(user_dataset)
         teams = db.create_list("teams", UserDict)
 
         # Append creates a new dict
@@ -85,7 +85,7 @@ class TestListOfDicts:
         db = DB(self.temp_path)
 
         user_dataset = db.create_dataset("users", id="uint32", name="U50")
-        UserDict = Dict.template(user_dataset, cache_size=10)
+        UserDict = Dict.template(user_dataset)
         teams = db.create_list("teams", UserDict)
 
         # Create multiple teams
@@ -110,7 +110,7 @@ class TestListOfDicts:
         db = DB(self.temp_path)
 
         user_dataset = db.create_dataset("users", id="uint32", name="U50")
-        UserDict = Dict.template(user_dataset, cache_size=10)
+        UserDict = Dict.template(user_dataset)
         teams = db.create_list("teams", UserDict)
 
         # Create teams
@@ -136,7 +136,7 @@ class TestListOfDicts:
         user_dataset = db.create_dataset(
             "users", id="uint32", name="U50", score="float32"
         )
-        UserDict = Dict.template(user_dataset, cache_size=10)
+        UserDict = Dict.template(user_dataset)
         teams = db.create_list("teams", UserDict)
 
         # Create and populate
@@ -157,7 +157,7 @@ class TestListOfDicts:
         teams2 = db2._datastructures.get("teams")
         if teams2 is None:
             user_dataset2 = db2.get_dataset("users")
-            UserDict2 = Dict.template(user_dataset2, cache_size=10)
+            UserDict2 = Dict.template(user_dataset2)
             teams2 = db2.create_list("teams", UserDict2)
 
         assert len(teams2) == 2
@@ -177,7 +177,7 @@ class TestListOfDicts:
         db = DB(self.temp_path, header_size=1024 * 1024)
 
         user_dataset = db.create_dataset("users", id="uint32", name="U50")
-        UserDict = Dict.template(user_dataset, cache_size=0)
+        UserDict = Dict.template(user_dataset)
         departments = db.create_list("departments", UserDict)
 
         # Create 50 dicts
@@ -222,7 +222,7 @@ class TestDictOfLists:
         )
 
         # Create template for nested lists
-        TaskList = List.template(task_dataset, cache_size=10)
+        TaskList = List.template(task_dataset)
 
         # Create dict of lists
         user_tasks = db.create_dict("user_tasks", TaskList)
@@ -239,7 +239,7 @@ class TestDictOfLists:
         task_dataset = db.create_dataset(
             "tasks", id="uint32", title="U100", priority="uint8"
         )
-        TaskList = List.template(task_dataset, cache_size=10)
+        TaskList = List.template(task_dataset)
         user_tasks = db.create_dict("user_tasks", TaskList)
 
         # Access key auto-creates a list
@@ -261,7 +261,7 @@ class TestDictOfLists:
         db = DB(self.temp_path)
 
         task_dataset = db.create_dataset("tasks", id="uint32", title="U100")
-        TaskList = List.template(task_dataset, cache_size=10)
+        TaskList = List.template(task_dataset)
         user_tasks = db.create_dict("user_tasks", TaskList)
 
         # Create lists for multiple users
@@ -286,7 +286,7 @@ class TestDictOfLists:
         db = DB(self.temp_path)
 
         task_dataset = db.create_dataset("tasks", id="uint32", title="U100")
-        TaskList = List.template(task_dataset, cache_size=10)
+        TaskList = List.template(task_dataset)
         user_tasks = db.create_dict("user_tasks", TaskList)
 
         # Create lists
@@ -314,7 +314,7 @@ class TestDictOfLists:
         task_dataset = db.create_dataset(
             "tasks", id="uint32", title="U100", priority="uint8"
         )
-        TaskList = List.template(task_dataset, cache_size=10)
+        TaskList = List.template(task_dataset)
         user_tasks = db.create_dict("user_tasks", TaskList)
 
         # Create and populate
@@ -333,7 +333,7 @@ class TestDictOfLists:
         user_tasks2 = db2._datastructures.get("user_tasks")
         if user_tasks2 is None:
             task_dataset2 = db2.get_dataset("tasks")
-            TaskList2 = List.template(task_dataset2, cache_size=10)
+            TaskList2 = List.template(task_dataset2)
             user_tasks2 = db2.create_dict("user_tasks", TaskList2)
 
         assert len(user_tasks2) == 2
@@ -353,7 +353,7 @@ class TestDictOfLists:
         db = DB(self.temp_path, header_size=1024 * 1024)
 
         task_dataset = db.create_dataset("tasks", id="uint32", title="U50")
-        TaskList = List.template(task_dataset, cache_size=0)
+        TaskList = List.template(task_dataset)
         user_tasks = db.create_dict("user_tasks", TaskList)
 
         # Create 50 lists
@@ -395,12 +395,12 @@ class TestCrossNestedCombined:
 
         # Create List of Dicts
         user_dataset = db.create_dataset("users", id="uint32", name="U50")
-        UserDict = Dict.template(user_dataset, cache_size=10)
+        UserDict = Dict.template(user_dataset)
         teams = db.create_list("teams", UserDict)
 
         # Create Dict of Lists
         task_dataset = db.create_dataset("tasks", id="uint32", title="U100")
-        TaskList = List.template(task_dataset, cache_size=10)
+        TaskList = List.template(task_dataset)
         user_tasks = db.create_dict("user_tasks", TaskList)
 
         # Populate List of Dicts
@@ -426,11 +426,11 @@ class TestCrossNestedCombined:
 
         # Create structures
         user_dataset = db.create_dataset("users", id="uint32", name="U50")
-        UserDict = Dict.template(user_dataset, cache_size=10)
+        UserDict = Dict.template(user_dataset)
         teams = db.create_list("teams", UserDict)
 
         task_dataset = db.create_dataset("tasks", id="uint32", title="U100")
-        TaskList = List.template(task_dataset, cache_size=10)
+        TaskList = List.template(task_dataset)
         user_tasks = db.create_dict("user_tasks", TaskList)
 
         # Populate
@@ -452,14 +452,14 @@ class TestCrossNestedCombined:
         teams2 = db2._datastructures.get("teams")
         if teams2 is None:
             user_dataset2 = db2.get_dataset("users")
-            UserDict2 = Dict.template(user_dataset2, cache_size=10)
+            UserDict2 = Dict.template(user_dataset2)
             teams2 = db2.create_list("teams", UserDict2)
 
         # Reload user_tasks
         user_tasks2 = db2._datastructures.get("user_tasks")
         if user_tasks2 is None:
             task_dataset2 = db2.get_dataset("tasks")
-            TaskList2 = List.template(task_dataset2, cache_size=10)
+            TaskList2 = List.template(task_dataset2)
             user_tasks2 = db2.create_dict("user_tasks", TaskList2)
 
         assert len(teams2) == 1

@@ -160,13 +160,23 @@ class NamespacedCache:
         cache_a.clear()          # only invalidates cache_a entries
     """
 
-    def __init__(self, shared: LRUCache, namespace: str):
+    def __init__(self, shared: LRUCache, namespace):
+        """namespace may be a string OR a zero-arg callable returning a string.
+
+        A callable is resolved on every access, so structures whose stable
+        identity is not known at construction time (e.g. a nested List whose
+        first block is allocated lazily) can return their persistent address
+        once it exists.  This is essential for correctness: Python reuses
+        id() after GC, so a fixed id()-based namespace would let a short-lived
+        re-materialised nested structure inherit a dead sibling's entries.
+        """
         self._shared = shared
         self._ns = namespace
         self._gen = 0
 
     def _k(self, key: Any):
-        return (self._ns, self._gen, key)
+        ns = self._ns() if callable(self._ns) else self._ns
+        return (ns, self._gen, key)
 
     def get(self, key: Any, default: Any = None) -> Any:
         return self._shared.get(self._k(key), default)

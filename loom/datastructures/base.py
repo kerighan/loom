@@ -199,35 +199,64 @@ class DataStructure(ABC):
         """
         return self._db.get_dataset(dataset_name)
 
-    def _make_cache(self, suffix: str, hint_size: int):
+    def _make_cache(self, suffix: str, hint_size: int = 0):
         """Create a cache for this structure.
 
-        If the DB has a shared cache, returns a NamespacedCache (shared
-        budget, one LRU for the whole DB).  Otherwise falls back to a
-        standalone LRUCache of hint_size — backward-compatible behaviour
-        when DB was created without cache_size.
+        Caching is governed SOLELY by the DB-level shared cache (one LRU for
+        the whole DB, sized by ``DB(cache_size=…)``).  If it exists, every
+        structure namespaces into it; otherwise nothing is cached.
+
+        There are no per-structure caches any more.  The old model gave each
+        structure its own standalone LRU — unworkable for a Graph, whose
+        thousands of inner adjacency dicts would each want a cache.  A single
+        shared budget bounds total RAM and lets hot structures claim their
+        share via LRU.  ``hint_size`` is accepted for backward compatibility
+        but ignored.
+
+        Caching addresses is always safe: records have stable absolute
+        addresses (arena redesign — no migration), so a cached value_addr
+        never goes stale.  This is what lets lookups skip the per-table scan.
 
         Args:
             suffix:    Short label appended to the namespace key,
                        e.g. "values", "nodes", "blocks".
-            hint_size: Desired standalone capacity (used only if no
-                       shared cache exists). 0 → NullCache.
+            hint_size: Ignored (legacy per-structure cache size).
         """
-        from loom.cache import LRUCache, NamespacedCache, NullCache
+        from loom.cache import NamespacedCache, NullCache
 
         shared = getattr(self._db, "_shared_cache", None)
-        if shared is not None:
-            if hint_size <= 0:
-                return NullCache()
-            # Use id(self) — unique per Python object, no collision
-            # even if two structures share the same name.
-            ns = f"{id(self)}:{suffix}"
-            return NamespacedCache(shared, ns)
-
-        # Standalone fallback (no shared cache configured)
-        if hint_size > 0:
-            return LRUCache(hint_size)
+        if shared is not None and self._should_cache():
+            # Namespace by a STABLE persistent identity, resolved lazily on
+            # every access (see NamespacedCache).  NOT by id(self): nested
+            # structures are re-materialised on every parent lookup and their
+            # ids get reused after GC, so an id()-based namespace would let a
+            # fresh nested structure read a dead sibling's cached entries —
+            # silent data corruption.
+            return NamespacedCache(shared, lambda: f"{self._cache_namespace()}:{suffix}")
         return NullCache()
+
+    def _should_cache(self):
+        """Whether this structure may use the shared cache.
+
+        Caching a value *address* across re-materialisations is always safe —
+        addresses are stable (arena redesign, no migration).  Caching mutable
+        *contents* (List blocks, BTree nodes) is only safe for a long-lived
+        top-level object: a nested List/BTree is re-materialised on every
+        parent lookup, so a cached block could be read back stale after a
+        sibling materialisation mutated it.  List/BTree therefore override
+        this to disable caching when nested; Dict (address cache) does not.
+        """
+        return True
+
+    def _cache_namespace(self):
+        """Stable, collision-free identity for this structure's cache entries.
+
+        Defaults to the (unique, persistent) structure name.  Nested
+        structures whose name is id-derived override this to return a stable
+        persistent address (e.g. first table address) so the namespace is the
+        same every time the structure is re-materialised.
+        """
+        return self.name
 
     def _auto_save_check(self):
         """Check if auto-save should trigger and save if needed.
@@ -275,7 +304,7 @@ class DataStructure(ABC):
             DataStructureTemplate instance
 
         Example:
-            UserList = List.template(user_dataset, cache_size=10)
+            UserList = List.template(user_dataset)
             teams = db.create_list('teams', UserList)
             eng = teams.append()  # Creates nested List
         """
@@ -325,8 +354,8 @@ class DataStructure(ABC):
 
         Example:
             return {
-                'cache_size': 'uint32',
                 'growth_factor': 'float64',
+                'p_init': 'uint32',
             }
         """
         return {}

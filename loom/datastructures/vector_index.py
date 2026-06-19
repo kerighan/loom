@@ -258,7 +258,7 @@ class FlatIndex(VectorIndex):
         from loom.datastructures.dict import Dict
         self._rev = Dict(
             f"_vidx_{self.name}_rev", self._db, addr_ds,
-            cache_size=2000, use_bloom=False, store_key=False,
+            use_bloom=False, store_key=False,
         )
 
         # Pre-allocate a block for the vectors + ids
@@ -561,7 +561,7 @@ class IVFIndex(VectorIndex):
         from loom.datastructures.dict import Dict
         self._rev = Dict(
             f"_vidx_{self.name}_rev", self._db, rev_ds,
-            cache_size=4000, use_bloom=False, store_key=False,
+            use_bloom=False, store_key=False,
         )
         self._make_cell_lists()
 

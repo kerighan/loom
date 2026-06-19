@@ -45,7 +45,7 @@ def benchmark_nested_dict_creation(num_inner_dicts=100, items_per_dict=100):
         )
         
         # Create template for nested dicts
-        UserDictTemplate = Dict.template(user_dataset, cache_size=100, use_bloom=False)
+        UserDictTemplate = Dict.template(user_dataset, use_bloom=False)
         
         # Create outer dict (dict of dicts)
         teams = db.create_dict("teams", UserDictTemplate, use_bloom=False)
@@ -100,7 +100,7 @@ def benchmark_nested_dict_creation(num_inner_dicts=100, items_per_dict=100):
         teams = db._datastructures.get("teams")
         if teams is None:
             user_dataset = db.get_dataset("users")
-            UserDictTemplate = Dict.template(user_dataset, cache_size=100, use_bloom=False)
+            UserDictTemplate = Dict.template(user_dataset, use_bloom=False)
             teams = db.create_dict("teams", UserDictTemplate, use_bloom=False)
         
         random.seed(42)
@@ -171,7 +171,7 @@ def benchmark_stress_test(num_inner_dicts=1000):
         db = DB(filename)
         
         user_dataset = db.create_dataset("users", id="uint32", name="U50")
-        UserDictTemplate = Dict.template(user_dataset, cache_size=0, use_bloom=False)
+        UserDictTemplate = Dict.template(user_dataset, use_bloom=False)
         departments = db.create_dict("departments", UserDictTemplate, use_bloom=False)
         
         start = time.time()

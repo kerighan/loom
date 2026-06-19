@@ -14,7 +14,6 @@ import json
 
 from loom.datastructures.base import DataStructure, write_op
 from loom.datastructures.template import DataStructureTemplate
-from loom.cache import LRUCache
 
 
 class List(DataStructure):
@@ -77,7 +76,6 @@ class List(DataStructure):
         """Schema for List config fields in references."""
         return {
             "growth_factor": "float64",
-            "cache_size": "uint32",
             "p_init": "uint32",
         }
 
@@ -161,17 +159,14 @@ class List(DataStructure):
             "bvc_13": "uint32",
             "bvc_14": "uint32",
             "bvc_15": "uint32",
-            # Config
-            "cache_size": "uint16",  # 2 bytes
         }
-        # Total: 1(valid) + 200 + 4 + 4 + 1 + 128 + 64 + 2 = 404 bytes
+        # Total: 1(valid) + 200 + 4 + 4 + 1 + 128 + 64 = 402 bytes
 
     def __init__(
         self,
         name,
         db,
         dataset_or_template,
-        cache_size=10,
         auto_save_interval=None,
         _parent=None,
     ):
@@ -181,11 +176,9 @@ class List(DataStructure):
             name: Unique name for this list
             db: Database instance
             dataset_or_template: Either a Dataset or DataStructureTemplate
-            cache_size: Number of blocks to cache (0 to disable)
             auto_save_interval: Save metadata every N operations
             _parent: Parent data structure if this is nested (internal use)
         """
-        self.cache_size = cache_size
         self._parent_key = None  # Key in parent dict (set by parent for Dict[List])
 
         # Detect if this is a nested list
@@ -219,7 +212,15 @@ class List(DataStructure):
             self._initialize()
 
         # Initialize block cache
-        self._block_cache = self._make_cache("blocks", cache_size)
+        self._block_cache = self._make_cache("blocks")
+
+    def _should_cache(self):
+        # The block cache stores mutable block *contents*.  A nested list is
+        # re-materialised on every parent lookup, so a cached block could be
+        # served stale after another materialisation mutated/compacted it.
+        # Only cache a long-lived top-level list.  (This matches the old
+        # behaviour, where nested lists were created with cache_size=0.)
+        return self._parent is None
 
     def _initialize(self):
         """Initialize new list."""
@@ -1229,7 +1230,6 @@ class List(DataStructure):
         return {
             "ref_dataset_name": self._items_dataset.name,
             "growth_factor": self.GROWTH_FACTOR,
-            "cache_size": self.cache_size,
             "p_init": self.P_INIT,
         }
 
@@ -1262,9 +1262,6 @@ class List(DataStructure):
                     if i < len(self.block_valid_counts)
                     else 0
                 )
-
-            # Config
-            ref["cache_size"] = self.cache_size
 
             return ref
         else:
@@ -1316,8 +1313,7 @@ class List(DataStructure):
             instance._is_nested = False  # This nested list stores data, not refs
             instance._template = None
             instance._shared_items_dataset = None
-            instance.cache_size = int(ref["cache_size"])
-            instance._block_cache = instance._make_cache("blocks", instance.cache_size)
+            instance._block_cache = instance._make_cache("blocks")
             instance._auto_save_interval = 0  # Don't auto-save nested lists
             instance._ops_since_save = 0
             instance._inline_metadata = None
@@ -1356,7 +1352,6 @@ class List(DataStructure):
                 ref["ds_name"],
                 db,
                 template,
-                cache_size=ref["cache_size"],
                 _parent="__nested__",
             )
         else:
@@ -1368,13 +1363,10 @@ class List(DataStructure):
                     ref["ds_name"],
                     db,
                     dataset,
-                    cache_size=ref["cache_size"],
                     _parent="__nested__",
                 )
             else:
-                instance.__init__(
-                    ref["ds_name"], db, dataset, cache_size=ref["cache_size"]
-                )
+                instance.__init__(ref["ds_name"], db, dataset)
 
         return instance
 
@@ -1427,11 +1419,11 @@ class List(DataStructure):
     # ---- Registry protocol ----
 
     def _get_registry_params(self):
-        return {"schema": self.item_schema, "cache_size": self.cache_size}
+        return {"schema": self.item_schema}
 
     @classmethod
     def _from_registry_params(cls, name, db, params):
-        return cls(name, db, params["schema"], params.get("cache_size", 10))
+        return cls(name, db, params["schema"])
 
     def __repr__(self):
         """String representation."""

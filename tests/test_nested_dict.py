@@ -30,7 +30,7 @@ class TestNestedDict:
         user_dataset = db.create_dataset("users", id="uint32", name="U50", score="float32")
         
         # Create template for nested dicts
-        UserDict = Dict.template(user_dataset, cache_size=10)
+        UserDict = Dict.template(user_dataset)
         
         # Create outer dict (dict of dicts)
         teams = db.create_dict("teams", UserDict)
@@ -45,7 +45,7 @@ class TestNestedDict:
         db = DB(self.temp_path)
         
         user_dataset = db.create_dataset("users", id="uint32", name="U50", score="float32")
-        UserDict = Dict.template(user_dataset, cache_size=10)
+        UserDict = Dict.template(user_dataset)
         teams = db.create_dict("teams", UserDict)
         
         # Create nested dict by accessing key
@@ -66,7 +66,7 @@ class TestNestedDict:
         db = DB(self.temp_path)
         
         user_dataset = db.create_dataset("users", id="uint32", name="U50", score="float32")
-        UserDict = Dict.template(user_dataset, cache_size=10)
+        UserDict = Dict.template(user_dataset)
         teams = db.create_dict("teams", UserDict)
         
         # Create and populate nested dict
@@ -87,7 +87,7 @@ class TestNestedDict:
         if teams2 is None:
             # Fallback: recreate with same params (will load from metadata)
             user_dataset2 = db2.get_dataset("users")
-            UserDict2 = Dict.template(user_dataset2, cache_size=10)
+            UserDict2 = Dict.template(user_dataset2)
             teams2 = db2.create_dict("teams", UserDict2)
         
         assert len(teams2) == 2
@@ -107,7 +107,7 @@ class TestNestedDict:
         db = DB(self.temp_path, header_size=1024*1024)  # 1MB header
         
         user_dataset = db.create_dataset("users", id="uint32", name="U50")
-        UserDict = Dict.template(user_dataset, cache_size=0)
+        UserDict = Dict.template(user_dataset)
         departments = db.create_dict("departments", UserDict)
         
         # Create 100 nested dicts
@@ -130,7 +130,7 @@ class TestNestedDict:
         db = DB(self.temp_path)
         
         user_dataset = db.create_dataset("users", id="uint32", name="U50")
-        UserDict = Dict.template(user_dataset, cache_size=10)
+        UserDict = Dict.template(user_dataset)
         teams = db.create_dict("teams", UserDict)
         
         # Create nested dicts

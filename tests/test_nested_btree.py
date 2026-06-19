@@ -30,7 +30,7 @@ class TestDictOfBtrees:
         db = DB(self.temp_path)
 
         user_dataset = db.create_dataset("users", id="uint32", name="U50")
-        UserBTree = BTree.template(user_dataset, cache_size=10)
+        UserBTree = BTree.template(user_dataset)
 
         teams = db.create_dict("teams", UserBTree)
 
@@ -47,7 +47,7 @@ class TestDictOfBtrees:
         db = DB(self.temp_path)
 
         user_dataset = db.create_dataset("users", id="uint32", name="U50")
-        UserBTree = BTree.template(user_dataset, cache_size=10)
+        UserBTree = BTree.template(user_dataset)
         teams = db.create_dict("teams", UserBTree)
 
         eng = teams["engineering"]
@@ -77,7 +77,7 @@ class TestBtreeOfDicts:
         db = DB(self.temp_path, header_size=1024 * 1024)
 
         user_dataset = db.create_dataset("users", id="uint32", name="U50")
-        UserDict = Dict.template(user_dataset, cache_size=10)
+        UserDict = Dict.template(user_dataset)
 
         teams = db.create_btree("teams", UserDict)
 
@@ -99,7 +99,7 @@ class TestBtreeOfDicts:
         db = DB(self.temp_path, header_size=1024 * 1024)
 
         user_dataset = db.create_dataset("users", id="uint32", name="U50")
-        UserDict = Dict.template(user_dataset, cache_size=10)
+        UserDict = Dict.template(user_dataset)
         teams = db.create_btree("teams", UserDict)
 
         eng = teams["engineering"]

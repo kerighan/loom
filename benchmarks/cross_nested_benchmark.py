@@ -45,7 +45,7 @@ def benchmark_list_of_dicts(num_dicts=100, items_per_dict=100):
         )
 
         # Create template for nested dicts
-        UserDictTemplate = Dict.template(user_dataset, cache_size=100, use_bloom=False)
+        UserDictTemplate = Dict.template(user_dataset, use_bloom=False)
 
         # Create list of dicts
         teams = db.create_list("teams", UserDictTemplate)
@@ -105,7 +105,7 @@ def benchmark_list_of_dicts(num_dicts=100, items_per_dict=100):
         if teams is None:
             user_dataset = db.get_dataset("users")
             UserDictTemplate = Dict.template(
-                user_dataset, cache_size=100, use_bloom=False
+                user_dataset, use_bloom=False
             )
             teams = db.create_list("teams", UserDictTemplate)
 
@@ -184,7 +184,7 @@ def benchmark_dict_of_lists(num_lists=100, items_per_list=100):
         )
 
         # Create template for nested lists
-        TaskListTemplate = List.template(task_dataset, cache_size=10)
+        TaskListTemplate = List.template(task_dataset)
 
         # Create dict of lists
         user_tasks = db.create_dict("user_tasks", TaskListTemplate, use_bloom=False)
@@ -242,7 +242,7 @@ def benchmark_dict_of_lists(num_lists=100, items_per_list=100):
         user_tasks = db._datastructures.get("user_tasks")
         if user_tasks is None:
             task_dataset = db.get_dataset("tasks")
-            TaskListTemplate = List.template(task_dataset, cache_size=10)
+            TaskListTemplate = List.template(task_dataset)
             user_tasks = db.create_dict("user_tasks", TaskListTemplate, use_bloom=False)
 
         random.seed(42)
@@ -313,7 +313,7 @@ def benchmark_stress_test(num_structures=200):
         # Test List[Dict]
         print(f"\n--- List[Dict] Stress Test ---")
         user_dataset = db.create_dataset("users", id="uint32", name="U50")
-        UserDictTemplate = Dict.template(user_dataset, cache_size=0, use_bloom=False)
+        UserDictTemplate = Dict.template(user_dataset, use_bloom=False)
         teams = db.create_list("teams", UserDictTemplate)
 
         start = time.time()
@@ -332,7 +332,7 @@ def benchmark_stress_test(num_structures=200):
         # Test Dict[List]
         print(f"\n--- Dict[List] Stress Test ---")
         task_dataset = db.create_dataset("tasks", id="uint32", title="U50")
-        TaskListTemplate = List.template(task_dataset, cache_size=0)
+        TaskListTemplate = List.template(task_dataset)
         user_tasks = db.create_dict("user_tasks", TaskListTemplate, use_bloom=False)
 
         start = time.time()
