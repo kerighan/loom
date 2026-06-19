@@ -67,9 +67,12 @@ def main():
         idx = db.create_search_index("news", scoring="bm25")
 
         # ── build ────────────────────────────────────────────────────────────
+        # add() buffers in memory; flush() materialises the postings blobs.
+        # Both are part of the build cost.
         t = time.time()
         for d in docs:
             idx.add(d)
+        idx.flush()
         build_dt = time.time() - t
         db.flush()
 
