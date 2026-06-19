@@ -169,6 +169,40 @@ def Vec(*shape: int):
     return Annotated[list, _VecMeta]
 
 
+def Utf8(max_bytes: int):
+    """Fixed-width UTF-8 string field (→ 'utf8[N]', stored inline as N bytes).
+
+    The space-efficient middle ground between `FixedStr(N)`/`U{N}` (numpy
+    UCS-4, a fixed **4 bytes per character**) and plain `str` (variable-length
+    BlobStore, with indirection): a `utf8` field is stored inline like U{N}
+    — reads are a single mmap slice, no BlobStore hop — but encoded as UTF-8,
+    so ASCII text costs ~1 byte/char (~4× smaller than U{N}).
+
+    IMPORTANT: `max_bytes` is a **byte** budget, not a character count.
+    ASCII fits `max_bytes` characters; accented/CJK text fits fewer.
+    Over-long values are truncated on a UTF-8 codepoint boundary (never
+    splitting a character), matching U{N}'s truncate-on-overflow behaviour.
+
+    Example:
+        from loom.schema import Utf8
+
+        class Page(BaseModel):
+            url:   Utf8(200)    # ASCII URLs: 200 B inline vs 800 B for U200
+            title: str          # long/unicode → text (BlobStore)
+
+    Lexicographic ordering is preserved (UTF-8 sorts in code-point order),
+    so a utf8 field is safe as a BTree key.
+    """
+    from typing import Annotated
+
+    tag = f"utf8[{max_bytes}]"
+
+    class _Utf8Meta:
+        loom_dtype = tag
+
+    return Annotated[str, _Utf8Meta]
+
+
 def FixedStr(max_length: int):
     """Shorthand for a fixed-length string field (→ U{max_length}).
 

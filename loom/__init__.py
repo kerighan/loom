@@ -12,7 +12,7 @@ from loom.client import (
 )
 from loom.dataset import Dataset
 from loom.datastructures import List, BloomFilter, CountingBloomFilter
-from loom.schema import dt_key, key_dt, dt_key_size, FixedStr, Vec, schema_from_model
+from loom.schema import dt_key, key_dt, dt_key_size, FixedStr, Utf8, Vec, schema_from_model
 from loom.errors import (
     LoomError,
     DatabaseError,
@@ -64,6 +64,7 @@ __all__ = [
     "key_dt",
     "dt_key_size",
     "FixedStr",
+    "Utf8",
     "Vec",
     "schema_from_model",
 ]

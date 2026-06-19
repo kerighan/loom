@@ -101,11 +101,16 @@ class Dataset:
         # Track special variable-length fields
         self._blob_fields = set()   # raw bytes via BlobStore
         self._text_fields = set()   # UTF-8 strings via BlobStore (transparent)
+        # Fixed-width UTF-8 string fields: field_name → byte budget N.
+        # Stored inline as numpy S{N} (raw bytes), encoded/decoded transparently
+        # — ~4× smaller than U{N} (UCS-4, 4 bytes/char) for ASCII, with no
+        # BlobStore indirection.  N is a BYTE budget, not a char count.
+        self._utf8_fields = {}
 
         # Track array (vector) fields for proper serialization
         self._array_fields = {}   # field_name → shape tuple
 
-        # Convert dtype strings, handling "blob", "text", and "float32[N]" array notation
+        # Convert dtype strings, handling "blob", "text", "utf8[N]", and "float32[N]"
         processed_schema = []
         for field, dtype in schema.items():
             if dtype == "blob":
@@ -114,6 +119,10 @@ class Dataset:
             elif dtype == "text":
                 self._text_fields.add(field)
                 processed_schema.append((field, BLOB_DTYPE))
+            elif isinstance(dtype, str) and dtype.startswith("utf8[") and dtype.endswith("]"):
+                n = int(dtype[5:-1])
+                self._utf8_fields[field] = n
+                processed_schema.append((field, np.dtype(f"S{n}")))
             else:
                 np_dtype = parse_dtype(dtype)
                 if np_dtype.shape:
@@ -132,6 +141,18 @@ class Dataset:
         # Pre-built zero record for fast bulk-init (one write instead of N)
         self._zero_record = self._serialize_zero()
 
+    @staticmethod
+    def _utf8_pack(value, n):
+        """Encode a str to at most n UTF-8 bytes, truncating on a codepoint
+        boundary (never splits a multi-byte char → always valid UTF-8)."""
+        if value is None:
+            return b""
+        enc = value.encode("utf-8") if isinstance(value, str) else bytes(value)
+        if len(enc) > n:
+            # decode(errors="ignore") drops the trailing partial sequence
+            enc = enc[:n].decode("utf-8", "ignore").encode("utf-8")
+        return enc
+
     def _serialize_zero(self):
         """Return a zero/empty record as bytes (for bulk block init)."""
         values = [self.identifier]
@@ -139,6 +160,8 @@ class Dataset:
             dtype = self.user_schema.fields[field][0]
             if field in self._text_fields or field in self._blob_fields:
                 values.append((0, 0))
+            elif field in self._utf8_fields:
+                values.append(b"")
             elif dtype.kind == "U":
                 values.append("")
             else:
@@ -183,6 +206,8 @@ class Dataset:
                     if value is not None:
                         arr[field]["offset"] = value[0]
                         arr[field]["n_slots"] = value[1]
+                elif field in self._utf8_fields:
+                    arr[field] = self._utf8_pack(value, self._utf8_fields[field])
                 elif field in self._array_fields:
                     # numpy array field — assign directly
                     arr[field] = np.asarray(value, dtype=self.user_schema.fields[field][0].base)
@@ -220,6 +245,8 @@ class Dataset:
                     result[field] = None  # Null blob
                 else:
                     result[field] = (offset, n_slots)
+            elif field in self._utf8_fields:
+                result[field] = bytes(value).rstrip(b"\x00").decode("utf-8")
             elif field in self._array_fields:
                 # Return a writable numpy array copy (not a mmap view)
                 result[field] = np.array(value)
@@ -315,6 +342,8 @@ class Dataset:
                         offset = int(value["offset"])
                         n_slots = int(value["n_slots"])
                         d[field] = None if (offset == 0 and n_slots == 0) else (offset, n_slots)
+                    elif field in self._utf8_fields:
+                        d[field] = bytes(rec[field]).rstrip(b"\x00").decode("utf-8")
                     else:
                         d[field] = rec[field]
                 if prefix == -self.identifier:
@@ -380,6 +409,13 @@ class Dataset:
             self.db.write(address + field_offset, new_ref.tobytes())
             return
 
+        if field_name in self._utf8_fields:
+            field_dtype = self.user_schema.fields[field_name][0]
+            packed = self._utf8_pack(value, self._utf8_fields[field_name])
+            data = np.array([packed], dtype=field_dtype).tobytes()
+            self.db.write(address + field_offset, data)
+            return
+
         # Standard field update
         field_dtype = self.user_schema.fields[field_name][0]
         data = np.array([value], dtype=field_dtype).tobytes()
@@ -410,7 +446,10 @@ class Dataset:
 
         # Read field data
         data = self.db.read(address + field_offset, field_size)
-        return np.frombuffer(data, dtype=field_dtype)[0]
+        value = np.frombuffer(data, dtype=field_dtype)[0]
+        if field_name in self._utf8_fields:
+            return bytes(value).rstrip(b"\x00").decode("utf-8")
+        return value
 
     def exists(self, address):
         """Check if a valid record exists at address.

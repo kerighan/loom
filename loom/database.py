@@ -324,6 +324,8 @@ class DB:
             return "text"
         if field_name in dataset._blob_fields:
             return "blob"
+        if field_name in getattr(dataset, "_utf8_fields", {}):
+            return f"utf8[{dataset._utf8_fields[field_name]}]"
         dtype = dataset.user_schema.fields[field_name][0]
         return dtype_to_str(dtype)
 
@@ -765,6 +767,8 @@ class DB:
         hash_keys=False,
         hash_bits=128,
         store_key=True,
+        max_key_len=100,
+        key_dtype=None,
     ):
         """Create a persistent Dict.
 
@@ -772,6 +776,12 @@ class DB:
             name: Unique name for this dict
             dataset_or_template: Dataset (for regular dict) or DataStructureTemplate (for nested dict)
             use_bloom: Whether to use bloom filters for acceleration
+            max_key_len: Byte budget for the stored key (used for iteration
+                recovery via keys()/items()).  Default 100.  Smaller = smaller
+                value records when keys are short.
+            key_dtype: How the recovered key is stored. Default None →
+                "utf8[max_key_len]" (inline UTF-8, ~4× smaller than UCS-4 for
+                ASCII). Pass "U{N}" for fixed UCS-4 or "text" for unbounded.
 
         Returns:
             Dict instance
@@ -808,6 +818,8 @@ class DB:
             hash_keys=hash_keys,
             hash_bits=hash_bits,
             store_key=store_key,
+            max_key_len=max_key_len,
+            key_dtype=key_dtype,
         )
         self._datastructures[name] = dct  # Register for caching and auto-save
         self._save_datastructures_registry()  # Persist registry

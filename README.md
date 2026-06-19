@@ -49,21 +49,22 @@ Define your record schema as a Pydantic model. loom maps types automatically:
 | `float` | `float64` | |
 | `bool` | `bool` | |
 | `str` | `text` | Variable-length, compressed via BlobStore |
-| `str = Field(max_length=N)` | `U{N}` | Fixed-length numpy unicode, faster reads |
-| `FixedStr(N)` | `U{N}` | loom shorthand |
+| `Utf8(N)` | `utf8[N]` | **Fixed-width inline UTF-8, N bytes** — ~4× smaller than `U{N}` for ASCII, same read speed |
+| `str = Field(max_length=N)` | `U{N}` | Fixed-length numpy UCS-4 (4 bytes/char) |
+| `FixedStr(N)` | `U{N}` | loom shorthand for the above |
 
 ```python
 from pydantic import BaseModel, Field
-from loom.schema import FixedStr
+from loom.schema import FixedStr, Utf8
 
 class Message(BaseModel):
     id:      int
-    role:    str = Field(max_length=20)  # → U20, fast key
-    content: str                          # → text, variable-length
+    role:    Utf8(20)   # → utf8[20], 20 B inline, fast key
+    content: str        # → text, variable-length
 
 class Product(BaseModel):
-    sku:    FixedStr(20)   # → U20
-    name:   str            # → text
+    sku:    Utf8(20)    # → utf8[20]
+    name:   str         # → text
     price:  float
     stock:  int
 ```
@@ -71,10 +72,10 @@ class Product(BaseModel):
 You can also pass plain dicts:
 
 ```python
-db.create_dataset("events", id="uint32", ts="int64", kind="U20")
+db.create_dataset("events", id="uint32", ts="int64", kind="utf8[20]")
 ```
 
-**Rule of thumb:** use `Field(max_length=N)` or `FixedStr(N)` for short fields used as keys or in frequent filters. Use plain `str` (→ `text`) for anything that can be long or variable — body text, descriptions, JSON payloads, etc.
+**Rule of thumb:** use `Utf8(N)` for short bounded strings used as keys or in frequent filters (inline, compact, fast) — it's ~4× smaller than `U{N}` for ASCII. Use plain `str` (→ `text`) for anything long or variable — body text, descriptions, JSON payloads. Reach for `U{N}`/`FixedStr(N)` only when you specifically need fixed UCS-4.
 
 ### The DB object
 
@@ -637,7 +638,10 @@ Bottom line: use a `Dict` for pure point access, a `BTree` when you need orderin
 
 - `blob_compression=None` (**default**) — fastest writes, larger files.
 - `"brotli"` — 3–5× compression on natural language, but ~20× slower inserts; pick when storage > write throughput.
-- `Field(max_length=N)` — keeps the field in the fixed record, no BlobStore at all.
+- `Field(max_length=N)` → `U{N}` — keeps the field in the fixed record (UCS-4, **4 bytes/char**), no BlobStore.
+- `Utf8(N)` → `utf8[N]` — fixed-width **inline UTF-8**: N bytes in the record, no BlobStore hop, so ~**4× smaller than `U{N}`** for ASCII at the same read speed. `N` is a byte budget (over-long values truncate on a codepoint boundary). The sweet spot for short ASCII-ish strings — ids, URLs, codes, enums.
+
+**Choosing a string field**: `Utf8(N)` for bounded ASCII-ish values you read a lot (inline, compact, fast); `str`/`text` for long or unbounded natural language (BlobStore, compressible); `U{N}`/`FixedStr(N)` only when you specifically need fixed UCS-4. loom stores Dict/Graph **keys** (`_key`) as `utf8` by default for exactly this reason.
 
 ### Graph — FB15k knowledge graph (reference benchmark)
 
@@ -688,12 +692,14 @@ Query engine (Cypher):
 The label index (`nodes_with_label`, used to seed `(a:Type)…` queries) builds
 in ~110 ms for 15k nodes and then serves ~36 000 lookups/s. Reopen is ~1 ms.
 
-On-disk: **~600 bytes/edge** (277 MB for 483k edges, double-indexed `_out` +
-`_in`). What's left is mostly the live edge records (each direction stores the
-edge once) plus the per-source nested hash tables; the node-id strings are a
-minor part. Graphs with few nodes benefit even more from the small default
-values-block (see note) — a sparse graph that used to be ~3× this size is now
-close to its live data.
+On-disk: **~277 bytes/edge** (127 MB for 483k edges, double-indexed `_out` +
+`_in`). Storing the adjacency key (`_key`, the destination/source node id) as
+inline `utf8` instead of UCS-4 `U{N}` roughly halved this (277 → 127 MB) at no
+read cost — node ids are short ASCII, so 1 byte/char instead of 4. What's left
+is mostly the live edge records (each direction stores the edge once) plus the
+per-source nested hash tables. Graphs with few nodes benefit even more from the
+small default values-block (see note) — a sparse graph that used to be several×
+this size is now close to its live data.
 
 > **Node ids are the adjacency key — pick stable ids.** Edges are keyed by node
 > id, so there is no `rename`: changing a node's id would orphan its edges.

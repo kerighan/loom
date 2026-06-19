@@ -66,8 +66,11 @@ class Dict(DataStructure):
                 "name": f"_{parent_name}_shared_values",
                 # Inject _key so nested-Dict iteration can recover the
                 # original key string.  Hash-table slots are binary and
-                # don't carry the key any more.
-                "schema": {"_key": f"U{key_size}", **inner_schema},
+                # don't carry the key any more.  Stored as fixed-width UTF-8
+                # (utf8[N] = N bytes inline) instead of U{N} (UCS-4, 4×N
+                # bytes) — keys are almost always ASCII ids, so this is ~4×
+                # smaller on disk with identical capacity.
+                "schema": {"_key": f"utf8[{key_size}]", **inner_schema},
             },
         }
 
@@ -130,14 +133,20 @@ class Dict(DataStructure):
         hash_keys=False,  # legacy hex-key mode, kept for compat
         hash_bits=128,  # used only when hash_keys=True (legacy)
         store_key=True,  # inject _key into values dataset for iteration
-        key_dtype=None,  # dtype for _key field: "U{N}" or "text"
-        max_key_len=100,  # used when key_dtype is None → auto "U{max_key_len}"
+        key_dtype=None,  # dtype for _key field: "utf8[N]" (default) | "U{N}" | "text"
+        max_key_len=100,  # used when key_dtype is None → auto "utf8[max_key_len]"
         _parent=None,
     ):
         self._store_key = store_key
         self._hash_keys = hash_keys  # legacy
         self._hash_bits = hash_bits  # legacy
-        self._key_dtype = key_dtype or (f"U{max_key_len}" if store_key else None)
+        # Store the iteration-recovery _key as fixed-width UTF-8 (utf8[N] = N
+        # bytes inline) rather than U{N} (UCS-4, 4×N bytes).  ASCII keys/ids —
+        # the overwhelmingly common case — cost 1 byte/char, so this is ~4×
+        # smaller on disk with the same capacity.  (N is a byte budget: a key
+        # longer than N UTF-8 bytes is truncated on a codepoint boundary, the
+        # same lossy behaviour U{N} already had for over-long keys.)
+        self._key_dtype = key_dtype or (f"utf8[{max_key_len}]" if store_key else None)
         self._max_key_len = max_key_len
         self._hash_key_fn = None  # legacy hex mode only
         self._key_size = 0  # no longer used for slot sizing
@@ -1610,7 +1619,7 @@ class Dict(DataStructure):
         ds = self._values_dataset
         rs = ds.record_size
         names = ds.user_schema.names
-        has_variable = bool(ds._text_fields or ds._blob_fields)
+        has_variable = bool(ds._text_fields or ds._blob_fields or ds._utf8_fields)
 
         # 2) Sort by address and walk contiguous runs — one mmap slice per run.
         # Values are bump-allocated into geometric arenas (and set_batch puts a
@@ -1651,6 +1660,8 @@ class Dict(DataStructure):
                         else:
                             d[field] = None
                             pending_blobs.append((off, key, field, False))
+                    elif field in ds._utf8_fields:
+                        d[field] = bytes(rec[field]).rstrip(b"\x00").decode("utf-8")
                     else:
                         d[field] = rec[field]
                 result[key] = d

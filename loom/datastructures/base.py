@@ -330,6 +330,8 @@ class DataStructure(ABC):
                     result[name] = "text"
                 elif hasattr(ds, "_blob_fields") and name in ds._blob_fields:
                     result[name] = "blob"
+                elif name in getattr(ds, "_utf8_fields", {}):
+                    result[name] = f"utf8[{ds._utf8_fields[name]}]"
                 else:
                     raw = ds.user_schema.fields[name][0]
                     # _DummySchema stores plain strings, real Dataset stores np.dtype
