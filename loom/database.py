@@ -960,6 +960,9 @@ class DB:
         ignore_accent=True,
         ignore_punctuation=True,
         doc_id_dtype="uint32",
+        scoring="boolean",
+        bm25_k1=1.5,
+        bm25_b=0.75,
     ):
         """Create or reopen a full-text SearchIndex (inverted index).
 
@@ -973,14 +976,20 @@ class DB:
             ignore_case / ignore_accent / ignore_punctuation: normalisation
                 applied identically at index and query time.
             doc_id_dtype: stored doc-id width ("uint32" = up to 4 G documents).
+            scoring: "boolean" (default, postings store only doc-ids) or "bm25"
+                (also store term frequencies + doc lengths to enable ranked
+                search). A "bm25" index still answers mode="boolean" queries.
+            bm25_k1, bm25_b: BM25 tuning parameters.
 
         Returns:
             SearchIndex instance.
 
         Example:
-            idx = db.create_search_index("docs", text_fields=["title", "body"])
+            idx = db.create_search_index("docs", text_fields=["title", "body"],
+                                         scoring="bm25")
             i = idx.add({"title": "Fast search", "body": "inverted index"})
-            idx.search("search AND NOT slow")   # → [{...}]
+            idx.search("search AND NOT slow")              # ranked (bm25)
+            idx.search("search", mode="boolean")           # unranked doc-ids/docs
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
@@ -999,6 +1008,9 @@ class DB:
             ignore_accent=ignore_accent,
             ignore_punctuation=ignore_punctuation,
             doc_id_dtype=doc_id_dtype,
+            scoring=scoring,
+            bm25_k1=bm25_k1,
+            bm25_b=bm25_b,
         )
         self._datastructures[name] = si
         self._save_datastructures_registry()
