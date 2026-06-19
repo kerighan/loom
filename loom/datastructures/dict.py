@@ -232,63 +232,26 @@ class Dict(DataStructure):
             self._value_freelist.append(addr)
 
     def _grow_values_block(self, min_cap=0):
-        """Allocate a larger values block, copy existing records, rewrite
-        slot ``value_addr``s to point into the new block.
+        """Start a NEW values arena — no copy, no migration.
 
-        Called from ``_alloc_value_addr`` when the current block is full.
-        Doubles the capacity (with a sane minimum) so growth is amortised
-        O(1) per insert; pass ``min_cap`` to size it for a known bulk insert.
+        Records already written keep their absolute address (the hash slots
+        store ``value_addr`` directly), so a "grow" just allocates a fresh
+        arena and bump-allocates from it; the previous arena keeps its live
+        records exactly where they are.  Arenas grow geometrically, so a dict
+        of N entries ends up with O(log N) contiguous arenas — and
+        ``to_dict()`` reads each one as a single mmap slice.
+
+        This replaces the old realloc-copy-migrate scheme, which on every
+        growth copied the whole block and rewrote every ``value_addr`` across
+        all hash tables (O(N) per growth) and left the old block as dead space.
+        ``min_cap`` lets a bulk insert (set_batch) get one arena sized to fit
+        the whole batch contiguously.
         """
-        old_addr = int(self.values_block_addr)
         old_cap = int(self.values_capacity)
-        record_size = int(self._values_dataset.record_size)
-
-        # Double capacity (minimum bump of 8 to avoid degenerate growth).
-        # `min_cap` lets a bulk insert jump straight to the size it needs in a
-        # single allocation instead of doubling N times (each doubling leaks
-        # its predecessor and bumps the file's high-water mark).
         new_cap = max(old_cap * self.GROWTH_FACTOR, old_cap + 8, int(min_cap))
-        new_addr = int(self._values_dataset.allocate_block(new_cap))
-
-        # Copy old block contents byte-for-byte (preserves prefix + payload).
-        if old_cap > 0:
-            old_bytes = self._values_dataset.db.read(old_addr, old_cap * record_size)
-            self._values_dataset.db.write(new_addr, old_bytes)
-
-        # Rewrite slot value_addrs to point into the new block.
-        # Each address moves by (new_addr - old_addr) for slots that were in
-        # the old range; out-of-range slots (e.g. Refs into a user dataset
-        # for non-nested mode) are left untouched.
-        delta = new_addr - old_addr
-        old_end = old_addr + old_cap * record_size
-        ht = self._hash_table
-        ht_record_size = ht.record_size
-        p_init = getattr(self, "_p_init", self.P_INIT)
-
-        import numpy as np
-
-        for p_idx, table_addr in enumerate(self.table_addrs):
-            cap = self._get_capacity(p_init + p_idx)
-            raw = ht.db.read(table_addr, cap * ht_record_size)
-            arr = np.frombuffer(raw, dtype=ht.schema).copy()
-            mask = (arr["_prefix"] == ht.identifier) & arr["valid"]
-            mask &= (arr["value_addr"] >= old_addr) & (arr["value_addr"] < old_end)
-            if mask.any():
-                # delta may be negative when the new block reuses a freed,
-                # lower-addressed slot — do the arithmetic signed, then store
-                # back as uint64 (a bare ``+= delta`` would up-cast to float).
-                arr["value_addr"][mask] = (
-                    arr["value_addr"][mask].astype(np.int64) + delta
-                ).astype(np.uint64)
-                ht.db.write(table_addr, arr.tobytes())
-
-        self.values_block_addr = new_addr
+        self.values_block_addr = int(self._values_dataset.allocate_block(new_cap))
         self.values_capacity = new_cap
-        # NB: the old block is intentionally not free()d here — the file-level
-        # freelist lives in the (bounded) header, and freeing many scattered
-        # blocks overflows it.  Growth is kept rare instead: a small initial
-        # capacity + bulk pre-sizing (set_batch) mean blocks are sized close to
-        # final in one shot, so the leaked predecessors are few and small.
+        self.next_data_offset = 0  # bump from the start of the fresh arena
 
     # ── Hash table schema helpers ─────────────────────────────────────────
 
@@ -834,12 +797,12 @@ class Dict(DataStructure):
             items: iterable of (key, value) pairs
         """
         items = list(items)
-        # Size the values block for the whole batch in one allocation so the
-        # per-item inserts below never trigger repeated doubling (each of which
-        # leaks its old block — the dominant source of graph on-disk waste).
-        needed = self.next_data_offset + len(items)
-        if needed > self.values_capacity:
-            self._grow_values_block(min_cap=needed)
+        # If the current arena can't hold the whole batch, open one fresh arena
+        # sized to fit it — so the batch lands contiguously (one mmap-slice run
+        # for to_dict) and the per-item inserts below never trigger growth.
+        n = len(items)
+        if self.values_capacity - self.next_data_offset < n:
+            self._grow_values_block(min_cap=n)
 
         self._defer_parent_update = True
         try:
@@ -1611,6 +1574,11 @@ class Dict(DataStructure):
         """
         import numpy as np
 
+        # Nested containers store nested-dict refs, not plain records — keep
+        # the simple per-entry path for them.
+        if self._is_nested:
+            return dict(self._iter_entries())
+
         # 1) Collect all (key, value_addr) from hash tables
         entries = []
         p_init = getattr(self, "_p_init", self.P_INIT)
@@ -1620,57 +1588,48 @@ class Dict(DataStructure):
             capacity = self._get_capacity(p)
             try:
                 for key, value_addr in self._read_table_entries(table_addr, capacity):
-                    entries.append((key, value_addr))
+                    entries.append((key, int(value_addr)))
             except Exception:
                 pass
 
         if not entries:
             return {}
 
-        # 2) Bulk-read the values block if all addresses are in it
-        record_size = self._values_dataset.record_size
-        block_start = self.values_block_addr
-        block_end = block_start + self.next_data_offset * record_size
+        ds = self._values_dataset
+        rs = ds.record_size
+        names = ds.user_schema.names
+        has_variable = bool(ds._text_fields or ds._blob_fields)
 
-        # Check if all value addrs fall in the contiguous block
-        all_contiguous = all(block_start <= addr < block_end for _, addr in entries)
-
-        if all_contiguous and self.next_data_offset > 0 and not self._is_nested:
-            # Single bulk read of the entire values block
-            total = self.next_data_offset * record_size
-            raw = self._values_dataset.db.read(block_start, total)
-            arr = np.frombuffer(raw, dtype=self._values_dataset.schema)
-
-            ds = self._values_dataset
-            has_variable = bool(ds._text_fields or ds._blob_fields)
-
-            if not has_variable:
-                # Pure fast path: all fields are fixed-size numpy, no blobs
-                result = {}
-                for key, addr in entries:
-                    idx = (addr - block_start) // record_size
-                    rec = arr[idx]
-                    result[key] = {f: rec[f] for f in ds.user_schema.names}
-                return result
-
-            # Pass 1 — extract fixed fields from numpy, collect blob refs
-            # pending_blobs: list of (file_offset, key, field_name, is_text)
-            #   sorted by file_offset in pass 2 for sequential I/O
-            result = {}
-            pending_blobs = []
-
-            for key, addr in entries:
-                idx = (addr - block_start) // record_size
-                rec = arr[idx]
+        # 2) Sort by address and walk contiguous runs — one mmap slice per run.
+        # Values are bump-allocated into geometric arenas (and set_batch puts a
+        # whole batch in one arena), so records are laid out in a handful of
+        # contiguous runs; a freed-then-reused slot is just a run of length 1.
+        entries.sort(key=lambda kv: kv[1])
+        result = {}
+        pending_blobs = []  # (file_offset, key, field, is_text) — read sorted in pass 2
+        i, total = 0, len(entries)
+        while i < total:
+            run_start = entries[i][1]
+            j = i + 1
+            while j < total and entries[j][1] == entries[j - 1][1] + rs:
+                j += 1
+            raw = ds.db.read(run_start, (j - i) * rs)
+            arr = np.frombuffer(raw, dtype=ds.schema)
+            for k in range(i, j):
+                key, addr = entries[k]
+                rec = arr[(addr - run_start) // rs]
+                if not has_variable:
+                    result[key] = {f: rec[f] for f in names}
+                    continue
                 d = {}
-                for field in ds.user_schema.names:
+                for field in names:
                     if field in ds._text_fields:
                         val = rec[field]
                         off, ns = int(val["offset"]), int(val["n_slots"])
                         if off == 0 and ns == 0:
                             d[field] = ""
                         else:
-                            d[field] = None  # placeholder
+                            d[field] = None
                             pending_blobs.append((off, key, field, True))
                     elif field in ds._blob_fields:
                         val = rec[field]
@@ -1678,26 +1637,21 @@ class Dict(DataStructure):
                         if off == 0 and ns == 0:
                             d[field] = None
                         else:
-                            d[field] = None  # placeholder
+                            d[field] = None
                             pending_blobs.append((off, key, field, False))
                     else:
                         d[field] = rec[field]
                 result[key] = d
+            i = j
 
-            # Pass 2 — resolve blobs in file-offset order (sequential I/O,
-            # better page-cache and TLB behaviour on large datasets)
-            if pending_blobs:
-                pending_blobs.sort(key=lambda x: x[0])
-                for off, key, field, is_text in pending_blobs:
-                    raw_blob = ds.blob_store.read(off)
-                    result[key][field] = (
-                        raw_blob.decode("utf-8") if is_text else raw_blob
-                    )
+        # 3) Resolve blobs in file-offset order (sequential I/O)
+        if pending_blobs:
+            pending_blobs.sort(key=lambda x: x[0])
+            for off, key, field, is_text in pending_blobs:
+                raw_blob = ds.blob_store.read(off)
+                result[key][field] = raw_blob.decode("utf-8") if is_text else raw_blob
 
-            return result
-
-        # 3) Fallback: individual reads (nested dicts, or scattered addresses)
-        return dict(self._iter_entries())
+        return result
 
     def __repr__(self):
         return f"Dict('{self.name}', size={self.size}, tables={self.p_last - self.P_INIT + 1})"
