@@ -453,7 +453,7 @@ class Graph(DataStructure):
             return True
 
         target_capacity = max(8, n_items * 2)
-        target_p = (target_capacity - 1).bit_length()
+        target_p = child._p_for_capacity(target_capacity)
         capacity = child._get_capacity(target_p)
         probe_range = min(child._get_probe_range(target_p), capacity)
         used_positions = set()

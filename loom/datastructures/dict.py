@@ -247,7 +247,7 @@ class Dict(DataStructure):
         # `min_cap` lets a bulk insert jump straight to the size it needs in a
         # single allocation instead of doubling N times (each doubling leaks
         # its predecessor and bumps the file's high-water mark).
-        new_cap = max(old_cap * 2, old_cap + 8, int(min_cap))
+        new_cap = max(old_cap * self.GROWTH_FACTOR, old_cap + 8, int(min_cap))
         new_addr = int(self._values_dataset.allocate_block(new_cap))
 
         # Copy old block contents byte-for-byte (preserves prefix + payload).
@@ -347,6 +347,19 @@ class Dict(DataStructure):
 
     def _get_capacity(self, p):
         return self.GROWTH_FACTOR**p
+
+    def _p_for_capacity(self, n):
+        """Smallest table level p (>=1) whose capacity g^p covers n entries.
+
+        Use this instead of ``(n).bit_length()`` (which hard-codes base 2):
+        capacities are ``GROWTH_FACTOR**p``, so the level must be computed in
+        base GROWTH_FACTOR or a non-2 factor silently over-allocates (g=3 gave
+        g^log2(n) = n^1.58 — 17× too big).
+        """
+        p = 1
+        while self._get_capacity(p) < n:
+            p += 1
+        return p
 
     def _get_probe_range(self, p):
         return int(round(p * self.PROBE_FACTOR * self.GROWTH_FACTOR))
