@@ -952,6 +952,58 @@ class DB:
         self._save_datastructures_registry()
         return g
 
+    def create_search_index(
+        self,
+        name,
+        text_fields=None,
+        ignore_case=True,
+        ignore_accent=True,
+        ignore_punctuation=True,
+        doc_id_dtype="uint32",
+    ):
+        """Create or reopen a full-text SearchIndex (inverted index).
+
+        Boolean queries (AND / OR / AND NOT, parentheses, `*` wildcards) are
+        parsed and evaluated by eldar (`pip install eldar`); loom stores the
+        postings. v1 is boolean retrieval only.
+
+        Args:
+            name: Unique name for this index.
+            text_fields: Document fields to index (None → all string fields).
+            ignore_case / ignore_accent / ignore_punctuation: normalisation
+                applied identically at index and query time.
+            doc_id_dtype: stored doc-id width ("uint32" = up to 4 G documents).
+
+        Returns:
+            SearchIndex instance.
+
+        Example:
+            idx = db.create_search_index("docs", text_fields=["title", "body"])
+            i = idx.add({"title": "Fast search", "body": "inverted index"})
+            idx.search("search AND NOT slow")   # → [{...}]
+        """
+        if not self._is_open:
+            raise DatabaseNotOpenError()
+        self._ensure_writable()
+
+        from loom.datastructures.search import SearchIndex
+
+        if name in self._datastructures:
+            return self._datastructures[name]
+
+        si = SearchIndex(
+            name,
+            self,
+            text_fields=text_fields,
+            ignore_case=ignore_case,
+            ignore_accent=ignore_accent,
+            ignore_punctuation=ignore_punctuation,
+            doc_id_dtype=doc_id_dtype,
+        )
+        self._datastructures[name] = si
+        self._save_datastructures_registry()
+        return si
+
     def create_queue(self, name, schema, block_size=64):
         """Create a persistent FIFO Queue.
 

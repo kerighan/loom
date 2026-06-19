@@ -2,6 +2,7 @@
 
 from loom.database import DB
 from loom.collection import Collection
+from loom.datastructures.search import SearchIndex
 from loom.client import (
     LoomClient,
     LoomClientError,
@@ -34,6 +35,7 @@ __version__ = "0.1.0"
 __all__ = [
     "DB",
     "Collection",
+    "SearchIndex",
     "Dataset",
     "List",
     "BloomFilter",
