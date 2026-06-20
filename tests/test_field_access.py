@@ -96,3 +96,57 @@ class TestFieldSet:
         d["bob"] = {"id": 2, "name": "Bob", "likes": 0, "bio": "", "tag": ""}
         d["alice", "likes"] = 7
         assert sorted(d.keys()) == ["alice", "bob"]   # _key untouched by field write
+
+
+class TestGetRef:
+    """Ref handles from Dict/List/BTree: cached-address reads/writes, with the
+    internal _key (Dict/BTree) and valid (List) fields hidden on get() and
+    preserved on a full set()."""
+
+    def test_dict_ref_get_hides_key_and_set_preserves_it(self, db):
+        d = _dict(db)
+        d["bob"] = {"id": 2, "name": "Bob", "likes": 0, "bio": "", "tag": ""}
+        r = d.get_ref("alice")
+        assert "_key" not in r.get()
+        assert r.get()["name"] == "Alice"
+        r["likes"] = r["likes"] + 5                # single field
+        r.update(name="Alicia")                    # partial
+        assert d["alice"]["likes"] == 10 and d["alice"]["name"] == "Alicia"
+        r.set({"id": 1, "name": "A2", "likes": 1, "bio": "x", "tag": "y"})  # full
+        assert d["alice"]["name"] == "A2"
+        assert sorted(d.keys()) == ["alice", "bob"]   # _key preserved through set()
+
+    def test_dict_ref_missing_raises(self, db):
+        d = _dict(db)
+        with pytest.raises(KeyError):
+            d.get_ref("nobody")
+
+    def test_list_ref_hides_valid(self, db):
+        ds = db.create_dataset("li", v="int64", tag="U10")
+        lst = db.create_list("l", ds)
+        lst.append({"v": 5, "tag": "a"})
+        r = lst.get_ref(0)
+        assert r.get() == {"v": 5, "tag": "a"}     # no 'valid'
+        r["v"] = r["v"] + 10
+        assert lst[0] == {"v": 15, "tag": "a"}
+
+    def test_btree_ref(self, db):
+        ds = db.create_dataset("bd", v="int64", name="U10")
+        bt = db.create_btree("bt", ds)
+        bt["k"] = {"v": 1, "name": "x"}
+        r = bt.get_ref("k")
+        assert "_key" not in r.get()
+        r["v"] = 42
+        assert bt["k"]["v"] == 42
+        assert list(bt.keys()) == ["k"]            # _key intact
+
+    def test_ref_survives_reopen(self, db):
+        d = _dict(db)
+        d.get_ref("alice").update(likes=77)
+        path = db.filename
+        db.close()
+        db2 = DB(path)
+        try:
+            assert db2._datastructures["d"]["alice"]["likes"] == 77
+        finally:
+            db2.close()

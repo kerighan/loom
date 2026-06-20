@@ -763,6 +763,29 @@ class List(DataStructure):
 
         return np.concatenate(arrays) if len(arrays) > 1 else arrays[0]
 
+    def get_ref(self, index):
+        """Return a Ref handle to the record at `index` (in-place reads/writes).
+
+            r = posts.get_ref(0)
+            r["likes"] += 1            # single-field update, no re-fetch
+            r.update(text="edited")    # partial update
+            r.get()                    # the record (without the 'valid' flag)
+        """
+        from loom.ref import Ref
+
+        if self._is_nested:
+            raise TypeError("get_ref is not supported on nested lists")
+        if index < 0:
+            index = self.valid_count + index
+        if index < 0 or index >= self.valid_count:
+            raise IndexError("list index out of range")
+        if self.length == self.valid_count:
+            block_idx, offset = self._calculate_block_and_offset(index)
+            item_addr = self.blocks[block_idx] + offset * self._items_dataset.record_size
+        else:
+            _block_idx, item_addr = self._find_nth_valid_item_address(index)
+        return Ref(self._items_dataset, item_addr)
+
     def __getitem__(self, index):
         """Get item(s) by index or slice.
 

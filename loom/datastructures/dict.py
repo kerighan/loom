@@ -1065,6 +1065,23 @@ class Dict(DataStructure):
             raise TypeError("d[key, field] field access is not supported on nested dicts")
         self._values_dataset.write_field(self._resolve_value_addr(key), field, value)
 
+    def get_ref(self, key):
+        """Return a Ref handle to the record stored at `key`.
+
+        The Ref caches the record's (stable) address, so repeated reads/writes
+        skip the key hash + slot scan:
+
+            r = users.get_ref("alice")
+            r["age"] = r["age"] + 1     # in-place single-field update
+            r.update(city="Paris")      # partial update (other fields kept)
+            r.set({...})                # full replace (the _key is preserved)
+            r.get()                     # the record (without the internal _key)
+
+        Raises KeyError if the key is absent."""
+        if self._is_nested:
+            raise TypeError("get_ref is not supported on nested dicts")
+        return Ref(self._values_dataset, self._resolve_value_addr(key))
+
     def _setitem_fast(self, key, value):
         """Fast path for non-atomic insert/update (current implementation)."""
         # Keep original string key for _key injection in values dataset

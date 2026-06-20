@@ -14,10 +14,27 @@ class Ref:
     dataset: Any
     addr: int
 
+    # Internal fields loom injects into value records: the Dict/BTree
+    # iteration key, and the List soft-delete flag.  A Ref hides them on read
+    # and preserves them on a full-record replace (dropping them would break
+    # keys()/items() or mark a live List item deleted).
+    _INTERNAL_FIELDS = ("_key", "valid")
+
     def get(self) -> TypingDict[str, Any]:
-        return self.dataset[self.addr]
+        rec = self.dataset[self.addr]
+        for f in self._INTERNAL_FIELDS:
+            rec.pop(f, None)
+        return rec
 
     def set(self, record: TypingDict[str, Any]) -> None:
+        names = getattr(getattr(self.dataset, "user_schema", None), "names", ())
+        preserved = {
+            f: self.dataset.read_field(self.addr, f)
+            for f in self._INTERNAL_FIELDS
+            if f in names and f not in record
+        }
+        if preserved:
+            record = {**preserved, **record}
         self.dataset[self.addr] = record
 
     def update(self, **fields: Any) -> None:
