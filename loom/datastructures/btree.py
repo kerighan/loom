@@ -178,7 +178,7 @@ class BTree(DataStructure):
             "num_keys": "uint16",
         }
         for i in range(cls.ORDER - 1):
-            node_schema[f"key_{i}"] = "U50"
+            node_schema[f"key_{i}"] = "utf8[50]"
         for i in range(cls.ORDER):
             node_schema[f"child_{i}"] = "uint64"
 
@@ -263,9 +263,12 @@ class BTree(DataStructure):
             "is_leaf": "bool",
             "num_keys": "uint16",
         }
-        # Add key slots
+        # Add key slots — fixed-width inline UTF-8 (utf8[N] = N bytes) instead
+        # of U{N} (UCS-4, 4×N bytes).  Keys are compared as decoded strings, so
+        # ordering is unchanged; this ~4× shrinks node records (disk + node
+        # cache).  N is a byte budget for the key.
         for i in range(self.ORDER - 1):
-            node_schema[f"key_{i}"] = f"U{self._key_size}"
+            node_schema[f"key_{i}"] = f"utf8[{self._key_size}]"
         # Add child/value address slots (ORDER for children, ORDER-1 for values)
         for i in range(self.ORDER):
             node_schema[f"child_{i}"] = "uint64"  # Child node address or value address
