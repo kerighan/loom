@@ -60,6 +60,14 @@ BLOB_DTYPE = np.dtype([("offset", "uint64"), ("n_slots", "uint16")])
 _NULL_BLOB = (0, 0)
 
 
+def _to_native(value):
+    """Convert a numpy scalar (np.int64/float64/bool_/str_) to its native
+    Python type on read, so records are clean Python dicts (JSON-serialisable,
+    `isinstance(_, int)` works).  Array/vector fields (np.ndarray) are NOT
+    numpy scalars and pass through unchanged."""
+    return value.item() if isinstance(value, np.generic) else value
+
+
 class Dataset:
     """A typed dataset with prefix-based identification.
 
@@ -251,7 +259,7 @@ class Dataset:
                 # Return a writable numpy array copy (not a mmap view)
                 result[field] = np.array(value)
             else:
-                result[field] = value
+                result[field] = _to_native(value)
         return result
 
     def write(self, address, **record):
@@ -345,7 +353,7 @@ class Dataset:
                     elif field in self._utf8_fields:
                         d[field] = bytes(rec[field]).rstrip(b"\x00").decode("utf-8")
                     else:
-                        d[field] = rec[field]
+                        d[field] = _to_native(rec[field])
                 if prefix == -self.identifier:
                     d["valid"] = False
                 results.append(d)
@@ -455,7 +463,7 @@ class Dataset:
         if field_name in self._blob_fields:
             off, ns = int(value["offset"]), int(value["n_slots"])
             return None if (off == 0 and ns == 0) else self.blob_store.read(off)
-        return value
+        return _to_native(value)
 
     def exists(self, address):
         """Check if a valid record exists at address.

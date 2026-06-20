@@ -5,6 +5,7 @@ import mmh3
 from loom.datastructures.base import DataStructure, write_op
 from loom.datastructures.template import DataStructureTemplate
 from loom.datastructures.counting_bloomfilter import CountingBloomFilter
+from loom.dataset import _to_native
 from loom.ref import Ref
 
 
@@ -1681,7 +1682,7 @@ class Dict(DataStructure):
                 key, addr = entries[k]
                 rec = arr[(addr - run_start) // rs]
                 if not has_variable:
-                    result[key] = {f: rec[f] for f in names}
+                    result[key] = {f: _to_native(rec[f]) for f in names}
                     continue
                 d = {}
                 for field in names:
@@ -1704,7 +1705,7 @@ class Dict(DataStructure):
                     elif field in ds._utf8_fields:
                         d[field] = bytes(rec[field]).rstrip(b"\x00").decode("utf-8")
                     else:
-                        d[field] = rec[field]
+                        d[field] = _to_native(rec[field])
                 result[key] = d
             i = j
 
