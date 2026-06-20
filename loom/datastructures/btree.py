@@ -1001,6 +1001,31 @@ class BTree(DataStructure):
             for i in range(node["num_keys"] + 1):
                 yield from self._inorder_entries(node["children"][i])
 
+    def _inorder_from(self, node_addr, start, start_inclusive):
+        """In-order entries with key >= start (or > start), pruning every
+        subtree entirely left of `start`.  Descends one path to the start leaf
+        — O(log n) — then yields the rest in order, so range/prefix are
+        O(log n + k) instead of scanning from the smallest key.
+
+        Relies on the B+tree layout: data lives in leaves; an internal node's
+        separator keys[i] is the first key of child[i+1], and child[i] holds
+        keys < keys[i]."""
+        node = self._read_node(node_addr)
+        nk = node["num_keys"]
+        if node["is_leaf"]:
+            for i in range(nk):
+                k = node["keys"][i]
+                if k > start or (start_inclusive and k == start):
+                    yield k, node["children"][i]
+            return
+        # First child whose subtree can hold keys >= start.
+        i = 0
+        while i < nk and node["keys"][i] <= start:
+            i += 1
+        yield from self._inorder_from(node["children"][i], start, start_inclusive)
+        for j in range(i + 1, nk + 1):
+            yield from self._inorder_entries(node["children"][j])
+
     def values(self):
         """Iterate over values in key-sorted order."""
         if self.root_addr == 0:
@@ -1079,17 +1104,16 @@ class BTree(DataStructure):
 
         start_inc, end_inc = inclusive
 
-        for key, value_addr in self._inorder_entries(self.root_addr):
-            # Check lower bound
-            if start is not None:
-                if start_inc:
-                    if key < start:
-                        continue
-                else:
-                    if key <= start:
-                        continue
+        # Seek straight to the start leaf (O(log n)) instead of scanning the
+        # whole tree from the smallest key.
+        if start is not None:
+            entries = self._inorder_from(self.root_addr, start, start_inc)
+        else:
+            entries = self._inorder_entries(self.root_addr)
 
-            # Check upper bound — can break early since keys are sorted
+        for key, value_addr in entries:
+            # Upper bound — break early since keys are sorted (start already
+            # handled by the seek).
             if end is not None:
                 if end_inc:
                     if key > end:
@@ -1122,7 +1146,8 @@ class BTree(DataStructure):
         if self.root_addr == 0:
             return
 
-        for key, value_addr in self._inorder_entries(self.root_addr):
+        # Seek to the first key >= prefix, then walk forward while it matches.
+        for key, value_addr in self._inorder_from(self.root_addr, prefix_str, True):
             if key.startswith(prefix_str):
                 value_data = self._values_dataset[value_addr]
                 if self._is_nested:
@@ -1135,7 +1160,7 @@ class BTree(DataStructure):
                     yield key, result
                 else:
                     yield key, value_data
-            elif key > prefix_str and not key.startswith(prefix_str):
+            elif key > prefix_str:
                 break
 
     # ========== Datetime helpers ==========
