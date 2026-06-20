@@ -190,10 +190,16 @@ class Collection:
                                 entries.append((key, {"pk": pk}))
                         struct.set_batch(entries)
                     else:  # BTree composite (range / many)
+                        entries = []
                         for record, pk in zip(records, pks):
                             key = self._index_key(ix, record, pk)
                             if key is not None:
-                                struct[key] = {"pk": pk}
+                                entries.append((key, {"pk": pk}))
+                        if struct.size == 0 and struct.root_addr == 0:
+                            struct.bulk_load(entries)        # fresh index: O(n) build
+                        else:
+                            for key, val in entries:
+                                struct[key] = val
         return pks
 
     def update(self, pk, **changes):

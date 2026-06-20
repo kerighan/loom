@@ -538,6 +538,72 @@ class BTree(DataStructure):
 
     # ========== Node Operations ==========
 
+    @staticmethod
+    def _bulk_chunk_sizes(n, maxsize):
+        """Split n items into evenly-sized chunks of at most `maxsize`, so no
+        chunk is tiny (keeps every node above the B-tree min-keys invariant)."""
+        nchunks = max(1, -(-n // maxsize))   # ceil(n / maxsize)
+        base, rem = divmod(n, nchunks)
+        return [base + (1 if i < rem else 0) for i in range(nchunks)]
+
+    def bulk_load(self, items):
+        """Build the tree bottom-up from (key, value) pairs — O(n), far faster
+        than N individual inserts, and the result is densely packed.
+
+        items: iterable of (key, value); values are written to the values
+        dataset (or, if a Ref, reused).  Only valid on an empty tree.
+        """
+        if self.root_addr != 0 or self.size != 0:
+            raise ValueError("bulk_load requires an empty BTree")
+        items = sorted(((str(k), v) for k, v in items), key=lambda kv: kv[0])
+        if not items:
+            return
+
+        # 1) write value records → (key, value_addr), in sorted-key order
+        leaves_in = []
+        for key, value in items:
+            if isinstance(value, Ref):
+                addr = int(value.addr)
+            else:
+                addr = self._allocate_value_addr()
+                self._values_dataset[addr] = value
+            leaves_in.append((key, addr))
+
+        # 2) pack leaves (≤ ORDER-1 keys), then build separator levels up
+        def build_level(entries, is_leaf):
+            out = []
+            pos = 0
+            maxsize = (self.ORDER - 1) if is_leaf else self.ORDER  # keys vs children
+            for size in self._bulk_chunk_sizes(len(entries), maxsize):
+                group = entries[pos:pos + size]
+                pos += size
+                addr = self._node_dataset.allocate_block(1)
+                if is_leaf:
+                    keys = [k for k, _ in group]
+                    children = [a for _, a in group]
+                else:
+                    # separators = first key of every child except the first
+                    keys = [fk for fk, _ in group[1:]]
+                    children = [a for _, a in group]
+                self._write_node({
+                    "addr": addr, "is_leaf": is_leaf,
+                    "num_keys": len(keys), "keys": keys, "children": children,
+                })
+                out.append((group[0][0], addr))   # (first_key, node_addr)
+            return out
+
+        level = build_level(leaves_in, is_leaf=True)
+        height = 1
+        while len(level) > 1:
+            level = build_level(level, is_leaf=False)
+            height += 1
+
+        self.root_addr = level[0][1]
+        self.height = height
+        self.size = len(items)
+        self._update_parent_ref()
+        self.save()
+
     def _create_node(self, is_leaf=True):
         """Create a new node and return its address."""
         # Allocate space for one node
