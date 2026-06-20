@@ -578,11 +578,11 @@ All numbers use the **default shared cache** (`DB(cache_size=200_000)`) — one 
 
 | Operation | **loom** | **SqliteDict** | Ratio |
 |---|---:|---:|---:|
-| Dict insert (per-call) | **24 000 ops/s** | 5 000 ops/s (autocommit) | loom **4.8×** |
-| Dict insert (batch) | **23 000 ops/s** | 23 000 ops/s (single `COMMIT`) | loom **1.0×** |
-| Dict read | **140 000 ops/s** | 10 700 ops/s | loom **13×** |
-| Dict contains | **906 000 ops/s** | 11 600 ops/s | loom **78×** |
-| Dict keys() | **183 000 ops/s** | 122 000 ops/s | loom **1.5×** |
+| Dict insert (per-call) | **21 000 ops/s** | 5 000 ops/s (autocommit) | loom **4.2×** |
+| Dict insert (batch) | **22 000 ops/s** | 22 000 ops/s (single `COMMIT`) | loom **1.0×** |
+| Dict read | **167 000 ops/s** | 11 900 ops/s | loom **14×** |
+| Dict contains | **624 000 ops/s** | 12 300 ops/s | loom **51×** |
+| Dict keys() | **263 000 ops/s** | 111 000 ops/s | loom **2.4×** |
 
 loom is faster on every line, including SQLite's most favourable mode (defer all writes to a single transaction). The gap is widest on point ops because loom uses lazy mmap flush — no `msync()` per write, just OS page-cache writeback — while SQLite has to walk a B-tree per call. `contains` benefits from binary murmur128 slots (25 bytes regardless of key length), which makes the inner loop a couple of integer compares.
 
@@ -592,19 +592,19 @@ Per-call inserts already run at batch speed in loom (the flush is already lazy),
 
 | Structure | Operation | ops/s | µs/op |
 |---|---|---:|---:|
-| Dict | insert | 24 000 | 42 |
-| Dict | read | 140 000 | 7 |
-| Dict | contains | 906 000 | 1 |
-| Dict | keys() | 183 000 | 5 |
-| Dict | items() | 91 000 | 11 |
-| List | append | 78 000 | 13 |
-| List | read[i] | 133 000 | 8 |
-| Queue | push (batch) | 136 000 | 7 |
-| Queue | pop | 186 000 | 5 |
-| BTree | insert | 12 000 | 85 |
-| BTree | read | 108 000 | 9 |
-| BTree | contains | 220 000 | 5 |
-| BTree | keys() [sorted] | 6 900 000 | 0 |
+| Dict | insert | 21 000 | 48 |
+| Dict | read | 167 000 | 6 |
+| Dict | contains | 624 000 | 2 |
+| Dict | keys() | 263 000 | 4 |
+| Dict | items() | 134 000 | 7 |
+| List | append | 91 000 | 11 |
+| List | read[i] | 190 000 | 5 |
+| Queue | push (batch) | 158 000 | 6 |
+| Queue | pop | 187 000 | 5 |
+| BTree | insert | 12 000 | 81 |
+| BTree | read | 104 000 | 10 |
+| BTree | contains | 175 000 | 6 |
+| BTree | keys() [sorted] | 6 160 000 | 0 |
 | Set | add | 27 000 | 37 |
 | Set | contains | 441 000 | 2 |
 | Set | remove | 25 000 | 40 |
@@ -618,11 +618,11 @@ Per-call inserts already run at batch speed in loom (the flush is already lazy),
 
 All rows use the default shared cache; Graph rows are the FB15k reference benchmark below. `contains`/`read` on Dict, Set and BTree are dominated by cache hits (key→address), so they assume a working set that fits the cache. `Set add`/`LRUDict set` track `Dict insert` because both wrap a Dict (Set adds a membership record; LRUDict adds eviction bookkeeping), so neither can be faster than the underlying insert.
 
-**Dict vs BTree — pick the right tool.** The B-tree relies on keeping its internal nodes hot. With the shared cache its random `read` (~108k/s) and `contains` (~220k/s) are strong, and `keys()` iterates already-sorted, mostly-cached nodes at millions/s; at `cache_size=0` the same `read` collapses (every node a cold mmap read). The Dict reaches similar read rates from the address cache and inserts ~2× faster. So:
+**Dict vs BTree — pick the right tool.** The B-tree relies on keeping its internal nodes hot. With the shared cache its random `read` (~104k/s) and `contains` (~175k/s) are strong, and `keys()` iterates already-sorted, mostly-cached nodes at millions/s; at `cache_size=0` the same `read` collapses (every node a cold mmap read). The Dict reaches higher read rates from the address cache and inserts ~2× faster. So:
 
-- **Insert**: Dict wins (~24k vs ~12k/s) — O(1) slot vs O(log n) node path.
+- **Insert**: Dict wins (~21k vs ~12k/s) — O(1) slot vs O(log n) node path. Building a fresh BTree from a batch, use `bulk_load()` (O(n) bottom-up, ~140k keys/s).
 - **Random read / contains**: comparable with a warm cache; the Dict is the simpler choice for pure point access.
-- **Ordered iteration / range / prefix**: BTree only — `keys()` comes out sorted and `range()`/`prefix()` walk a contiguous key span without scanning everything.
+- **Ordered iteration / range / prefix**: BTree only — `keys()` comes out sorted, and `range()`/`prefix()` seek to the start key then walk the span (O(log n + k)). A range of 101 keys takes ~364 µs (~2 700 ranges/s).
 
 Bottom line: use a `Dict` for pure point access, a `BTree` when you need ordering or range queries.
 
@@ -632,8 +632,8 @@ Bottom line: use a `Dict` for pure point access, a `BTree` when you need orderin
 
 | Schema | Compression | insert | read |
 |---|---|---:|---:|
-| Fixed fields only | — | 24 000 ops/s | 140 000 ops/s |
-| + `str` body (≈600 chars) | None (default) | 22 000 ops/s | 134 000 ops/s |
+| Fixed fields only | — | 21 000 ops/s | 167 000 ops/s |
+| + `str` body (≈600 chars) | None (default) | 22 000 ops/s | 167 000 ops/s |
 | + `str` body (≈600 chars) | brotli | 1 300 ops/s | 59 000 ops/s |
 
 - `blob_compression=None` (**default**) — fastest writes, larger files.
