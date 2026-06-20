@@ -1,7 +1,7 @@
 """Loom - A persistent database that feels like Python."""
 
 from loom.database import DB
-from loom.collection import Collection
+from loom.collection import Collection, Primary, Unique, Range, Many
 from loom.datastructures.search import SearchIndex
 from loom.client import (
     LoomClient,

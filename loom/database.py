@@ -1189,96 +1189,138 @@ class DB:
         self._save_datastructures_registry()
         return idx
 
-    def collection(self, name, model=None, key=None, indexes=None, key_size=64):
-        """Create or reopen a Collection: a record store with attached indexes.
+    def collection(self, name, model=None, indexes=None, key_size=64,
+                   index_key_size=192):
+        """Create or reopen a Collection: a record store with typed indexes.
 
-        The record lives once in a primary Dict (keyed by ``key``); each
-        attached index maps a field/derived value → the primary key and is
-        kept in sync on insert/update/delete.  Secondary lookups resolve
-        through the primary key, so there is no record duplication.
+        Each field's index *kind* is declared and mapped to the right loom
+        structure, kept in sync automatically.  Exactly one index must be the
+        ``primary`` (it stores the records and is the unique key).
 
         Args:
             name:    Unique collection name.
-            model:   Pydantic model or dict schema for the record.  Omit to
-                     reopen an existing collection from its persisted config.
-            key:     Primary-key field name (required when creating).
-            indexes: Attached indexes — either a list of field names
-                     ``["email", "phone"]`` or a dict ``{index_name:
-                     field_name_or_callable}``.  Field names are persisted and
-                     auto-restored on reopen; callables (computed keys) must be
-                     re-supplied each session.
-            key_size: Max length of the primary-key string (default 64).
+            model:   Pydantic model / dict schema / Dataset for the records.
+                     Omit to reopen an existing collection.
+            indexes: ``{field: kind}`` where kind is a string ("primary",
+                     "unique", "range", "many") or a spec object
+                     (``Unique()``, ``Range()``, ``Many(sort=..., desc=...)``).
+            key_size:       max primary-key length (default 64).
+            index_key_size: max composite-key length for range/many BTrees.
+
+        Kinds → structures: primary/unique → Dict; range/many → BTree.
 
         Example:
-            users = db.collection("users", User, key="username",
-                                  indexes={"email": "email"})
-            users.insert({"username": "alice", "email": "a@x.com"})
-            users["alice"]                  # primary lookup
-            users.get("email", "a@x.com")  # secondary lookup → record
+            from loom import Many
+            posts = db.collection("posts", Post, indexes={
+                "id":         "primary",
+                "username":   Many(sort="created_at", desc=True),
+                "engagement": "range",
+            })
+            posts.insert({"id": "p1", "username": "alice",
+                          "created_at": 170, "engagement": 9})
+            posts["p1"]                              # by id
+            posts.find("username", "alice", limit=20)   # user's recent posts
+            posts.range("engagement", 1000, None)       # engagement >= 1000
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
-        from loom.collection import Collection, _make_extractor
-
-        # Normalise indexes spec → {index_name: field_or_callable}
-        supplied = indexes or {}
-        if isinstance(supplied, (list, tuple)):
-            supplied = {f: f for f in supplied}
+        from loom.collection import Collection, Many, Range, Unique, Primary, _as_spec
 
         cfg_key = f"__collection__::{name}"
         cfg = self._db.get_header_field(cfg_key)
 
+        def _spec_from_cfg(ic):
+            k = ic["kind"]
+            if k == "unique":
+                return Unique()
+            if k == "range":
+                return Range()
+            if k == "many":
+                return Many(sort=ic.get("sort"), desc=ic.get("desc", False))
+            return Primary()
+
+        def _build_index_objs(cfg):
+            objs = {}
+            for field, ic in cfg["indexes"].items():
+                spec = _spec_from_cfg(ic)
+                sources = [field]
+                if spec.kind == "many" and spec.sort is not None:
+                    sources.append(spec.sort)
+                objs[field] = {
+                    "name": field, "spec": spec, "field": field,
+                    "struct": self._datastructures[ic["struct"]],
+                    "sources": sources,
+                }
+            return objs
+
         if model is None:
-            # ── Reopen from persisted config ────────────────────────────
+            # ── Reopen ──────────────────────────────────────────────────
             if not cfg:
                 raise StructureNotFoundError(name)
-            dataset = self.get_dataset(cfg["dataset"])
-            primary = self._datastructures[cfg["primary_dict"]]
-            key_field = cfg["key_field"]
-            idx_objs = {}
-            for idx_name, idx_cfg in cfg["indexes"].items():
-                idx_dict = self._datastructures[idx_cfg["dict"]]
-                field = idx_cfg["field"]
-                if field is not None:
-                    extractor, _fname = _make_extractor(field)
-                elif idx_name in supplied:
-                    extractor, _fname = _make_extractor(supplied[idx_name])
-                else:
-                    raise ValueError(
-                        f"index {idx_name!r} was defined with a callable and "
-                        f"cannot be auto-restored; re-supply it in indexes=..."
-                    )
-                idx_objs[idx_name] = (idx_dict, extractor, field)
-            return Collection(self, name, dataset, primary, key_field, idx_objs)
-
-        # ── Create (idempotent — reuses existing structures) ────────────
-        self._ensure_writable()
-        if key is None:
-            raise ValueError(
-                "key=<primary-key field> is required when creating a collection"
+            return Collection(
+                self, name, self.get_dataset(cfg["dataset"]),
+                cfg["primary_field"], self._datastructures[cfg["primary"]],
+                _build_index_objs(cfg), cfg["key_size"],
             )
-        if isinstance(model, dict):
+
+        # ── Create ──────────────────────────────────────────────────────
+        self._ensure_writable()
+        specs = {f: _as_spec(s) for f, s in (indexes or {}).items()}
+        primaries = [f for f, s in specs.items() if s.kind == "primary"]
+        if len(primaries) != 1:
+            raise ValueError(
+                "exactly one index must be 'primary' "
+                f"(got {len(primaries)}: {primaries})"
+            )
+        primary_field = primaries[0]
+
+        from loom.dataset import Dataset
+        if isinstance(model, Dataset):
+            dataset = model
+        elif isinstance(model, dict):
             dataset = self.create_dataset(f"{name}__data", **model)
         else:
             dataset = self.create_dataset(f"{name}__data", model)
-        primary = self.create_dict(f"{name}__primary", dataset, key_size=key_size)
+        primary = self.create_dict(
+            f"{name}__primary", dataset, key_size=key_size, max_key_len=key_size
+        )
+
         idx_objs = {}
         cfg_indexes = {}
-        for idx_name, spec in supplied.items():
-            extractor, field = _make_extractor(spec)
-            idx_ds = self.create_dataset(f"{name}__ix_{idx_name}", pk=f"U{key_size}")
-            idx_dict = self.create_dict(
-                f"{name}__ix_{idx_name}__d", idx_ds, key_size=key_size
-            )
-            idx_objs[idx_name] = (idx_dict, extractor, field)
-            cfg_indexes[idx_name] = {
-                "dict": idx_dict.name, "ds": idx_ds.name, "field": field,
+        for field, spec in specs.items():
+            if spec.kind == "primary":
+                continue
+            ix_ds = self.create_dataset(f"{name}__ix_{field}", pk=f"utf8[{key_size}]")
+            if spec.kind == "unique":
+                struct = self.create_dict(
+                    f"{name}__ix_{field}__d", ix_ds,
+                    key_size=key_size, max_key_len=key_size,
+                )
+            else:  # range / many → BTree composite
+                struct = self.create_btree(
+                    f"{name}__bt_{field}", ix_ds, key_size=index_key_size
+                )
+            sources = [field]
+            if spec.kind == "many" and spec.sort is not None:
+                sources.append(spec.sort)
+            idx_objs[field] = {
+                "name": field, "spec": spec, "field": field,
+                "struct": struct, "sources": sources,
+            }
+            cfg_indexes[field] = {
+                "kind": spec.kind, "field": field,
+                "sort": getattr(spec, "sort", None),
+                "desc": getattr(spec, "desc", False),
+                "struct": struct.name,
             }
         self._db.set_header_field(cfg_key, {
             "dataset": dataset.name,
-            "primary_dict": primary.name,
-            "key_field": key,
+            "primary": primary.name,
+            "primary_field": primary_field,
             "key_size": key_size,
+            "index_key_size": index_key_size,
             "indexes": cfg_indexes,
         })
-        return Collection(self, name, dataset, primary, key, idx_objs)
+        return Collection(
+            self, name, dataset, primary_field, primary, idx_objs, key_size
+        )
