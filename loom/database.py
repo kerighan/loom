@@ -955,6 +955,7 @@ class DB:
     def create_search_index(
         self,
         name,
+        dataset,
         text_fields=None,
         ignore_case=True,
         ignore_accent=True,
@@ -964,15 +965,19 @@ class DB:
         bm25_k1=1.5,
         bm25_b=0.75,
     ):
-        """Create or reopen a full-text SearchIndex (inverted index).
+        """Create or reopen a full-text SearchIndex over a documents dataset.
 
-        Boolean queries (AND / OR / AND NOT, parentheses, `*` wildcards) are
-        parsed and evaluated by eldar (`pip install eldar`); loom stores the
-        postings. v1 is boolean retrieval only.
+        The index is built on a user Dataset (the document store), like the
+        other structures.  add(record) inserts the record into that dataset and
+        indexes its text fields, keeping only the record's address — documents
+        are never duplicated.  Boolean queries (AND / OR / AND NOT, parens, `*`)
+        are parsed by eldar (`pip install eldar`); loom stores the postings.
 
         Args:
             name: Unique name for this index.
-            text_fields: Document fields to index (None → all string fields).
+            dataset: Dataset holding the documents (its fields are the schema
+                of the records you add()).
+            text_fields: Dataset fields to index (None → all string fields).
             ignore_case / ignore_accent / ignore_punctuation: normalisation
                 applied identically at index and query time.
             doc_id_dtype: stored doc-id width ("uint32" = up to 4 G documents).
@@ -985,11 +990,12 @@ class DB:
             SearchIndex instance.
 
         Example:
-            idx = db.create_search_index("docs", text_fields=["title", "body"],
+            docs = db.create_dataset("docs", title="utf8[120]", body="text")
+            idx = db.create_search_index("idx", docs, text_fields=["title", "body"],
                                          scoring="bm25")
             i = idx.add({"title": "Fast search", "body": "inverted index"})
             idx.search("search AND NOT slow")              # ranked (bm25)
-            idx.search("search", mode="boolean")           # unranked doc-ids/docs
+            idx.search("search", mode="boolean")           # unranked
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
@@ -1003,6 +1009,7 @@ class DB:
         si = SearchIndex(
             name,
             self,
+            dataset,
             text_fields=text_fields,
             ignore_case=ignore_case,
             ignore_accent=ignore_accent,

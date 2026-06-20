@@ -64,21 +64,24 @@ def main():
 
     try:
         db = DB(path)
-        idx = db.create_search_index("news", scoring="bm25")
+        news_ds = db.create_dataset("news_docs", body="text")
+        idx = db.create_search_index("news", news_ds, text_fields=["body"], scoring="bm25")
 
         # ── build ────────────────────────────────────────────────────────────
-        # add() buffers in memory; flush() materialises the postings blobs.
+        # add() buffers in memory; flush() materialises records + postings.
         # Both are part of the build cost.
         t = time.time()
         for d in docs:
-            idx.add(d)
+            idx.add({"body": d})
         idx.flush()
         build_dt = time.time() - t
         db.flush()
 
         vocab = len(idx._postings)
         avg_len = int(idx._meta["total_len"]["v"]) / max(n, 1)
-        disk_mb = os.path.getsize(path) / (1024 * 1024)
+        # high-water allocated space (the file itself is larger — mmap grows by
+        # doubling, so os.path.getsize overstates actual usage)
+        disk_mb = db._db.get_used_space() / (1024 * 1024)
 
         rows.append(("Build", "add (per-doc, indexed)", f"{n / build_dt:,.0f} docs/s"))
         rows.append(("Build", "total build time", f"{build_dt:.1f} s"))

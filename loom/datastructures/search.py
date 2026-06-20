@@ -1,33 +1,32 @@
 """Persistent full-text search index (inverted index) with boolean + BM25.
 
-A `SearchIndex` is a composite structure built on loom primitives:
+The index is built over a user **Dataset** (the document store), like the
+other structures — `db.create_search_index(name, dataset, text_fields=[...])`.
+`add(record)` inserts the record into that dataset and indexes its text
+fields; only the record's **address** is kept (in a dense List by doc-id), so
+documents are never duplicated.
 
     SearchIndex
+    ├── dataset   : user Dataset (the documents — structured records)
     ├── _postings : Dict[term -> {df, last, off, nslots}]   compact postings
-    ├── _docs     : Dict[doc_id -> {doc: json}]             document store
-    ├── _lengths  : List[{dl}]   (scored only, dense by doc_id) doc lengths
+    ├── _docmeta  : List[{addr, dl}]   dense by doc_id: record address + length
     ├── _deleted  : Set[doc_id]                             tombstones
     └── _meta     : Dict (next_id, total_len)
 
-Postings are stored as a **delta + varint** byte blob per term (in the shared
-BlobStore): doc-ids are assigned by a monotonic counter and indexed in id
-order, so each list is sorted ascending and the gaps between consecutive ids
-are small — one or two bytes each.  A rare term (df=1) costs a couple of bytes
-plus a tiny fixed record, versus ~1.5 KB for a nested-List representation.
+Postings are a **delta + varint** byte blob per term (in the shared BlobStore):
+doc-ids are assigned by a monotonic counter and indexed in id order, so each
+list is sorted ascending and the gaps are tiny (1-2 bytes each).
 
 Writes are **buffered in memory** and materialised on `flush()` (also called
-automatically before any read / on close): a bulk build therefore writes each
-term's blob exactly once.  This makes it a build-then-query index; interleaving
-adds and searches re-flushes (read-append-write the touched term blobs).
+automatically before any read / on close): a bulk build inserts the records in
+one contiguous block and writes each term's blob once.
 
 Boolean queries (AND / OR / AND NOT, parens, `*` wildcards) are parsed and
-evaluated by **eldar** (https://github.com/kerighan/eldar) — its index-mode
-parser builds a tree of set operations whose leaves call `SearchIndex.get`.
-BM25/TF-IDF ranking scores the boolean candidate set by the query's positive
-terms.  eldar is an optional dependency (lazy import; `pip install eldar`).
+evaluated by **eldar** (https://github.com/kerighan/eldar); BM25/TF-IDF ranking
+scores the boolean candidate set by the query's positive terms.  eldar is an
+optional dependency (lazy import; `pip install eldar`).
 """
 
-import json
 import re
 from collections import Counter
 
@@ -73,20 +72,22 @@ def _iter_varint(buf: bytes):
 
 
 class SearchIndex(DataStructure):
-    """Inverted index with boolean + BM25 search, backed by loom, parsed by eldar.
+    """Inverted index over a user Dataset, with boolean + BM25 search.
 
     Example:
-        idx = db.create_search_index("docs", text_fields=["title", "body"],
+        docs = db.create_dataset("docs", title="utf8[120]", body="text")
+        idx = db.create_search_index("idx", docs, text_fields=["title", "body"],
                                      scoring="bm25")
-        idx.add({"title": "Fast search", "body": "inverted index ..."})
-        idx.search("search AND (fast OR quick) AND NOT slow")   # ranked docs
-        idx.search("search", mode="boolean", return_ids=True)   # [doc_id, ...]
+        i = idx.add({"title": "Fast search", "body": "inverted index ..."})
+        idx.search("search AND (fast OR quick) AND NOT slow")   # ranked records
+        idx.get_document(i)                                     # the record
     """
 
     def __init__(
         self,
         name,
         db,
+        dataset=None,
         text_fields=None,
         ignore_case=True,
         ignore_accent=True,
@@ -97,6 +98,8 @@ class SearchIndex(DataStructure):
         bm25_b=0.75,
         _parent=None,
     ):
+        self._dataset = dataset
+        self._dataset_name = dataset.name if dataset is not None else None
         self._text_fields = list(text_fields) if text_fields else None
         self.ignore_case = ignore_case
         self.ignore_accent = ignore_accent
@@ -110,12 +113,11 @@ class SearchIndex(DataStructure):
         self._b = bm25_b
         self.item_schema = None
         # in-memory write buffer (flushed lazily — see flush())
-        self._buf_docs = []   # [(doc_id, doc_json, dl)]
-        self._buf_post = {}    # term -> [doc_id]  or  [(doc_id, tf)] when scored
+        self._buf_recs = []   # [(doc_id, record, dl)]
+        self._buf_post = {}    # term -> [doc_id] or [(doc_id, tf)] when scored
         self._next_id = 0
         self._dirty = False
-        # sub-structures (resolved lazily)
-        self._postings = self._docs = self._deleted = self._meta = self._lengths = None
+        self._postings = self._docmeta = self._deleted = self._meta = None
 
         super().__init__(name, db, _parent=_parent)
 
@@ -126,33 +128,45 @@ class SearchIndex(DataStructure):
 
     # ── construction / persistence ───────────────────────────────────────────
 
+    def _default_text_fields(self):
+        """All string-valued fields of the dataset (text / utf8 / U)."""
+        ds = self._dataset
+        fields = []
+        for fname in ds.user_schema.names:
+            if fname in getattr(ds, "_text_fields", ()) or fname in getattr(ds, "_utf8_fields", {}):
+                fields.append(fname)
+            elif ds.user_schema.fields[fname][0].kind == "U":
+                fields.append(fname)
+        return fields
+
     def _initialize(self):
+        if self._dataset is None:
+            raise ValueError("create_search_index requires a documents dataset")
+        if self._text_fields is None:
+            self._text_fields = self._default_text_fields()
         n = self.name
         post_ds = self._db.create_dataset(
             f"_search_{n}_postid",
             df="uint32", last=self._doc_id_dtype, off="uint64", nslots="uint32",
         )
-        # Terms are short → size the stored key tightly (utf8[N] is N fixed
-        # bytes; the default 100 would waste ~100 B per term over 100k+ terms).
         self._postings = self._db.create_dict(
             f"_search_{n}_postings", post_ds, max_key_len=64
         )
-        doc_ds = self._db.create_dataset(f"_search_{n}_docds", doc="text")
-        self._docs = self._db.create_dict(f"_search_{n}_docs", doc_ds)
+        meta_ds = self._db.create_dataset(
+            f"_search_{n}_dmeta", addr="uint64", dl="uint32"
+        )
+        self._docmeta = self._db.create_list(f"_search_{n}_docmeta", meta_ds)
         self._deleted = self._db.create_set(f"_search_{n}_deleted", key_size=24)
-        meta_ds = self._db.create_dataset(f"_search_{n}_metads", v="int64")
-        self._meta = self._db.create_dict(f"_search_{n}_meta", meta_ds)
+        ctr_ds = self._db.create_dataset(f"_search_{n}_metads", v="int64")
+        self._meta = self._db.create_dict(f"_search_{n}_meta", ctr_ds)
         self._meta["next_id"] = {"v": 0}
-        self._lengths = None
-        if self._scored:
-            len_ds = self._db.create_dataset(f"_search_{n}_lends", dl="uint32")
-            self._lengths = self._db.create_list(f"_search_{n}_lengths", len_ds)
-            self._meta["total_len"] = {"v": 0}
+        self._meta["total_len"] = {"v": 0}
         self._next_id = 0
         self.save()
 
     def _load(self):
         m = self._load_metadata()
+        self._dataset_name = m.get("dataset_name")
         self._text_fields = m.get("text_fields")
         self.ignore_case = m.get("ignore_case", True)
         self.ignore_accent = m.get("ignore_accent", True)
@@ -162,20 +176,19 @@ class SearchIndex(DataStructure):
         self._scored = self._scoring != "boolean"
         self._k1 = m.get("bm25_k1", 1.5)
         self._b = m.get("bm25_b", 0.75)
-        self._postings = self._docs = self._deleted = self._meta = self._lengths = None
+        self._dataset = None
+        self._postings = self._docmeta = self._deleted = self._meta = None
         self._loaded_next_id = False
 
     def _ensure_loaded(self):
         if self._postings is not None:
             return
         n = self.name
+        self._dataset = self._db.get_dataset(self._dataset_name)
         self._postings = self._db._datastructures[f"_search_{n}_postings"]
-        self._docs = self._db._datastructures[f"_search_{n}_docs"]
+        self._docmeta = self._db._datastructures[f"_search_{n}_docmeta"]
         self._deleted = self._db._datastructures[f"_search_{n}_deleted"]
         self._meta = self._db._datastructures[f"_search_{n}_meta"]
-        if self._scored:
-            self._lengths = self._db._datastructures[f"_search_{n}_lengths"]
-        # restore the monotonic counter from disk (only the first time)
         if not getattr(self, "_loaded_next_id", True):
             self._next_id = int(self._meta["next_id"]["v"])
             self._loaded_next_id = True
@@ -186,6 +199,7 @@ class SearchIndex(DataStructure):
 
     def _config(self):
         return {
+            "dataset_name": self._dataset_name,
             "text_fields": self._text_fields,
             "ignore_case": self.ignore_case,
             "ignore_accent": self.ignore_accent,
@@ -201,7 +215,8 @@ class SearchIndex(DataStructure):
 
     @classmethod
     def _from_registry_params(cls, name, db, params):
-        return cls(name, db, **params)
+        ds = db.get_dataset(params.pop("dataset_name"))
+        return cls(name, db, ds, **params)
 
     # ── tokenisation (kept consistent with eldar's normalisation) ─────────────
 
@@ -224,48 +239,38 @@ class SearchIndex(DataStructure):
             toks = [t.translate(table) for t in toks]
         return [t for t in toks if t]
 
-    def _doc_text(self, document):
-        if isinstance(document, str):
-            return document
-        if self._text_fields is not None:
-            fields = self._text_fields
-        else:
-            fields = [k for k, v in document.items() if isinstance(v, str)]
-        return " ".join(str(document.get(f, "")) for f in fields)
+    def _doc_text(self, record):
+        return " ".join(str(record.get(f, "")) for f in self._text_fields)
 
     # ── write API ─────────────────────────────────────────────────────────────
 
-    def add(self, document):
-        """Buffer a document for indexing; returns its assigned doc-id.
-
-        Postings are materialised on the next flush() (auto before any read /
-        on close), so a bulk add+search loop writes each term's blob once.
-        """
+    def add(self, record):
+        """Buffer a record (dict matching the dataset schema) for indexing;
+        returns its assigned doc-id.  Materialised on the next flush()."""
+        if not isinstance(record, dict):
+            raise TypeError("record must be a dict matching the dataset schema")
         self._ensure_loaded()
         doc_id = self._next_id
         self._next_id += 1
-        tokens = self._tokens(self._doc_text(document))
-        doc_json = json.dumps(document)
+        tokens = self._tokens(self._doc_text(record))
 
+        self._buf_recs.append((doc_id, record, len(tokens)))
         if self._scored:
-            self._buf_docs.append((doc_id, doc_json, len(tokens)))
             for term, count in Counter(tokens).items():
                 self._buf_post.setdefault(term, []).append((doc_id, min(count, 65535)))
         else:
-            self._buf_docs.append((doc_id, doc_json, 0))
             for term in set(tokens):
                 self._buf_post.setdefault(term, []).append(doc_id)
 
         self._dirty = True
         return doc_id
 
-    def add_many(self, documents):
-        ids = [self.add(d) for d in documents]
+    def add_many(self, records):
+        ids = [self.add(r) for r in records]
         self.flush()
         return ids
 
     def _encode(self, items, last):
-        """Delta+varint encode buffered postings (ascending) → (bytes, new_last)."""
         out = bytearray()
         if self._scored:
             for doc_id, tf in items:
@@ -279,26 +284,24 @@ class SearchIndex(DataStructure):
         return bytes(out), last
 
     def flush(self):
-        """Materialise buffered docs + postings to disk (one blob write/term).
-
-        Records are written with set_batch / append_many — one contiguous
-        arena + a single parent-ref update per structure — instead of
-        per-item inserts, which dominates a bulk build.
-        """
+        """Materialise buffered records + postings to disk."""
         if not self._dirty:
             return
         blobs = self._db.blob_store
+        ds = self._dataset
 
-        # documents (+ dense per-doc length list, scored) — batched
-        self._docs.set_batch(
-            (str(doc_id), {"doc": doc_json}) for doc_id, doc_json, _ in self._buf_docs
-        )
-        if self._scored:
-            self._lengths.append_many({"dl": dl} for _, _, dl in self._buf_docs)
-            total_add = sum(dl for _, _, dl in self._buf_docs)
+        # documents: one contiguous allocation, write records, record addresses
+        n = len(self._buf_recs)
+        rs = ds.record_size
+        base = ds.allocate_block(n)
+        total_add = 0
+        for i, (doc_id, record, dl) in enumerate(self._buf_recs):
+            addr = base + i * rs
+            ds[addr] = record
+            self._docmeta.append({"addr": addr, "dl": dl})   # index == doc_id
+            total_add += dl
 
-        # postings: append-encode into each term's blob (rewrite once per
-        # flush), then bulk-insert all term records in one shot.
+        # postings: append-encode each term's blob (rewrite once), bulk-insert
         records = []
         for term, items in self._buf_post.items():
             if term in self._postings:
@@ -320,7 +323,7 @@ class SearchIndex(DataStructure):
         if self._scored:
             self._meta["total_len"] = {"v": int(self._meta["total_len"]["v"]) + total_add}
         self._meta["next_id"] = {"v": self._next_id}
-        self._buf_docs = []
+        self._buf_recs = []
         self._buf_post = {}
         self._dirty = False
 
@@ -332,7 +335,6 @@ class SearchIndex(DataStructure):
     # ── postings access ───────────────────────────────────────────────────────
 
     def _decode_postings(self, rec):
-        """Decode a term record's blob → list[doc_id] (boolean) or list[(id,tf)]."""
         ns = int(rec["nslots"])
         if ns == 0:
             return []
@@ -343,8 +345,7 @@ class SearchIndex(DataStructure):
             last = 0
             for gap in it:
                 last += gap
-                tf = next(it)
-                out.append((last, tf))
+                out.append((last, next(it)))
         else:
             last = 0
             for gap in _iter_varint(blob):
@@ -359,9 +360,7 @@ class SearchIndex(DataStructure):
         return [i for i, _ in post] if self._scored else post
 
     def _term_tf(self, term):
-        if term not in self._postings:
-            return {}
-        if not self._scored:
+        if not self._scored or term not in self._postings:
             return {}
         return {i: tf for i, tf in self._decode_postings(self._postings[term])}
 
@@ -372,7 +371,6 @@ class SearchIndex(DataStructure):
 
         if self.ignore_punctuation:
             query_term = self._strip_punct(query_term)
-
         result = set()
         if "*" in query_term:
             rgx = re.compile(query_term.replace("*", ".*"))  # eldar: re.match, no end-anchor
@@ -390,9 +388,9 @@ class SearchIndex(DataStructure):
     def search(self, query, return_ids=False, limit=None, mode=None, with_scores=False):
         """Run a query; return matching documents (or doc-ids).
 
-        Supports AND / OR / AND NOT, parentheses and `*` wildcards via eldar.
-        mode: "boolean" (unranked, doc-id order) or "bm25"/"tfidf" (ranked,
-        best first; needs a scored index).  Defaults to the index's scoring.
+        AND / OR / AND NOT, parentheses, `*` wildcards (via eldar).  mode:
+        "boolean" (unranked, doc-id order) or "bm25"/"tfidf" (ranked, best
+        first; needs scoring="bm25").  Defaults to the index's scoring.
         """
         _require_eldar()
         from eldar.index import parse_query
@@ -414,7 +412,7 @@ class SearchIndex(DataStructure):
         tree = parse_query(
             q, ignore_case=self.ignore_case, ignore_accent=self.ignore_accent
         )
-        ids = tree.search(self)  # candidate set of int doc-ids (boolean match)
+        ids = tree.search(self)
         if self._deleted is not None and len(self._deleted):
             ids = {i for i in ids if str(i) not in self._deleted}
 
@@ -424,7 +422,7 @@ class SearchIndex(DataStructure):
                 out = out[:limit]
             return out if return_ids else [self.get_document(i) for i in out]
 
-        ranked = self._rank(ids, tree, mode)        # [(doc_id, score)] desc
+        ranked = self._rank(ids, tree, mode)
         if limit is not None:
             ranked = ranked[:limit]
         if return_ids:
@@ -434,16 +432,14 @@ class SearchIndex(DataStructure):
         return [self.get_document(i) for i, _ in ranked]
 
     def get_document(self, doc_id):
-        """Return the stored document for a doc-id (or None if absent)."""
+        """Return the stored record for a doc-id (or None if out of range)."""
         self._ensure_loaded()
         self.flush()
-        key = str(doc_id)
-        if key not in self._docs:
+        if doc_id < 0 or doc_id >= len(self._docmeta):
             return None
-        return json.loads(self._docs[key]["doc"])
+        return self._dataset[int(self._docmeta[doc_id]["addr"])]
 
     def document_frequency(self, term):
-        """Number of documents a term occurs in."""
         self._ensure_loaded()
         self.flush()
         term = self._strip_punct(self._normalise(term))
@@ -452,16 +448,14 @@ class SearchIndex(DataStructure):
         return int(self._postings[term]["df"])
 
     def __len__(self):
-        """Number of live (non-deleted) documents."""
         self._ensure_loaded()
         self.flush()
-        return len(self._docs) - len(self._deleted)
+        return len(self._docmeta) - len(self._deleted)
 
     def __contains__(self, doc_id):
         self._ensure_loaded()
         self.flush()
-        key = str(doc_id)
-        return key in self._docs and key not in self._deleted
+        return 0 <= doc_id < len(self._docmeta) and str(doc_id) not in self._deleted
 
     # ── ranking (BM25 / TF-IDF) ───────────────────────────────────────────────
 
@@ -473,7 +467,6 @@ class SearchIndex(DataStructure):
         return term
 
     def _positive_terms(self, node, negated=False, out=None):
-        """Collect the query's positive (non-negated) single-word terms."""
         from eldar.indexops import AND, OR, ANDNOT
         from eldar.entry import IndexEntry
 
@@ -492,7 +485,7 @@ class SearchIndex(DataStructure):
         return out
 
     def _doc_len(self, doc_id):
-        return int(self._lengths[doc_id]["dl"])
+        return int(self._docmeta[doc_id]["dl"])
 
     def _rank(self, candidate_ids, tree, mode):
         import math
@@ -506,14 +499,14 @@ class SearchIndex(DataStructure):
         k1, b = self._k1, self._b
 
         scores = {i: 0.0 for i in candidates}
-        for term in sorted(terms):   # deterministic summation order
+        for term in sorted(terms):
             tf_map = self._term_tf(term)
             df = len(tf_map)
             if df == 0:
                 continue
             if mode == "bm25":
                 idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
-            else:  # tfidf
+            else:
                 idf = math.log(N / df)
             for doc_id, tf in tf_map.items():
                 if doc_id not in candidates:
