@@ -294,16 +294,22 @@ class SearchIndex(DataStructure):
         blobs = self._db.blob_store
         ds = self._dataset
 
-        # documents: one contiguous allocation, write records, record addresses
+        # documents: one contiguous allocation, serialize all records into one
+        # buffer and write it in a single db.write (instead of N), then record
+        # the (addr, length) per doc.
         n = len(self._buf_recs)
         rs = ds.record_size
         base = ds.allocate_block(n)
+        buf = bytearray()
+        for _doc_id, record, _dl in self._buf_recs:
+            buf += ds._serialize(**record)
+        ds.db.write(base, bytes(buf))
         total_add = 0
-        for i, (doc_id, record, dl) in enumerate(self._buf_recs):
-            addr = base + i * rs
-            ds[addr] = record
-            self._docmeta.append({"addr": addr, "dl": dl})   # index == doc_id
-            total_add += dl
+        self._docmeta.append_many(
+            {"addr": base + i * rs, "dl": dl}
+            for i, (_d, _r, dl) in enumerate(self._buf_recs)
+        )
+        total_add = sum(dl for _d, _r, dl in self._buf_recs)
 
         # postings: append-encode each term's blob (rewrite once), bulk-insert
         records = []

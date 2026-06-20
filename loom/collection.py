@@ -213,8 +213,12 @@ class Collection:
                 # contiguous arena + a single parent-ref update.  Range/many
                 # (BTree) indexes have no bulk insert, so they loop.
                 self._primary.set_batch(zip(pks, records))
-                for record, pk in zip(records, pks):
-                    self._add_to_search(record, pk)
+                for si in self._search.values():
+                    p2d = []
+                    for record, pk in zip(records, pks):
+                        text = " ".join(str(record.get(f, "")) for f in si["fields"])
+                        p2d.append((pk, {"doc_id": si["index"].add({"pk": pk}, text=text)}))
+                    si["pk2docid"].set_batch(p2d)
                 for ix in self._indexes.values():
                     struct = ix["struct"]
                     if ix["spec"].kind == "unique":
