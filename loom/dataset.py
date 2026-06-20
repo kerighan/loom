@@ -235,28 +235,38 @@ class Dataset:
         Actual blob data must be fetched separately via BlobStore.
         """
         arr = np.frombuffer(data, dtype=self.schema)[0]
+        if not self._array_fields:
+            # Fast path (no vector fields): convert the whole record to native
+            # Python in one C call (arr.item()), then fix up only the special
+            # scalar fields.  Much cheaper than a per-field isinstance + .item()
+            # loop — and most records (incl. store_key Dicts, whose only special
+            # field is the utf8 _key) land here.
+            result = dict(zip(self.schema.names, arr.item()))
+            del result["_prefix"]
+            for field in self._utf8_fields:
+                v = result[field]
+                result[field] = v.rstrip(b"\x00").decode("utf-8") if isinstance(v, bytes) else str(v)
+            for field in self._text_fields:
+                off, ns = result[field]
+                result[field] = "" if (off == 0 and ns == 0) else self.blob_store.read(int(off)).decode("utf-8")
+            for field in self._blob_fields:
+                off, ns = result[field]
+                result[field] = None if (off == 0 and ns == 0) else (int(off), int(ns))
+            return result
+
+        # Vector path: keep arrays as numpy (never item() a whole vector).
         result = {}
         for field in self.user_schema.names:
             value = arr[field]
             if field in self._text_fields:
-                offset = int(value["offset"])
-                n_slots = int(value["n_slots"])
-                if offset == 0 and n_slots == 0:
-                    result[field] = ""
-                else:
-                    result[field] = self.blob_store.read(offset).decode("utf-8")
+                offset, n_slots = int(value["offset"]), int(value["n_slots"])
+                result[field] = "" if (offset == 0 and n_slots == 0) else self.blob_store.read(offset).decode("utf-8")
             elif field in self._blob_fields:
-                # Convert structured array to tuple
-                offset = int(value["offset"])
-                n_slots = int(value["n_slots"])
-                if offset == 0 and n_slots == 0:
-                    result[field] = None  # Null blob
-                else:
-                    result[field] = (offset, n_slots)
+                offset, n_slots = int(value["offset"]), int(value["n_slots"])
+                result[field] = None if (offset == 0 and n_slots == 0) else (offset, n_slots)
             elif field in self._utf8_fields:
                 result[field] = bytes(value).rstrip(b"\x00").decode("utf-8")
             elif field in self._array_fields:
-                # Return a writable numpy array copy (not a mmap view)
                 result[field] = np.array(value)
             else:
                 result[field] = _to_native(value)
