@@ -96,8 +96,14 @@ class SearchIndex(DataStructure):
         scoring="boolean",
         bm25_k1=1.5,
         bm25_b=0.75,
+        store_documents=True,
         _parent=None,
     ):
+        # store_documents=False: the index keeps only postings + doc lengths
+        # (no dataset, no doc→address map) and search() returns doc-ids; the
+        # caller (e.g. a Collection) owns the doc-id → record mapping.  Avoids
+        # duplicating the document store.
+        self._store_docs = store_documents
         self._dataset = dataset
         self._dataset_name = dataset.name if dataset is not None else None
         self._text_fields = list(text_fields) if text_fields else None
@@ -140,10 +146,11 @@ class SearchIndex(DataStructure):
         return fields
 
     def _initialize(self):
-        if self._dataset is None:
-            raise ValueError("create_search_index requires a documents dataset")
-        if self._text_fields is None:
-            self._text_fields = self._default_text_fields()
+        if self._store_docs:
+            if self._dataset is None:
+                raise ValueError("create_search_index requires a documents dataset")
+            if self._text_fields is None:
+                self._text_fields = self._default_text_fields()
         n = self.name
         post_ds = self._db.create_dataset(
             f"_search_{n}_postid",
@@ -152,9 +159,12 @@ class SearchIndex(DataStructure):
         self._postings = self._db.create_dict(
             f"_search_{n}_postings", post_ds, max_key_len=64
         )
-        meta_ds = self._db.create_dataset(
-            f"_search_{n}_dmeta", addr="uint64", dl="uint32"
-        )
+        # doc-meta: (addr, dl) when we store documents, else just dl (lengths
+        # for BM25), dense by doc-id.
+        if self._store_docs:
+            meta_ds = self._db.create_dataset(f"_search_{n}_dmeta", addr="uint64", dl="uint32")
+        else:
+            meta_ds = self._db.create_dataset(f"_search_{n}_dmeta", dl="uint32")
         self._docmeta = self._db.create_list(f"_search_{n}_docmeta", meta_ds)
         self._deleted = self._db.create_set(f"_search_{n}_deleted", key_size=24)
         ctr_ds = self._db.create_dataset(f"_search_{n}_metads", v="int64")
@@ -176,6 +186,7 @@ class SearchIndex(DataStructure):
         self._scored = self._scoring != "boolean"
         self._k1 = m.get("bm25_k1", 1.5)
         self._b = m.get("bm25_b", 0.75)
+        self._store_docs = m.get("store_documents", True)
         self._dataset = None
         self._postings = self._docmeta = self._deleted = self._meta = None
         self._loaded_next_id = False
@@ -184,7 +195,7 @@ class SearchIndex(DataStructure):
         if self._postings is not None:
             return
         n = self.name
-        self._dataset = self._db.get_dataset(self._dataset_name)
+        self._dataset = self._db.get_dataset(self._dataset_name) if self._dataset_name else None
         self._postings = self._db._datastructures[f"_search_{n}_postings"]
         self._docmeta = self._db._datastructures[f"_search_{n}_docmeta"]
         self._deleted = self._db._datastructures[f"_search_{n}_deleted"]
@@ -208,6 +219,7 @@ class SearchIndex(DataStructure):
             "scoring": self._scoring,
             "bm25_k1": self._k1,
             "bm25_b": self._b,
+            "store_documents": self._store_docs,
         }
 
     def _get_registry_params(self):
@@ -215,7 +227,8 @@ class SearchIndex(DataStructure):
 
     @classmethod
     def _from_registry_params(cls, name, db, params):
-        ds = db.get_dataset(params.pop("dataset_name"))
+        dsname = params.pop("dataset_name")
+        ds = db.get_dataset(dsname) if dsname else None
         return cls(name, db, ds, **params)
 
     # ── tokenisation (kept consistent with eldar's normalisation) ─────────────
@@ -248,10 +261,10 @@ class SearchIndex(DataStructure):
         """Buffer a record (dict matching the dataset schema) for indexing;
         returns its assigned doc-id.  Materialised on the next flush().
 
-        text: if given, index THIS text instead of the record's own fields —
-        lets a Collection store just a {pk} stub here while indexing the real
-        record's text (no document duplication)."""
-        if not isinstance(record, dict):
+        text: if given, index THIS text instead of the record's own fields.
+        record may be None when store_documents=False (the caller owns the
+        doc-id → record mapping)."""
+        if self._store_docs and not isinstance(record, dict):
             raise TypeError("record must be a dict matching the dataset schema")
         self._ensure_loaded()
         doc_id = self._next_id
@@ -292,23 +305,25 @@ class SearchIndex(DataStructure):
         if not self._dirty:
             return
         blobs = self._db.blob_store
-        ds = self._dataset
 
-        # documents: one contiguous allocation, serialize all records into one
-        # buffer and write it in a single db.write (instead of N), then record
-        # the (addr, length) per doc.
-        n = len(self._buf_recs)
-        rs = ds.record_size
-        base = ds.allocate_block(n)
-        buf = bytearray()
-        for _doc_id, record, _dl in self._buf_recs:
-            buf += ds._serialize(**record)
-        ds.db.write(base, bytes(buf))
-        total_add = 0
-        self._docmeta.append_many(
-            {"addr": base + i * rs, "dl": dl}
-            for i, (_d, _r, dl) in enumerate(self._buf_recs)
-        )
+        if self._store_docs:
+            # documents: one contiguous allocation, serialize all records into
+            # one buffer and write it in a single db.write, then record the
+            # (addr, length) per doc.
+            ds = self._dataset
+            rs = ds.record_size
+            base = ds.allocate_block(len(self._buf_recs))
+            buf = bytearray()
+            for _doc_id, record, _dl in self._buf_recs:
+                buf += ds._serialize(**record)
+            ds.db.write(base, bytes(buf))
+            self._docmeta.append_many(
+                {"addr": base + i * rs, "dl": dl}
+                for i, (_d, _r, dl) in enumerate(self._buf_recs)
+            )
+        else:
+            # no doc-store: only per-doc lengths (for BM25)
+            self._docmeta.append_many({"dl": dl} for _d, _r, dl in self._buf_recs)
         total_add = sum(dl for _d, _r, dl in self._buf_recs)
 
         # postings: append-encode each term's blob (rewrite once), bulk-insert
@@ -442,7 +457,10 @@ class SearchIndex(DataStructure):
         return [self.get_document(i) for i, _ in ranked]
 
     def get_document(self, doc_id):
-        """Return the stored record for a doc-id (or None if out of range)."""
+        """Return the stored record for a doc-id (or None).  Only meaningful
+        when store_documents=True; otherwise the caller owns doc-id→record."""
+        if not self._store_docs:
+            return None
         self._ensure_loaded()
         self.flush()
         if doc_id < 0 or doc_id >= len(self._docmeta):

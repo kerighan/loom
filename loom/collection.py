@@ -118,7 +118,7 @@ class Collection:
         """
         indexes: {idx_name: {"name", "spec", "field", "struct", "sources"}}
         search:  {idx_name: {"fields": [...], "index": SearchIndex,
-                             "pk2docid": Dict}}  full-text indexes
+                             "pk2docid": Dict, "docid2pk": List}}  full-text
         """
         self._db = db
         self.name = name
@@ -185,7 +185,8 @@ class Collection:
     def _add_to_search(self, record, pk):
         for si in self._search.values():
             text = " ".join(str(record.get(f, "")) for f in si["fields"])
-            doc_id = si["index"].add({"pk": pk}, text=text)
+            doc_id = si["index"].add(None, text=text)
+            si["docid2pk"].append({"pk": pk})
             si["pk2docid"][pk] = {"doc_id": doc_id}
 
     def _remove_from_search(self, pk):
@@ -215,9 +216,13 @@ class Collection:
                 self._primary.set_batch(zip(pks, records))
                 for si in self._search.values():
                     p2d = []
+                    d2p = []
                     for record, pk in zip(records, pks):
                         text = " ".join(str(record.get(f, "")) for f in si["fields"])
-                        p2d.append((pk, {"doc_id": si["index"].add({"pk": pk}, text=text)}))
+                        doc_id = si["index"].add(None, text=text)
+                        d2p.append({"pk": pk})
+                        p2d.append((pk, {"doc_id": doc_id}))
+                    si["docid2pk"].append_many(d2p)
                     si["pk2docid"].set_batch(p2d)
                 for ix in self._indexes.values():
                     struct = ix["struct"]
@@ -277,7 +282,9 @@ class Collection:
                         if entry is not None:
                             si["index"].delete(int(entry["doc_id"]))
                         text = " ".join(str(new.get(f, "")) for f in si["fields"])
-                        si["pk2docid"][pk] = {"doc_id": si["index"].add({"pk": pk}, text=text)}
+                        doc_id = si["index"].add(None, text=text)
+                        si["docid2pk"].append({"pk": pk})
+                        si["pk2docid"][pk] = {"doc_id": doc_id}
                 self._primary[pk] = new
         return new
 
@@ -379,16 +386,19 @@ class Collection:
         si = self._search.get(index_name)
         if si is None:
             raise KeyError(f"no full-text index {index_name!r}")
-        res = si["index"].search(query, mode=mode, limit=limit, with_scores=with_scores)
+        res = si["index"].search(
+            query, return_ids=True, mode=mode, limit=limit, with_scores=with_scores
+        )
+        d2p = si["docid2pk"]
         out = []
         if with_scores:
-            for doc, score in res:
-                rec = self.get_primary(doc["pk"])
+            for doc_id, score in res:
+                rec = self.get_primary(d2p[int(doc_id)]["pk"])
                 if rec is not None:
                     out.append((rec, score))
         else:
-            for doc in res:
-                rec = self.get_primary(doc["pk"])
+            for doc_id in res:
+                rec = self.get_primary(d2p[int(doc_id)]["pk"])
                 if rec is not None:
                     out.append(rec)
         return out

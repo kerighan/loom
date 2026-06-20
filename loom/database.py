@@ -955,7 +955,7 @@ class DB:
     def create_search_index(
         self,
         name,
-        dataset,
+        dataset=None,
         text_fields=None,
         ignore_case=True,
         ignore_accent=True,
@@ -964,6 +964,7 @@ class DB:
         scoring="boolean",
         bm25_k1=1.5,
         bm25_b=0.75,
+        store_documents=True,
     ):
         """Create or reopen a full-text SearchIndex over a documents dataset.
 
@@ -1018,6 +1019,7 @@ class DB:
             scoring=scoring,
             bm25_k1=bm25_k1,
             bm25_b=bm25_b,
+            store_documents=store_documents,
         )
         self._datastructures[name] = si
         self._save_datastructures_registry()
@@ -1260,6 +1262,7 @@ class DB:
                     "fields": sc["fields"],
                     "index": self._datastructures[sc["search"]],
                     "pk2docid": self._datastructures[sc["pk2docid"]],
+                    "docid2pk": self._datastructures[sc["docid2pk"]],
                 }
             return objs
 
@@ -1325,25 +1328,29 @@ class DB:
                 "struct": struct.name,
             }
 
-        # Full-text (search) indexes: an internal SearchIndex storing only a
-        # {pk} stub (no record/text duplication) + a pk→doc_id map for delete.
+        # Full-text (search) indexes: a doc-store-less SearchIndex (postings +
+        # doc lengths only, no record duplication) + the collection's own
+        # doc_id↔pk maps (docid2pk List for results, pk2docid Dict for delete).
         search_objs = {}
         cfg_search = {}
         for field, spec in specs.items():
             if spec.kind != "search":
                 continue
             fields = spec.fields or [field]
-            sds = self.create_dataset(f"{name}__sds_{field}", pk=f"utf8[{key_size}]")
             si = self.create_search_index(
-                f"{name}__search_{field}", sds, text_fields=["pk"],
+                f"{name}__search_{field}", store_documents=False,
                 scoring=spec.scoring, bm25_k1=spec.bm25_k1, bm25_b=spec.bm25_b,
             )
+            d2p_ds = self.create_dataset(f"{name}__d2p_{field}", pk=f"utf8[{key_size}]")
+            docid2pk = self.create_list(f"{name}__d2p_{field}__l", d2p_ds)
             p2d_ds = self.create_dataset(f"{name}__s2d_{field}", doc_id="int64")
             p2d = self.create_dict(
                 f"{name}__s2d_{field}__d", p2d_ds, key_size=key_size, max_key_len=key_size
             )
-            search_objs[field] = {"fields": fields, "index": si, "pk2docid": p2d}
-            cfg_search[field] = {"fields": fields, "search": si.name, "pk2docid": p2d.name}
+            search_objs[field] = {"fields": fields, "index": si,
+                                  "pk2docid": p2d, "docid2pk": docid2pk}
+            cfg_search[field] = {"fields": fields, "search": si.name,
+                                 "pk2docid": p2d.name, "docid2pk": docid2pk.name}
 
         self._db.set_header_field(cfg_key, {
             "dataset": dataset.name,
