@@ -244,15 +244,19 @@ class SearchIndex(DataStructure):
 
     # ── write API ─────────────────────────────────────────────────────────────
 
-    def add(self, record):
+    def add(self, record, text=None):
         """Buffer a record (dict matching the dataset schema) for indexing;
-        returns its assigned doc-id.  Materialised on the next flush()."""
+        returns its assigned doc-id.  Materialised on the next flush().
+
+        text: if given, index THIS text instead of the record's own fields —
+        lets a Collection store just a {pk} stub here while indexing the real
+        record's text (no document duplication)."""
         if not isinstance(record, dict):
             raise TypeError("record must be a dict matching the dataset schema")
         self._ensure_loaded()
         doc_id = self._next_id
         self._next_id += 1
-        tokens = self._tokens(self._doc_text(record))
+        tokens = self._tokens(text if text is not None else self._doc_text(record))
 
         self._buf_recs.append((doc_id, record, len(tokens)))
         if self._scored:

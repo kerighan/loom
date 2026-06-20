@@ -167,3 +167,75 @@ class TestPersistence:
         posts.reindex()
         assert [p["id"] for p in posts.find("username", "alice")] == ["p2", "p3", "p1"]
         assert len(posts) == 5
+
+
+from loom import Search
+
+
+def make_articles(db, scoring="bm25"):
+    schema = {"id": "utf8[16]", "author": "utf8[24]",
+              "title": "text", "body": "text"}
+    return db.collection("articles", schema, indexes={
+        "id": "primary",
+        "author": Many(),
+        "content": Search(fields=["title", "body"], scoring=scoring),
+    })
+
+
+ARTICLES = [
+    {"id": "a1", "author": "alice", "title": "Fast search", "body": "an inverted index for python"},
+    {"id": "a2", "author": "bob",   "title": "Slow database", "body": "a full table scan in java"},
+    {"id": "a3", "author": "alice", "title": "Python tips", "body": "python search and indexing"},
+]
+
+
+class TestSearch:
+    def test_multifield_boolean(self, db):
+        c = make_articles(db)
+        c.insert_many(ARTICLES)
+        assert sorted(r["id"] for r in c.search("content", "python")) == ["a1", "a3"]
+        assert sorted(r["id"] for r in c.search("content", "fast")) == ["a1"]        # title field
+        assert sorted(r["id"] for r in c.search("content", "python AND search")) == ["a1", "a3"]
+        assert sorted(r["id"] for r in c.search("content", "index AND NOT java")) == ["a1"]
+        assert sorted(r["id"] for r in c.search("content", "index* AND NOT java")) == ["a1", "a3"]
+        assert c.search("content", "nonexistent") == []
+
+    def test_bm25_ranked_with_scores(self, db):
+        c = make_articles(db, scoring="bm25")
+        c.insert_many(ARTICLES)
+        res = c.search("content", "python", with_scores=True)
+        assert [r["id"] for r, _ in res] == ["a3", "a1"]   # a3 mentions python twice
+        assert res[0][1] >= res[1][1] > 0
+        assert all(hasattr(r, "pk") for r, _ in res)        # records are Collection Records
+
+    def test_results_are_records(self, db):
+        c = make_articles(db)
+        c.insert_many(ARTICLES)
+        r = c.search("content", "java")[0]
+        assert r["id"] == "a2" and r["author"] == "bob"     # full record via primary
+
+    def test_update_reindexes_text(self, db):
+        c = make_articles(db)
+        c.insert_many(ARTICLES)
+        c.update("a2", body="now mentions python too")
+        assert sorted(r["id"] for r in c.search("content", "python")) == ["a1", "a2", "a3"]
+
+    def test_delete_removes_from_search(self, db):
+        c = make_articles(db)
+        c.insert_many(ARTICLES)
+        c.delete("a1")
+        assert sorted(r["id"] for r in c.search("content", "python")) == ["a3"]
+
+    def test_survives_reopen(self, db):
+        make_articles(db).insert_many(ARTICLES)
+        path = db.filename
+        db.close()
+        db2 = DB(path)
+        try:
+            c = db2.collection("articles")
+            assert sorted(r["id"] for r in c.search("content", "python")) == ["a1", "a3"]
+            # writes after reopen stay indexed
+            c.insert({"id": "a4", "author": "carol", "title": "More python", "body": "x"})
+            assert sorted(r["id"] for r in c.search("content", "python")) == ["a1", "a3", "a4"]
+        finally:
+            db2.close()

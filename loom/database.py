@@ -1253,6 +1253,16 @@ class DB:
                 }
             return objs
 
+        def _build_search_objs(cfg):
+            objs = {}
+            for field, sc in cfg.get("search", {}).items():
+                objs[field] = {
+                    "fields": sc["fields"],
+                    "index": self._datastructures[sc["search"]],
+                    "pk2docid": self._datastructures[sc["pk2docid"]],
+                }
+            return objs
+
         if model is None:
             # ── Reopen ──────────────────────────────────────────────────
             if not cfg:
@@ -1261,6 +1271,7 @@ class DB:
                 self, name, self.get_dataset(cfg["dataset"]),
                 cfg["primary_field"], self._datastructures[cfg["primary"]],
                 _build_index_objs(cfg), cfg["key_size"],
+                search=_build_search_objs(cfg),
             )
 
         # ── Create ──────────────────────────────────────────────────────
@@ -1288,7 +1299,7 @@ class DB:
         idx_objs = {}
         cfg_indexes = {}
         for field, spec in specs.items():
-            if spec.kind == "primary":
+            if spec.kind in ("primary", "search"):
                 continue
             ix_ds = self.create_dataset(f"{name}__ix_{field}", pk=f"utf8[{key_size}]")
             if spec.kind == "unique":
@@ -1313,6 +1324,27 @@ class DB:
                 "desc": getattr(spec, "desc", False),
                 "struct": struct.name,
             }
+
+        # Full-text (search) indexes: an internal SearchIndex storing only a
+        # {pk} stub (no record/text duplication) + a pk→doc_id map for delete.
+        search_objs = {}
+        cfg_search = {}
+        for field, spec in specs.items():
+            if spec.kind != "search":
+                continue
+            fields = spec.fields or [field]
+            sds = self.create_dataset(f"{name}__sds_{field}", pk=f"utf8[{key_size}]")
+            si = self.create_search_index(
+                f"{name}__search_{field}", sds, text_fields=["pk"],
+                scoring=spec.scoring, bm25_k1=spec.bm25_k1, bm25_b=spec.bm25_b,
+            )
+            p2d_ds = self.create_dataset(f"{name}__s2d_{field}", doc_id="int64")
+            p2d = self.create_dict(
+                f"{name}__s2d_{field}__d", p2d_ds, key_size=key_size, max_key_len=key_size
+            )
+            search_objs[field] = {"fields": fields, "index": si, "pk2docid": p2d}
+            cfg_search[field] = {"fields": fields, "search": si.name, "pk2docid": p2d.name}
+
         self._db.set_header_field(cfg_key, {
             "dataset": dataset.name,
             "primary": primary.name,
@@ -1320,7 +1352,9 @@ class DB:
             "key_size": key_size,
             "index_key_size": index_key_size,
             "indexes": cfg_indexes,
+            "search": cfg_search,
         })
         return Collection(
-            self, name, dataset, primary_field, primary, idx_objs, key_size
+            self, name, dataset, primary_field, primary, idx_objs, key_size,
+            search=search_objs,
         )

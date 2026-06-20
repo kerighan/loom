@@ -63,7 +63,18 @@ class Many:
         self.desc = desc
 
 
-_STRING_KINDS = {"primary": Primary, "unique": Unique, "range": Range, "many": Many}
+class Search:
+    kind = "search"
+
+    def __init__(self, fields=None, scoring="boolean", bm25_k1=1.5, bm25_b=0.75):
+        self.fields = list(fields) if fields else None   # None → [index name]
+        self.scoring = scoring
+        self.bm25_k1 = bm25_k1
+        self.bm25_b = bm25_b
+
+
+_STRING_KINDS = {"primary": Primary, "unique": Unique, "range": Range,
+                 "many": Many, "search": Search}
 
 
 def _as_spec(spec):
@@ -102,9 +113,12 @@ def encode_value(value, desc=False):
 
 
 class Collection:
-    def __init__(self, db, name, dataset, primary_field, primary, indexes, key_size):
+    def __init__(self, db, name, dataset, primary_field, primary, indexes,
+                 key_size, search=None):
         """
         indexes: {idx_name: {"name", "spec", "field", "struct", "sources"}}
+        search:  {idx_name: {"fields": [...], "index": SearchIndex,
+                             "pk2docid": Dict}}  full-text indexes
         """
         self._db = db
         self.name = name
@@ -113,9 +127,14 @@ class Collection:
         self._primary = primary
         self._indexes = indexes
         self._key_size = key_size
+        self._search = search or {}
         self._indexed_fields = set()
         for ix in indexes.values():
             self._indexed_fields.update(ix["sources"])
+        # fields feeding any full-text index (→ re-index on update)
+        self._search_fields = set()
+        for si in self._search.values():
+            self._search_fields.update(si["fields"])
 
     # ── key construction ─────────────────────────────────────────────────
 
@@ -163,12 +182,26 @@ class Collection:
             if key is not None and key in ix["struct"]:
                 del ix["struct"][key]
 
+    def _add_to_search(self, record, pk):
+        for si in self._search.values():
+            text = " ".join(str(record.get(f, "")) for f in si["fields"])
+            doc_id = si["index"].add({"pk": pk}, text=text)
+            si["pk2docid"][pk] = {"doc_id": doc_id}
+
+    def _remove_from_search(self, pk):
+        for si in self._search.values():
+            entry = si["pk2docid"].get(pk)
+            if entry is not None:
+                si["index"].delete(int(entry["doc_id"]))
+                del si["pk2docid"][pk]
+
     def insert(self, record):
         pk = self._pk_of(record)
         with self._db.write_lock():
             with self._db.batch():
                 self._primary[pk] = record
                 self._add_to_indexes(record, pk)
+                self._add_to_search(record, pk)
         return pk
 
     def insert_many(self, records):
@@ -180,6 +213,8 @@ class Collection:
                 # contiguous arena + a single parent-ref update.  Range/many
                 # (BTree) indexes have no bulk insert, so they loop.
                 self._primary.set_batch(zip(pks, records))
+                for record, pk in zip(records, pks):
+                    self._add_to_search(record, pk)
                 for ix in self._indexes.values():
                     struct = ix["struct"]
                     if ix["spec"].kind == "unique":
@@ -229,6 +264,16 @@ class Collection:
                                     f"duplicate value for unique index {ix['name']!r}"
                                 )
                         ix["struct"][new_key] = {"pk": pk}
+                # Re-index full-text fields that changed (delete old doc, add new).
+                if self._search and any(f in changes for f in self._search_fields):
+                    for si in self._search.values():
+                        if not any(f in changes for f in si["fields"]):
+                            continue
+                        entry = si["pk2docid"].get(pk)
+                        if entry is not None:
+                            si["index"].delete(int(entry["doc_id"]))
+                        text = " ".join(str(new.get(f, "")) for f in si["fields"])
+                        si["pk2docid"][pk] = {"doc_id": si["index"].add({"pk": pk}, text=text)}
                 self._primary[pk] = new
         return new
 
@@ -240,6 +285,7 @@ class Collection:
         with self._db.write_lock():
             with self._db.batch():
                 self._remove_from_indexes(record, pk)
+                self._remove_from_search(pk)
                 del self._primary[pk]
 
     def increment(self, pk, field, amount=1):
@@ -318,6 +364,29 @@ class Collection:
                 out.append(self._wrap(entry["pk"], rec))
                 if limit is not None and len(out) >= limit:
                     break
+        return out
+
+    def search(self, index_name, query, mode=None, limit=None, with_scores=False):
+        """Full-text search on a 'search' index → matching records.
+
+        Boolean (AND/OR/AND NOT, parens, `*`) by default; ranked (bm25/tfidf)
+        if the index was declared with scoring="bm25".  with_scores → list of
+        (record, score)."""
+        si = self._search.get(index_name)
+        if si is None:
+            raise KeyError(f"no full-text index {index_name!r}")
+        res = si["index"].search(query, mode=mode, limit=limit, with_scores=with_scores)
+        out = []
+        if with_scores:
+            for doc, score in res:
+                rec = self.get_primary(doc["pk"])
+                if rec is not None:
+                    out.append((rec, score))
+        else:
+            for doc in res:
+                rec = self.get_primary(doc["pk"])
+                if rec is not None:
+                    out.append(rec)
         return out
 
     def __contains__(self, pk):
