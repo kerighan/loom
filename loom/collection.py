@@ -172,14 +172,28 @@ class Collection:
         return pk
 
     def insert_many(self, records):
-        pks = []
+        records = list(records)
+        pks = [self._pk_of(r) for r in records]
         with self._db.write_lock():
             with self._db.batch():
-                for record in records:
-                    pk = self._pk_of(record)
-                    self._primary[pk] = record
-                    self._add_to_indexes(record, pk)
-                    pks.append(pk)
+                # Primary + unique (Dict) indexes go through set_batch — one
+                # contiguous arena + a single parent-ref update.  Range/many
+                # (BTree) indexes have no bulk insert, so they loop.
+                self._primary.set_batch(zip(pks, records))
+                for ix in self._indexes.values():
+                    struct = ix["struct"]
+                    if ix["spec"].kind == "unique":
+                        entries = []
+                        for record, pk in zip(records, pks):
+                            key = self._index_key(ix, record, pk)
+                            if key is not None:
+                                entries.append((key, {"pk": pk}))
+                        struct.set_batch(entries)
+                    else:  # BTree composite (range / many)
+                        for record, pk in zip(records, pks):
+                            key = self._index_key(ix, record, pk)
+                            if key is not None:
+                                struct[key] = {"pk": pk}
         return pks
 
     def update(self, pk, **changes):
