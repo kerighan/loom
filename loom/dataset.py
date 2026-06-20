@@ -449,6 +449,12 @@ class Dataset:
         value = np.frombuffer(data, dtype=field_dtype)[0]
         if field_name in self._utf8_fields:
             return bytes(value).rstrip(b"\x00").decode("utf-8")
+        if field_name in self._text_fields:
+            off, ns = int(value["offset"]), int(value["n_slots"])
+            return "" if (off == 0 and ns == 0) else self.blob_store.read(off).decode("utf-8")
+        if field_name in self._blob_fields:
+            off, ns = int(value["offset"]), int(value["n_slots"])
+            return None if (off == 0 and ns == 0) else self.blob_store.read(off)
         return value
 
     def exists(self, address):

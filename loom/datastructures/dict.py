@@ -1022,10 +1022,47 @@ class Dict(DataStructure):
             value: Value to store (dict for regular, Dict for nested)
             atomic: If True, use WAL for crash safety (default: False)
         """
+        # Single-field update: d[key, field] = v → write just that field in
+        # place (the key must already exist).  Ideal for counters (likes/views).
+        if isinstance(key, tuple) and len(key) == 2:
+            self._set_field(key[0], key[1], value)
+            return
         if atomic:
             self._setitem_atomic(key, value)
         else:
             self._setitem_fast(key, value)
+
+    def _resolve_value_addr(self, key):
+        """Resolve a key to its value record address (cache-first), for
+        single-field access.  Raises KeyError if the key is absent."""
+        internal = self._to_internal_key(key)
+        cache_k = internal if self._store_key else (internal[0] << 64 | internal[1])
+        if self._cache:
+            cached = self._cache.get(cache_k)
+            if cached is not None:
+                return int(cached)
+        p, table_addr, position, entry = self._find_slot(
+            internal, self._hash(internal), for_insert=False
+        )
+        addr = int(entry["value_addr"])
+        if self._cache:
+            self._cache[cache_k] = addr
+        return addr
+
+    def _get_field(self, key, field):
+        """Read a single field of the record at `key` (d[key, field])."""
+        if self._is_nested:
+            raise TypeError("d[key, field] field access is not supported on nested dicts")
+        return self._values_dataset.read_field(self._resolve_value_addr(key), field)
+
+    def _set_field(self, key, field, value):
+        """Write a single field of the record at `key` (d[key, field] = v).
+
+        In-place: the record's address is unchanged, so any cached address
+        stays valid and other fields are untouched."""
+        if self._is_nested:
+            raise TypeError("d[key, field] field access is not supported on nested dicts")
+        self._values_dataset.write_field(self._resolve_value_addr(key), field, value)
 
     def _setitem_fast(self, key, value):
         """Fast path for non-atomic insert/update (current implementation)."""
@@ -1313,6 +1350,10 @@ class Dict(DataStructure):
         Raises:
             KeyError: If key not found
         """
+        # Single-field access: d[key, field] → just that field's value, read
+        # straight from its slot in the record (no full deserialization).
+        if isinstance(key, tuple) and len(key) == 2:
+            return self._get_field(key[0], key[1])
         # Keep original key string for auto-creation of nested children
         orig_key = key if isinstance(key, str) else str(key)
         # Normalise key and compute cache key before cache check
