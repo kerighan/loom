@@ -482,31 +482,28 @@ class Dataset:
         return prefix == self._deleted_prefix
 
     def __getitem__(self, address):
-        """Read a record using dict-like syntax.
-
-        Args:
-            address: Record address
-
-        Returns:
-            Dict with field values
-
-        Example:
-            record = dataset[addr]
+        """Read a record (``dataset[addr]``) or a single field
+        (``dataset[addr, field]`` → just that field's value).
         """
+        if isinstance(address, tuple) and len(address) == 2:
+            addr, field = address
+            if isinstance(addr, Ref):
+                addr = addr.addr
+            return self.read_field(addr, field)
         if isinstance(address, Ref):
             address = address.addr
         return self.read(address)
 
     def __setitem__(self, address, record):
-        """Write a record using dict-like syntax.
-
-        Args:
-            address: Record address
-            record: Dict with field values
-
-        Example:
-            dataset[addr] = {'id': 1, 'name': 'Alice'}
+        """Write a record (``dataset[addr] = {...}``) or a single field in place
+        (``dataset[addr, field] = value``).
         """
+        if isinstance(address, tuple) and len(address) == 2:
+            addr, field = address
+            if isinstance(addr, Ref):
+                addr = addr.addr
+            self.write_field(addr, field, record)
+            return
         if isinstance(address, Ref):
             address = address.addr
         if not isinstance(record, dict):

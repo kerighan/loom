@@ -25,6 +25,15 @@ class Ref:
         for field_name, value in fields.items():
             self.dataset.write_field(self.addr, field_name, value)
 
+    def __getitem__(self, field: str) -> Any:
+        """Read a single field of the referenced record (``ref['likes']``)."""
+        return self.dataset.read_field(self.addr, field)
+
+    def __setitem__(self, field: str, value: Any) -> None:
+        """Write a single field of the referenced record in place
+        (``ref['likes'] = 6``)."""
+        self.dataset.write_field(self.addr, field, value)
+
     def __repr__(self) -> str:
         ds_name = getattr(self.dataset, "name", "<unknown>")
         return f"Ref(dataset={ds_name!r}, addr={self.addr})"
