@@ -1369,13 +1369,14 @@ class DB:
 
         def _build_index_objs(cfg):
             objs = {}
-            for field, ic in cfg["indexes"].items():
+            for idx_name, ic in cfg["indexes"].items():
                 spec = _spec_from_cfg(ic)
+                field = ic.get("field", idx_name)   # field may differ from name
                 sources = [field]
                 if spec.kind == "many" and spec.sort is not None:
                     sources.append(spec.sort)
-                objs[field] = {
-                    "name": field, "spec": spec, "field": field,
+                objs[idx_name] = {
+                    "name": idx_name, "spec": spec, "field": field,
                     "struct": self._datastructures[ic["struct"]],
                     "sources": sources,
                 }
@@ -1437,27 +1438,31 @@ class DB:
 
         idx_objs = {}
         cfg_indexes = {}
-        for field, spec in specs.items():
+        for idx_name, spec in specs.items():
             if spec.kind in ("primary", "search"):
                 continue
-            ix_ds = self.create_dataset(f"{name}__ix_{field}", pk=f"utf8[{key_size}]")
+            # the index NAME labels the structures (unique); the FIELD is what
+            # gets indexed (defaults to the name, but can be shared across
+            # several indexes — e.g. one Many by date, one by engagement).
+            field = getattr(spec, "field", None) or idx_name
+            ix_ds = self.create_dataset(f"{name}__ix_{idx_name}", pk=f"utf8[{key_size}]")
             if spec.kind == "unique":
                 struct = self.create_dict(
-                    f"{name}__ix_{field}__d", ix_ds,
+                    f"{name}__ix_{idx_name}__d", ix_ds,
                     key_size=key_size, max_key_len=key_size,
                 )
             else:  # range / many → BTree composite
                 struct = self.create_btree(
-                    f"{name}__bt_{field}", ix_ds, key_size=index_key_size
+                    f"{name}__bt_{idx_name}", ix_ds, key_size=index_key_size
                 )
             sources = [field]
             if spec.kind == "many" and spec.sort is not None:
                 sources.append(spec.sort)
-            idx_objs[field] = {
-                "name": field, "spec": spec, "field": field,
+            idx_objs[idx_name] = {
+                "name": idx_name, "spec": spec, "field": field,
                 "struct": struct, "sources": sources,
             }
-            cfg_indexes[field] = {
+            cfg_indexes[idx_name] = {
                 "kind": spec.kind, "field": field,
                 "sort": getattr(spec, "sort", None),
                 "desc": getattr(spec, "desc", False),

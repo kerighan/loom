@@ -427,7 +427,7 @@ kept in sync on every insert / update / delete under one lock. The record lives
 | `"primary"` | Dict | the record store + unique key (exactly one required) |
 | `"unique"` | Dict | a second 1:1 lookup key (enforces uniqueness) |
 | `"range"` | B+Tree | numeric / ordered range scans (`>=`, between) |
-| `Many(sort=, desc=)` | B+Tree | one-to-many groups, returned in sort order |
+| `Many(sort=, desc=, field=)` | B+Tree | one-to-many groups, returned in sort order. It's a **compound** key, so `find()` can bound the sort field → *equality AND range* in one seek |
 | `Search(fields=, scoring=)` | SearchIndex | full-text (boolean or BM25) |
 
 ```python
@@ -483,6 +483,23 @@ posts.delete("p1")                             # removed from every index
   feed (e.g. each user's timeline); `range(desc=True)` is the single-axis
   "most-relevant/most-recent first" feed, and `range("relevance", 3.0, None)`
   still filters by score.
+- **Compound filter — equality AND range, fast at any scale.** A `Many` key is
+  `group · sort · pk`, so it *is* a compound index. `find()` can bound the sort
+  field, turning `category = X AND created_at >= T` into a single seek + bounded
+  scan — **O(log n + matches)**, independent of how much history the group holds
+  (a year of data stays instant). Use `field=` to index the same field under
+  several names (e.g. one ordering by date, one by engagement):
+
+  ```python
+  posts = db.collection("posts", Post, indexes={
+      "post_id":  "primary",
+      "category": Many(field="category_alias", sort="engagements", desc=True),  # top of a category
+      "cat_time": Many(field="category_alias", sort="created_at",  desc=True),  # category over time
+  })
+  posts.find("cat_time", "politics", start=date(2026, 1, 1))            # category X since a date
+  posts.find("cat_time", "politics", start=date(2026, 1, 1), end=date(2026, 6, 1))  # a window
+  posts.find("category", "politics", limit=20)                          # top-20 by engagement
+  ```
 - **Persistence.** The index declaration is saved with the collection, so
   `db.collection("posts")` (no model) reopens it and restores every index
   automatically.

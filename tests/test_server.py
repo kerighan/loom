@@ -503,6 +503,29 @@ def test_priority_queue_dashboard_support(db):
     assert client.get("/").json()["structures"]["jobs"] == "PriorityQueue"
 
 
+def test_collection_compound_find_over_http(db):
+    from loom import Many
+
+    db.collection("posts", {"id": "utf8[8]", "cat": "utf8[8]", "created_at": "datetime"},
+                  indexes={"id": "primary",
+                           "cat_time": Many(field="cat", sort="created_at", desc=True)})
+    client = TestClient(db.fastapi_app())
+    for i in range(1, 7):
+        client.post("/collections/posts/records",
+                    json={"id": f"p{i}", "cat": "x", "created_at": f"2026-0{i}-01T00:00:00"})
+
+    # cat == "x" AND created_at >= 2026-04-01  → p4, p5, p6 (recent first)
+    ids = [r["id"] for r in client.get("/collections/posts/find/cat_time",
+                                       params={"value": "x", "start": "2026-04-01T00:00:00"}).json()]
+    assert ids == ["p6", "p5", "p4"]
+    # closed window
+    ids = [r["id"] for r in client.get("/collections/posts/find/cat_time",
+                                       params={"value": "x",
+                                               "start": "2026-02-01T00:00:00",
+                                               "end": "2026-03-01T00:00:00"}).json()]
+    assert ids == ["p3", "p2"]
+
+
 def test_collection_datetime_field_over_http(db):
     from datetime import datetime
     from loom import Many

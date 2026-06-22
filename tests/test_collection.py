@@ -191,6 +191,34 @@ class TestPersistence:
         finally:
             db2.close()
 
+    def test_compound_equality_and_range(self, db):
+        # category (equality) + created_at (range) via a Many(field=, sort=) index
+        posts = db.collection("p", {"post_id": "utf8[8]", "cat": "utf8[8]", "ts": "int64"},
+                              indexes={
+                                  "post_id": "primary",
+                                  "by_eng": Many(field="cat", sort="post_id"),       # same field, another name
+                                  "cat_time": Many(field="cat", sort="ts", desc=True),
+                              })
+        for i in range(20):
+            posts.insert({"post_id": f"p{i:02d}", "cat": "a" if i % 2 else "b", "ts": i})
+        # cat == "a" AND ts >= 10, recent first
+        res = posts.find("cat_time", "a", start=10)
+        assert all(r["cat"] == "a" and r["ts"] >= 10 for r in res)
+        assert [r["ts"] for r in res] == sorted([r["ts"] for r in res], reverse=True)
+        # closed window
+        res2 = posts.find("cat_time", "a", start=4, end=12)
+        assert all(r["cat"] == "a" and 4 <= r["ts"] <= 12 for r in res2)
+        # two indexes on the same field coexist
+        assert {r["post_id"] for r in posts.find("by_eng", "b")} == \
+               {f"p{i:02d}" for i in range(20) if i % 2 == 0}
+
+    def test_find_bounds_require_sort(self, db):
+        posts = db.collection("p", {"id": "utf8[8]", "cat": "utf8[8]"},
+                              indexes={"id": "primary", "cat": Many()})  # no sort
+        posts.insert({"id": "p1", "cat": "a"})
+        with pytest.raises(ValueError):
+            posts.find("cat", "a", start="x")
+
     def test_reindex_rebuilds(self, db):
         posts = seed(make_posts(db))
         posts.reindex()

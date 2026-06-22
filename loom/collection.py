@@ -78,17 +78,26 @@ class Primary:
 class Unique:
     kind = "unique"
 
+    def __init__(self, field=None):
+        self.field = field   # None → the index's name is the field
+
 
 class Range:
     kind = "range"
+
+    def __init__(self, field=None):
+        self.field = field
 
 
 class Many:
     kind = "many"
 
-    def __init__(self, sort=None, desc=False):
+    def __init__(self, sort=None, desc=False, field=None):
         self.sort = sort
         self.desc = desc
+        # field defaults to the index name — set it to index the SAME field
+        # under several indexes (e.g. category by engagement AND by date).
+        self.field = field
 
 
 class Search:
@@ -421,14 +430,49 @@ class Collection:
             return default
         return self.get_primary(entry["pk"], default)
 
-    def find(self, index_name, value, limit=None):
-        """One-to-many lookup → list of records (ordered by the index's sort)."""
+    def find(self, index_name, value, start=None, end=None, limit=None):
+        """One-to-many lookup → records for group ``value`` (ordered by the
+        index's sort field).
+
+        ``start``/``end`` bound that sort field — a compound *equality AND
+        range* query.  For a ``Many(sort="created_at")`` index:
+
+            find("category_alias", "politics", start=date(2026, 1, 1))
+
+        runs as a single seek + bounded scan (O(log n + matches)), so it stays
+        fast no matter how much history the group holds.  Bounds are inclusive
+        and may be int / float / datetime / str (matching the sort field)."""
         ix = self._indexes[index_name]
-        if ix["spec"].kind != "many":
+        spec = ix["spec"]
+        if spec.kind != "many":
             raise ValueError(f"find() needs a 'many' index for {index_name!r}")
         value = self._coerce_field_value(ix["field"], value)
+        group = encode_value(value)
+        struct = ix["struct"]
+
+        if start is None and end is None:
+            it = struct.prefix(group + _SEP)
+        else:
+            if spec.sort is None:
+                raise ValueError(
+                    f"start/end need a Many(sort=...) index; {index_name!r} has no sort"
+                )
+            es = (encode_value(self._coerce_field_value(spec.sort, start), desc=spec.desc)
+                  if start is not None else None)
+            ee = (encode_value(self._coerce_field_value(spec.sort, end), desc=spec.desc)
+                  if end is not None else None)
+            if es is not None and ee is not None:
+                klo, khi = min(es, ee), max(es, ee)   # enc is monotone → value interval
+            elif spec.desc:
+                klo, khi = ee, es   # value>=start ↔ enc<=es ; value<=end ↔ enc>=ee
+            else:
+                klo, khi = es, ee
+            low_key = group + _SEP + (klo if klo is not None else "")
+            high_key = (group + _SEP + khi + "\x01") if khi is not None else group + "\x01"
+            it = struct.range(low_key, high_key, inclusive=(True, False))
+
         out = []
-        for _key, entry in ix["struct"].prefix(encode_value(value) + _SEP):
+        for _key, entry in it:
             rec = self._primary.get(str(entry["pk"]))
             if rec is not None:
                 out.append(self._wrap(entry["pk"], rec))

@@ -1198,6 +1198,8 @@ def build_app(
         name: str,
         index: str,
         value: str = Query(...),
+        start: Optional[str] = Query(None, description="lower bound on the Many sort field"),
+        end: Optional[str] = Query(None, description="upper bound on the Many sort field"),
         limit: Optional[int] = Query(None, ge=1, le=100_000),
     ):
         with lock:
@@ -1206,10 +1208,17 @@ def build_app(
             if ix is None:
                 raise HTTPException(404, f"index {index!r} not found")
             schema = _dataset_schema(col.dataset)
-            val = _coerce_scalar(schema.get(index, "text"), value)
+            val = _coerce_scalar(schema.get(ix["field"], "text"), value)
             kind = ix["spec"].kind
             if kind == "many":
-                rows = col.find(index, val, limit=limit)
+                sort = ix["spec"].sort
+                dt = schema.get(sort, "text") if sort else "text"
+                rows = col.find(
+                    index, val,
+                    start=_coerce_scalar(dt, start),
+                    end=_coerce_scalar(dt, end),
+                    limit=limit,
+                )
                 return [_to_jsonable(dict(r)) for r in rows]
             if kind == "unique":
                 rec = col.get(index, val)
