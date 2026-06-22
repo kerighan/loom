@@ -1485,7 +1485,6 @@ class DB:
         if not self._is_open:
             raise DatabaseNotOpenError()
         self._ensure_writable()
-        from loom.collection import Many, Range, Unique, Search
         from loom.dataset import Dataset
 
         cfg_key = f"__collection__::{name}"
@@ -1506,21 +1505,7 @@ class DB:
 
         # Reconstruct the index declaration from the stored config unless given.
         if indexes is None:
-            indexes = {cfg["primary_field"]: "primary"}
-            for idx_name, ic in cfg["indexes"].items():
-                field = ic.get("field", idx_name)
-                fld = None if field == idx_name else field
-                if ic["kind"] == "unique":
-                    indexes[idx_name] = Unique(field=fld)
-                elif ic["kind"] == "range":
-                    indexes[idx_name] = Range(field=fld)
-                else:
-                    indexes[idx_name] = Many(sort=ic.get("sort"),
-                                             desc=ic.get("desc", False), field=fld)
-            for field, sc in cfg.get("search", {}).items():
-                si = old._search[field]["index"]
-                indexes[field] = Search(fields=sc["fields"], scoring=si._scoring,
-                                        bm25_k1=si._k1, bm25_b=si._b)
+            indexes = self._collection_index_specs(cfg, old)
 
         # Read + transform every record FIRST (so the drop below can't lose data).
         migrated = []
@@ -1541,6 +1526,109 @@ class DB:
         if migrated:
             col.insert_many(migrated)
         return col
+
+    def _collection_index_specs(self, cfg, col):
+        """Rebuild the `indexes=` declaration from a collection's stored config
+        (used by migrate / vacuum to recreate it identically)."""
+        from loom.collection import Many, Range, Unique, Search
+        indexes = {cfg["primary_field"]: "primary"}
+        for idx_name, ic in cfg["indexes"].items():
+            field = ic.get("field", idx_name)
+            fld = None if field == idx_name else field
+            if ic["kind"] == "unique":
+                indexes[idx_name] = Unique(field=fld)
+            elif ic["kind"] == "range":
+                indexes[idx_name] = Range(field=fld)
+            else:
+                indexes[idx_name] = Many(sort=ic.get("sort"),
+                                         desc=ic.get("desc", False), field=fld)
+        for field, sc in cfg.get("search", {}).items():
+            si = col._search[field]["index"]
+            indexes[field] = Search(fields=sc["fields"], scoring=si._scoring,
+                                    bm25_k1=si._k1, bm25_b=si._b)
+        return indexes
+
+    def vacuum(self):
+        """Reclaim dead space by rewriting the database into a fresh file.
+
+        Soft-deleted records, fragmentation, and arenas orphaned by
+        drop/migrate/upsert are all dropped: every collection (and any
+        standalone dataset) is copied compactly into a new file, which then
+        atomically replaces the original.
+
+        Supports databases made of collections (+ their internals) and plain
+        datasets.  Raises NotImplementedError if it finds a standalone
+        structure type it can't safely copy yet — so it is never lossy.
+        """
+        if not self._is_open:
+            raise DatabaseNotOpenError()
+        self._ensure_writable()
+        import os as _os
+
+        coll_names = sorted(
+            k[len("__collection__::"):]
+            for k in self._db._header_data
+            if k.startswith("__collection__::")
+        )
+        owned_pats = [f"{c}__" for c in coll_names]
+
+        def _owned(n):
+            return any(p in n for p in owned_pats)
+
+        # Refuse rather than risk dropping anything we can't safely copy.
+        orphan = ([n for n in self._datastructures if not _owned(n)]
+                  + [n for n in self._datasets if not _owned(n)])
+        if orphan:
+            raise NotImplementedError(
+                "vacuum() currently supports databases made of collections only; "
+                f"found standalone structures/datasets: {orphan[:5]}"
+            )
+
+        # Snapshot each collection (schema dict, index specs, live records).
+        snapshots = []
+        for name in coll_names:
+            cfg = self._db.get_header_field(f"__collection__::{name}")
+            col = self.collection(name)
+            ds = col.dataset
+            schema = {f: self._dtype_to_registry_str(ds, f) for f in ds.user_schema.names}
+            indexes = self._collection_index_specs(cfg, col)
+            records = [dict(rec) for _pk, rec in col._primary.items()]
+            snapshots.append((name, schema, indexes, cfg["key_size"],
+                              cfg["index_key_size"], records))
+
+        orig_header = self._db.header_size
+        orig_sync = self._db.sync_writes
+        tmp_path = self.filename + ".vacuum.tmp"
+        for p in (tmp_path, tmp_path + ".log", tmp_path + ".lock"):
+            if _os.path.exists(p):
+                _os.remove(p)
+
+        fresh = DB(tmp_path, header_size=orig_header, cache_size=0, sync_writes=orig_sync)
+        try:
+            for name, schema, indexes, ks, iks, records in snapshots:
+                ncol = fresh.collection(name, schema, indexes=indexes,
+                                        key_size=ks, index_key_size=iks)
+                if records:
+                    ncol.insert_many(records)
+        finally:
+            fresh.close()
+
+        # Atomically swap the compacted file in, then reopen on it.
+        self.close()
+        _os.replace(tmp_path, self.filename)
+        for ext in (".log", ".lock"):
+            p = tmp_path + ext
+            if _os.path.exists(p):
+                _os.remove(p)
+        self._db = ByteFileDB(self.filename, header_size=orig_header,
+                              sync_writes=orig_sync, flag=self.flag)
+        self._datasets = {}
+        self._datastructures = {}
+        self._blob_store = None
+        self._is_open = False
+        if self._shared_cache is not None:
+            self._shared_cache.clear()
+        self.open()
 
     def _rollback_collection(self, ds_before, struct_before, cfg_key):
         """Undo a partially-created collection: unregister every dataset /

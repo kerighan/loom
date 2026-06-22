@@ -61,3 +61,39 @@ def test_drop_collection(db):
     # name is free again → can recreate
     col = db.collection("users", {"uid": "utf8[8]"}, indexes={"uid": "primary"})
     assert len(col) == 0
+
+
+def test_vacuum_reclaims_space_and_preserves_data(db):
+    col = db.collection("posts", {"pid": "utf8[8]", "cat": "utf8[8]", "text": "text"},
+                        indexes={"pid": "primary", "cat": Many(sort="pid"),
+                                 "body": Search(fields=["text"], scoring="bm25")})
+    col.insert_many([{"pid": f"p{i}", "cat": "a",
+                      "text": f"hello world number {i} python " * 8}
+                     for i in range(3000)])
+    for i in range(3000):
+        if i % 3:                       # delete ~2/3 → lots of dead space
+            col.delete(f"p{i}")
+    db.flush()
+    path = db.filename
+    size_before = os.path.getsize(path)
+    live = len(col)
+
+    db.vacuum()
+
+    assert os.path.getsize(path) < size_before          # space reclaimed
+    col2 = db["posts"]
+    assert len(col2) == live                            # data intact
+    assert len(col2.find("cat", "a")) == live           # index rebuilt
+    assert len(col2.search("body", "python")) == live   # full-text rebuilt
+
+    # survives reopen
+    db.close()
+    with DB(path) as db2:
+        assert len(db2["posts"]) == live
+
+
+def test_vacuum_refuses_standalone_structures(db):
+    ds = db.create_dataset("docs", id="int64")
+    db.create_dict("d", ds)   # standalone (non-collection) structure
+    with pytest.raises(NotImplementedError):
+        db.vacuum()

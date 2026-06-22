@@ -947,6 +947,7 @@ db = DB("app.db", sync_writes=True)
 - `ByteFileDB` freelist: freed blocks (Queue pop exhaustion, List compaction) are reused by any future allocation — the file does not grow unboundedly in steady state.
 - `Dict` tracks freed value slots and reuses them for new inserts.
 - `List.compact()` rebuilds without deleted items and returns old blocks to the freelist.
+- `db.vacuum()` rewrites the whole database into a fresh file — dropping soft-deleted records, fragmentation, and arenas orphaned by drop/migrate/upsert — then atomically swaps it in. Supports collection-based databases (raises rather than risk dropping a standalone structure type it can't yet copy).
 
 **Session safety**
 
