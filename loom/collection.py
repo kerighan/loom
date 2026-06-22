@@ -527,31 +527,73 @@ class Collection:
                     break
         return out
 
-    def search(self, index_name, query, mode=None, limit=None, with_scores=False):
+    def search(self, index_name, query, where=None, mode=None, limit=None,
+               with_scores=False):
         """Full-text search on a 'search' index → matching records.
 
         Boolean (AND/OR/AND NOT, parens, `*`) by default; ranked (bm25/tfidf)
         if the index was declared with scoring="bm25".  with_scores → list of
-        (record, score)."""
+        (record, score).
+
+        ``where`` filters the (relevance-ordered) hits by record fields — a
+        full-text query AND structured constraints in one call:
+
+            posts.search("body", "lait infantile",
+                         where={"category_alias": "health",
+                                "created_at": (date(2026, 1, 1), None)})
+
+        It is a dict ``{field: value}`` (equality) / ``{field: (lo, hi)}``
+        (inclusive range, None = open) — or any ``callable(record) -> bool``.
+        The filter is applied AFTER ranking, so a selective query term keeps it
+        cheap; ``limit`` is applied after filtering."""
         si = self._search.get(index_name)
         if si is None:
             raise KeyError(f"no full-text index {index_name!r}")
+        pred = self._make_predicate(where)
+        # When filtering, don't let the engine pre-truncate to `limit` — we need
+        # the full ranked candidate list to filter, then cap.
+        eng_limit = None if pred is not None else limit
         res = si["index"].search(
-            query, return_ids=True, mode=mode, limit=limit, with_scores=with_scores
+            query, return_ids=True, mode=mode, limit=eng_limit, with_scores=with_scores
         )
         d2p = si["docid2pk"]
         out = []
-        if with_scores:
-            for doc_id, score in res:
-                rec = self.get_primary(d2p[int(doc_id)]["pk"])
-                if rec is not None:
-                    out.append((rec, score))
-        else:
-            for doc_id in res:
-                rec = self.get_primary(d2p[int(doc_id)]["pk"])
-                if rec is not None:
-                    out.append(rec)
+        for item in res:
+            doc_id, score = item if with_scores else (item, None)
+            rec = self.get_primary(d2p[int(doc_id)]["pk"])
+            if rec is None or (pred is not None and not pred(rec)):
+                continue
+            out.append((rec, score) if with_scores else rec)
+            if limit is not None and len(out) >= limit:
+                break
         return out
+
+    @staticmethod
+    def _make_predicate(where):
+        """Build a record→bool filter from a dict spec or a callable (or None)."""
+        if where is None:
+            return None
+        if callable(where):
+            return where
+        checks = []
+        for field, cond in where.items():
+            if isinstance(cond, tuple) and len(cond) == 2:
+                checks.append((field, "range", cond[0], cond[1]))
+            else:
+                checks.append((field, "eq", cond, None))
+        def pred(rec):
+            for field, kind, a, b in checks:
+                v = rec.get(field)
+                if kind == "eq":
+                    if v != a:
+                        return False
+                else:
+                    if a is not None and v < a:
+                        return False
+                    if b is not None and v > b:
+                        return False
+            return True
+        return pred
 
     def __contains__(self, pk):
         return str(pk) in self._primary

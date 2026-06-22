@@ -463,6 +463,8 @@ posts.find("username", "alice", limit=20)      # alice's 20 most-recent posts
 posts.range("engagement", 1000, None)          # engagement >= 1000, ascending
 posts.range("created_at", limit=50, desc=True) # 50 most recent — no grouping needed
 posts.search("body", "inverted OR index")      # full-text → records
+posts.search("body", "inverted",               # full-text AND structured filter
+             where={"username": "alice", "created_at": (date(2026, 1, 1), None)})
 
 posts.increment("p1", "engagement", 1)         # atomic counter bump
 posts.update("p1", engagement=5000)            # re-indexes only changed fields

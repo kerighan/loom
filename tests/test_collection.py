@@ -277,6 +277,24 @@ class TestSearch:
         c.update("a2", body="now mentions python too")
         assert sorted(r["id"] for r in c.search("content", "python")) == ["a1", "a2", "a3"]
 
+    def test_search_with_where_filter(self, db):
+        c = make_articles(db)
+        c.insert_many(ARTICLES)   # a1 alice, a2 bob, a3 alice
+        # full-text AND author == alice
+        assert sorted(r["id"] for r in
+                      c.search("content", "python", where={"author": "alice"})) == ["a1", "a3"]
+        # full-text AND author == bob (no python match for bob)
+        assert c.search("content", "python", where={"author": "bob"}) == []
+        # callable predicate
+        assert sorted(r["id"] for r in
+                      c.search("content", "python", where=lambda r: r["author"] == "alice")) == ["a1", "a3"]
+        # range filter on a field (id between a1 and a2 inclusive)
+        ids = sorted(r["id"] for r in c.search("content", "python", where={"id": ("a1", "a2")}))
+        assert ids == ["a1"]
+        # with_scores + where + limit applied after filtering
+        res = c.search("content", "python", where={"author": "alice"}, with_scores=True, limit=1)
+        assert len(res) == 1 and res[0][0]["author"] == "alice"
+
     def test_delete_removes_from_search(self, db):
         c = make_articles(db)
         c.insert_many(ARTICLES)
