@@ -249,6 +249,14 @@ for k, v in idx.prefix("Beta"):   # prefix search
 
 `range()` is O(log n + k) in both directions — it seeks straight to the start (or, with `reverse=True`, the end) leaf rather than scanning from the smallest key.
 
+Keys are strings by default; pass `int_keys=True` for **integer keys ordered numerically** (stored order-preserving, so `2 < 10`, negatives supported) — `keys()`/`items()`/`range()`/`min()`/`max()` then take and return ints:
+
+```python
+ticks = db.create_btree("ticks", ohlcv_ds, int_keys=True)
+ticks[1700000000] = {...}
+ticks.range(1700000000, 1700003600)   # numeric range
+```
+
 ### Set — unique string collection
 
 ```python

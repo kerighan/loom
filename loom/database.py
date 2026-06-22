@@ -937,7 +937,7 @@ class DB:
         self._save_datastructures_registry()  # Persist registry
         return s
 
-    def create_btree(self, name, dataset, key_size=50, exist_ok=False):
+    def create_btree(self, name, dataset, key_size=50, int_keys=False, exist_ok=False):
         """Create a persistent BTree with ordered keys.
 
         BTree provides O(log n) operations with ordered iteration
@@ -947,6 +947,8 @@ class DB:
             name: Unique name for this BTree
             dataset: Dataset for storing values
             key_size: Maximum length of string keys (default: 50)
+            int_keys: If True, keys are integers ordered numerically (stored
+                order-preserving); keys()/items()/range() take and return ints.
 
         Returns:
             BTree instance
@@ -977,7 +979,7 @@ class DB:
         if existing is not None:
             return existing
 
-        btree = BTree(name, self, dataset, key_size=key_size)
+        btree = BTree(name, self, dataset, key_size=key_size, int_keys=int_keys)
         self._datastructures[name] = btree  # Register for caching and auto-save
         self._save_datastructures_registry()  # Persist registry
         return btree

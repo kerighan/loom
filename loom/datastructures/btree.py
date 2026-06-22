@@ -17,9 +17,22 @@ from loom.datastructures.template import DataStructureTemplate
 from loom.ref import Ref
 from loom.dataset import as_record
 
+# Order-preserving encoding for integer keys (int_keys=True): map signed int64
+# to a 20-digit zero-padded unsigned decimal so lexicographic == numeric order.
+_BT_INT_OFFSET = 1 << 63
+
+
+def _int_key(value):
+    return f"{int(value) + _BT_INT_OFFSET:020d}"
+
+
+def _int_unkey(s):
+    return int(s) - _BT_INT_OFFSET
+
 
 class BTree(DataStructure):
     MAX_VALUE_BLOCKS = 8
+    _int_keys = False   # class default for paths that bypass __init__ (nested from_ref)
     """Persistent B-tree with O(log n) operations and range queries.
 
     Usage:
@@ -69,6 +82,7 @@ class BTree(DataStructure):
         dataset_or_template=None,
         key_size: int = 50,
         auto_save_interval: int = None,
+        int_keys: bool = False,
         _parent=None,
     ):
         """Initialize a BTree.
@@ -81,6 +95,7 @@ class BTree(DataStructure):
             auto_save_interval: Save metadata every N operations
         """
         self._key_size = key_size
+        self._int_keys = int_keys
         self._parent_key = None
 
         if isinstance(dataset_or_template, DataStructureTemplate):
@@ -341,10 +356,21 @@ class BTree(DataStructure):
 
         self.save()
 
+    def _ekey(self, key):
+        """Encode a user key to its stored string form."""
+        if self._int_keys:
+            return _int_key(key)
+        return key if isinstance(key, str) else str(key)
+
+    def _dkey(self, stored):
+        """Decode a stored key string back to the user key type."""
+        return _int_unkey(stored) if self._int_keys else stored
+
     def _load(self):
         """Load existing BTree from disk."""
         metadata = self._load_metadata()
 
+        self._int_keys = metadata.get("int_keys", False)
         self._key_size = metadata.get("key_size", 50)
         self.root_addr = metadata.get("root_addr", 0)
         self.size = metadata.get("size", 0)
@@ -413,6 +439,7 @@ class BTree(DataStructure):
         """Save BTree metadata."""
         metadata = {
             "key_size": self._key_size,
+            "int_keys": self._int_keys,
             "root_addr": self.root_addr,
             "size": self.size,
             "height": self.height,
@@ -559,7 +586,7 @@ class BTree(DataStructure):
         """
         if self.root_addr != 0 or self.size != 0:
             raise ValueError("bulk_load requires an empty BTree")
-        items = sorted(((str(k), as_record(v)) for k, v in items), key=lambda kv: kv[0])
+        items = sorted(((self._ekey(k), as_record(v)) for k, v in items), key=lambda kv: kv[0])
         if not items:
             return
 
@@ -897,8 +924,7 @@ class BTree(DataStructure):
     @write_op
     def __setitem__(self, key, value):
         """Insert or update a key-value pair."""
-        if not isinstance(key, str):
-            key = str(key)
+        key = self._ekey(key)
 
         if not self._is_nested:
             value = as_record(value)   # accept a Pydantic model
@@ -963,8 +989,7 @@ class BTree(DataStructure):
 
     def get_ref(self, key):
         """Return a Ref handle to the underlying record for a key."""
-        if not isinstance(key, str):
-            key = str(key)
+        key = self._ekey(key)
 
         node, idx, found = self._search(key)
         if not found:
@@ -975,8 +1000,7 @@ class BTree(DataStructure):
 
     def __getitem__(self, key):
         """Get value for key."""
-        if not isinstance(key, str):
-            key = str(key)
+        key = self._ekey(key)
 
         node, idx, found = self._search(key)
         if not found:
@@ -1015,8 +1039,7 @@ class BTree(DataStructure):
     @write_op
     def __delitem__(self, key):
         """Delete a key."""
-        if not isinstance(key, str):
-            key = str(key)
+        key = self._ekey(key)
 
         self._delete(key)
         self.size -= 1
@@ -1025,8 +1048,7 @@ class BTree(DataStructure):
 
     def __contains__(self, key):
         """Check if key exists."""
-        if not isinstance(key, str):
-            key = str(key)
+        key = self._ekey(key)
 
         _, _, found = self._search(key)
         return found
@@ -1049,7 +1071,11 @@ class BTree(DataStructure):
         if self.root_addr == 0:
             return
 
-        yield from self._inorder_keys(self.root_addr)
+        if self._int_keys:
+            for k in self._inorder_keys(self.root_addr):
+                yield _int_unkey(k)
+        else:
+            yield from self._inorder_keys(self.root_addr)
 
     def _inorder_keys(self, node_addr):
         """In-order traversal yielding keys (B+ tree: only from leaves)."""
@@ -1165,6 +1191,7 @@ class BTree(DataStructure):
             return
         for key, value_addr in self._inorder_entries(self.root_addr):
             value_data = self._values_dataset[value_addr]
+            okey = self._dkey(key)
             if self._is_nested:
                 inner_class = self._template.ds_class
                 result = inner_class.from_ref(self._db, value_data)
@@ -1172,9 +1199,9 @@ class BTree(DataStructure):
                     result.set_shared_datasets(self._shared_datasets)
                 result._parent = self
                 result._parent_key = key
-                yield key, result
+                yield okey, result
             else:
-                yield key, value_data
+                yield okey, value_data
 
     def __iter__(self):
         """Iterate over keys."""
@@ -1189,7 +1216,7 @@ class BTree(DataStructure):
         while not node["is_leaf"]:
             node = self._read_node(node["children"][0])
 
-        return node["keys"][0] if node["num_keys"] > 0 else None
+        return self._dkey(node["keys"][0]) if node["num_keys"] > 0 else None
 
     def max(self):
         """Return the maximum key, or None if empty."""
@@ -1200,7 +1227,7 @@ class BTree(DataStructure):
         while not node["is_leaf"]:
             node = self._read_node(node["children"][node["num_keys"]])
 
-        return node["keys"][node["num_keys"] - 1] if node["num_keys"] > 0 else None
+        return self._dkey(node["keys"][node["num_keys"] - 1]) if node["num_keys"] > 0 else None
 
     # ========== Range Queries ==========
 
@@ -1220,6 +1247,10 @@ class BTree(DataStructure):
         if self.root_addr == 0:
             return
 
+        if self._int_keys:
+            start = _int_key(start) if start is not None else None
+            end = _int_key(end) if end is not None else None
+
         start_inc, end_inc = inclusive
 
         if reverse:
@@ -1236,7 +1267,7 @@ class BTree(DataStructure):
                     else:
                         if key <= start:
                             break
-                yield key, self._materialize(value_addr, key)
+                yield self._dkey(key), self._materialize(value_addr, key)
             return
 
         # Seek straight to the start leaf (O(log n)) instead of scanning the
@@ -1265,9 +1296,9 @@ class BTree(DataStructure):
                     result.set_shared_datasets(self._shared_datasets)
                 result._parent = self
                 result._parent_key = key
-                yield key, result
+                yield self._dkey(key), result
             else:
-                yield key, value_data
+                yield self._dkey(key), value_data
 
     def prefix(self, prefix_str):
         """Iterate over (key, value) pairs with keys starting with prefix.
@@ -1378,6 +1409,7 @@ class BTree(DataStructure):
         return {
             "schema": self.item_schema,
             "key_size": self._key_size,
+            "int_keys": self._int_keys,
         }
 
     @classmethod
@@ -1385,4 +1417,5 @@ class BTree(DataStructure):
         return cls(
             name, db, None,
             key_size=params.get("key_size", 50),
+            int_keys=params.get("int_keys", False),
         )

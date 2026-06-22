@@ -194,11 +194,11 @@ multi-writer semantics (readers hold LOCK_SH in locking mode).
 
 ---
 
-## 8. Quality-of-life / small items
+## 8. Quality-of-life / small items — ✅ mostly DONE
 
-- `db.stats()` — file size, fragmentation ratio, per-structure entry counts
-- `db.verify()` — walk all structures and check for corruption
-- Integer keys on BTree (currently strings only)
-- `dict.get_many(keys)` — bulk lookup with one mmap pass
-- `db.collection()` persisted metadata (avoid re-declaring lambdas on reopen)
-- Graceful handling of `HeaderTooLargeError` with auto-resize hint
+- ✅ `db.stats()` — file size, fragmentation ratio, per-structure entry counts
+- ✅ `db.verify()` — walk all structures and check for corruption
+- ✅ Integer keys on BTree (`create_btree(int_keys=True)`)
+- ✅ `dict.get_many(keys)` — bulk lookup with one mmap pass
+- ✅ `db.collection()` persisted metadata (declarative typed indexes)
+- ✅ Self-describing `header_size` (auto-detected on reopen)
