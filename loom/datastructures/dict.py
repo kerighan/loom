@@ -1513,6 +1513,27 @@ class Dict(DataStructure):
         except KeyError:
             return default
 
+    def get_many(self, keys):
+        """Bulk lookup → ``{key: value}`` for the keys that exist.
+
+        Resolves value addresses cache-first and reads them sorted by address
+        for better mmap locality.  Missing keys are simply absent from the
+        result (no KeyError)."""
+        resolved = []   # (key, value_addr)
+        for key in keys:
+            try:
+                addr = self._resolve_value_addr(key)
+            except KeyError:
+                continue
+            resolved.append((key, int(addr)))
+        out = {}
+        for key, addr in sorted(resolved, key=lambda kv: kv[1]):
+            v = self._values_dataset[addr]
+            if self._store_key and isinstance(v, dict) and "_key" in v:
+                v = {k: val for k, val in v.items() if k != "_key"}
+            out[key] = v
+        return out
+
     def _read_table_entries(self, table_addr, capacity):
         """Bulk-read a hash table and yield valid (key, value_addr) pairs.
 

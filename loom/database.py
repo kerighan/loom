@@ -1632,6 +1632,98 @@ class DB:
             self._shared_cache.clear()
         self.open()
 
+    def _collection_names(self):
+        return sorted(
+            k[len("__collection__::"):]
+            for k in self._db._header_data
+            if k.startswith("__collection__::")
+        )
+
+    def stats(self):
+        """Return a snapshot of disk usage and per-structure sizes.
+
+        Keys: filename, file_size, header_size, allocated_bytes (high-water
+        mark), free_bytes / free_blocks (reclaimable by vacuum),
+        fragmentation (free/allocated), collections, structures (top-level,
+        non-collection)."""
+        import os as _os
+
+        fio = self._db
+        file_size = _os.path.getsize(self.filename) if _os.path.exists(self.filename) else 0
+        allocated = fio._header_data.get(fio._allocation_index_key, fio.header_size)
+        free_bytes = sum(sz for _addr, sz in getattr(fio, "_freelist", []))
+        coll_names = self._collection_names()
+        owned_pats = [f"{c}__" for c in coll_names]
+
+        def _owned(n):
+            return any(p in n for p in owned_pats)
+
+        def _safe_len(s):
+            try:
+                return len(s)
+            except Exception:
+                return None
+
+        collections = {}
+        for name in coll_names:
+            col = self.collection(name)
+            collections[name] = {
+                "records": len(col),
+                "indexes": list(col._indexes.keys()),
+                "search": list(col._search.keys()),
+            }
+        structures = {
+            n: {"type": type(s).__name__, "length": _safe_len(s)}
+            for n, s in self._datastructures.items() if not _owned(n)
+        }
+        return {
+            "filename": self.filename,
+            "file_size": file_size,
+            "header_size": fio.header_size,
+            "allocated_bytes": int(allocated),
+            "free_bytes": int(free_bytes),
+            "free_blocks": len(getattr(fio, "_freelist", [])),
+            "fragmentation": (free_bytes / allocated) if allocated else 0.0,
+            "collections": collections,
+            "structures": structures,
+        }
+
+    def verify(self):
+        """Walk every structure and collection, returning a report of any
+        inconsistency found (dangling secondary-index pks, unreadable
+        structures).  O(n) — for occasional integrity checks.
+
+        Returns {"ok": bool, "issues": [str, ...]}."""
+        issues = []
+        for name, s in self._datastructures.items():
+            try:
+                if hasattr(s, "__len__"):
+                    len(s)
+            except Exception as e:                       # pragma: no cover
+                issues.append(f"structure {name!r}: not readable ({e})")
+        for cname in self._collection_names():
+            try:
+                col = self.collection(cname)
+            except Exception as e:                       # pragma: no cover
+                issues.append(f"collection {cname!r}: cannot open ({e})")
+                continue
+            primary = col._primary
+            for idx_name, ix in col._indexes.items():
+                struct = ix["struct"]
+                try:
+                    pairs = struct.items()
+                except Exception as e:                   # pragma: no cover
+                    issues.append(f"collection {cname!r} index {idx_name!r}: unreadable ({e})")
+                    continue
+                for _key, entry in pairs:
+                    pk = str(entry["pk"])
+                    if pk not in primary:
+                        issues.append(
+                            f"collection {cname!r} index {idx_name!r}: "
+                            f"dangling pk {pk!r}"
+                        )
+        return {"ok": not issues, "issues": issues}
+
     def _rollback_collection(self, ds_before, struct_before, cfg_key):
         """Undo a partially-created collection: unregister every dataset /
         datastructure created since the snapshot, and drop the config key."""
