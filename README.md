@@ -464,6 +464,10 @@ posts["p1"]["engagement"] = 5000               # same thing — write-through re
 posts.delete("p1")                             # removed from every index
 ```
 
+- **Upsert.** `insert`/`insert_many` replace a record whose primary key already
+  exists and re-point every index (the old field values' entries are dropped
+  first) — so re-loading a batch that contains existing keys stays consistent.
+  Within one `insert_many` batch a repeated key keeps the last occurrence.
 - **No duplication.** Secondary indexes store the *primary key*, not a copy of
   the record — a secondary lookup is one extra hop (`index → pk → record`). The
   full-text index keeps only postings (no record copy either).

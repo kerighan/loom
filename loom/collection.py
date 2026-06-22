@@ -233,20 +233,41 @@ class Collection:
                 del si["pk2docid"][pk]
 
     def insert(self, record):
+        """Insert a record, or upsert it if its primary key already exists
+        (the stored record is replaced and every index is re-pointed)."""
         record = as_record(record)
         pk = self._pk_of(record)
         with self._db.write_lock():
             with self._db.batch():
+                old = self._primary.get(pk)
+                if old is not None:        # upsert: drop the old index/search entries
+                    self._remove_from_indexes(old, pk)
+                    self._remove_from_search(pk)
                 self._primary[pk] = record
                 self._add_to_indexes(record, pk)
                 self._add_to_search(record, pk)
         return pk
 
     def insert_many(self, records):
-        records = [as_record(r) for r in records]
-        pks = [self._pk_of(r) for r in records]
+        """Bulk insert, upserting any record whose primary key already exists
+        (its old index/search entries are dropped first).  Within one batch a
+        repeated primary key keeps the last occurrence."""
+        # Dedup within the batch (last write wins), preserving first-seen order.
+        dedup = {}
+        for r in records:
+            r = as_record(r)
+            dedup[self._pk_of(r)] = r
+        pks = list(dedup.keys())
+        records = list(dedup.values())
         with self._db.write_lock():
             with self._db.batch():
+                # Upsert: drop stale index/search entries for pks already stored,
+                # so re-loading a batch with existing keys re-indexes cleanly.
+                for pk in pks:
+                    old = self._primary.get(pk)
+                    if old is not None:
+                        self._remove_from_indexes(old, pk)
+                        self._remove_from_search(pk)
                 # Primary + unique (Dict) indexes go through set_batch — one
                 # contiguous arena + a single parent-ref update.  Range/many
                 # (BTree) indexes have no bulk insert, so they loop.

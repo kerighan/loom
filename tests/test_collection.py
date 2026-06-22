@@ -144,6 +144,35 @@ class TestMutations:
         with pytest.raises(ValueError):
             posts.update("p1", id="pX")
 
+    def test_insert_existing_pk_upserts_and_reindexes(self, db):
+        posts = seed(make_posts(db))
+        # re-insert p1 with changed indexed fields → record replaced, indexes clean
+        posts.insert({"id": "p1", "username": "bob", "created_at": 500,
+                      "engagement": 7777, "likes": 0, "text": "moved"})
+        assert len(posts) == 5                                  # no duplicate record
+        assert posts["p1"]["username"] == "bob"
+        assert "p1" not in [p["id"] for p in posts.find("username", "alice")]
+        assert "p1" in [p["id"] for p in posts.find("username", "bob")]
+        # range: p1 appears exactly once, at its new engagement
+        eng = [(p["id"], p["engagement"]) for p in posts.range("engagement", 5000, None)]
+        assert eng == [("p1", 7777)]
+
+    def test_insert_many_upserts_and_dedups_batch(self, db):
+        posts = seed(make_posts(db))
+        posts.insert_many([
+            {"id": "p2", "username": "carol", "created_at": 9, "engagement": 10, "likes": 0, "text": "x"},
+            {"id": "p9", "username": "dave",  "created_at": 9, "engagement": 20, "likes": 0, "text": "y"},
+            {"id": "p9", "username": "dave2", "created_at": 9, "engagement": 25, "likes": 0, "text": "z"},  # dup → last wins
+        ])
+        assert len(posts) == 6                                  # p2 updated, p9 added once
+        assert posts["p2"]["username"] == "carol"
+        assert posts["p9"]["username"] == "dave2"
+        assert "p2" not in [p["id"] for p in posts.find("username", "alice")]  # old value gone
+        assert [p["id"] for p in posts.find("username", "dave")] == []          # overwritten in-batch
+        # no duplicate range entries for the upserted/added pks
+        ids = [p["id"] for p in posts.range("engagement", None, None)]
+        assert len(ids) == len(set(ids)) == 6
+
 
 class TestPersistence:
     def test_reopen(self, db):
