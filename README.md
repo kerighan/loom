@@ -50,7 +50,7 @@ Define your record schema as a Pydantic model. loom maps types automatically:
 | `bool` | `bool` | |
 | `datetime` / `date` | `datetime` | **Stored inline as int64 epoch-µs**, read/written as Python `datetime` — naturally ordered (range/sort/PriorityQueue work) |
 | `str` | `text` | Variable-length, compressed via BlobStore |
-| `Utf8(N)` | `utf8[N]` | **Fixed-width inline UTF-8, N bytes** — ~4× smaller than `U{N}` for ASCII, same read speed |
+| `Utf8(N)` | `utf8[N]` | **Fixed-width inline UTF-8, N bytes** — ~4× smaller than `U{N}` for ASCII, same read speed. **Raises** if a value exceeds N bytes; `Utf8(N, truncate=True)` to truncate instead |
 | `str = Field(max_length=N)` | `U{N}` | Fixed-length numpy UCS-4 (4 bytes/char) |
 | `FixedStr(N)` | `U{N}` | loom shorthand for the above |
 
@@ -125,6 +125,9 @@ db.create_list("feed", ds, exist_ok=True)  # idempotent: returns the existing on
 
 After reopening a DB, get your structures back with `db["name"]` (they're already
 loaded) — or pass `exist_ok=True` to `create_*` for an explicit open-or-create.
+This applies to **collections** too: `db["posts"]` (or `"posts" in db`) returns a
+reopened `Collection`, `db.collection("posts", Model, ...)` raises if it already
+exists, and `db.collection("posts", Model, ..., exist_ok=True)` opens-or-creates.
 
 ---
 
@@ -763,7 +766,7 @@ Bottom line: use a `Dict` for pure point access, a `BTree` when you need orderin
 - `blob_compression=None` (**default**) — fastest writes, larger files.
 - `"brotli"` — 3–5× compression on natural language, but ~20× slower inserts; pick when storage > write throughput.
 - `Field(max_length=N)` → `U{N}` — keeps the field in the fixed record (UCS-4, **4 bytes/char**), no BlobStore.
-- `Utf8(N)` → `utf8[N]` — fixed-width **inline UTF-8**: N bytes in the record, no BlobStore hop, so ~**4× smaller than `U{N}`** for ASCII at the same read speed. `N` is a byte budget (over-long values truncate on a codepoint boundary). The sweet spot for short ASCII-ish strings — ids, URLs, codes, enums.
+- `Utf8(N)` → `utf8[N]` — fixed-width **inline UTF-8**: N bytes in the record, no BlobStore hop, so ~**4× smaller than `U{N}`** for ASCII at the same read speed. `N` is a byte budget; a value over budget **raises ValueError** by default (use `Utf8(N, truncate=True)` to truncate on a codepoint boundary instead). The sweet spot for short ASCII-ish strings — ids, URLs, codes, enums.
 
 **Choosing a string field**: `Utf8(N)` for bounded ASCII-ish values you read a lot (inline, compact, fast); `str`/`text` for long or unbounded natural language (BlobStore, compressible); `U{N}`/`FixedStr(N)` only when you specifically need fixed UCS-4. loom stores Dict/Graph **keys** (`_key`) as `utf8` by default for exactly this reason.
 

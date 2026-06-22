@@ -331,7 +331,8 @@ class DataStructure(ABC):
                 elif hasattr(ds, "_blob_fields") and name in ds._blob_fields:
                     result[name] = "blob"
                 elif name in getattr(ds, "_utf8_fields", {}):
-                    result[name] = f"utf8[{ds._utf8_fields[name]}]"
+                    strict = name in getattr(ds, "_utf8_strict", set())
+                    result[name] = f"utf8[{ds._utf8_fields[name]}{'!' if strict else ''}]"
                 elif name in getattr(ds, "_datetime_fields", set()):
                     result[name] = "datetime"
                 else:

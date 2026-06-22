@@ -173,7 +173,7 @@ def Vec(*shape: int):
     return Annotated[list, _VecMeta]
 
 
-def Utf8(max_bytes: int):
+def Utf8(max_bytes: int, truncate: bool = False):
     """Fixed-width UTF-8 string field (→ 'utf8[N]', stored inline as N bytes).
 
     The space-efficient middle ground between `FixedStr(N)`/`U{N}` (numpy
@@ -184,22 +184,28 @@ def Utf8(max_bytes: int):
 
     IMPORTANT: `max_bytes` is a **byte** budget, not a character count.
     ASCII fits `max_bytes` characters; accented/CJK text fits fewer.
-    Over-long values are truncated on a UTF-8 codepoint boundary (never
-    splitting a character), matching U{N}'s truncate-on-overflow behaviour.
+    By default (`truncate=False`) a value that exceeds the byte budget **raises
+    ValueError** — failing loudly beats silently corrupting an id/key.  Pass
+    `truncate=True` to instead truncate on a UTF-8 codepoint boundary (never
+    splitting a character), matching U{N}'s behaviour.
+
+    IMPORTANT: `max_bytes` is a **byte** budget, not a character count.
 
     Example:
         from loom.schema import Utf8
 
         class Page(BaseModel):
-            url:   Utf8(200)    # ASCII URLs: 200 B inline vs 800 B for U200
-            title: str          # long/unicode → text (BlobStore)
+            slug:  Utf8(64)                # raises if a slug is over 64 bytes
+            url:   Utf8(200, truncate=True)  # silently truncate long URLs
+            title: str                     # long/unicode → text (BlobStore)
 
     Lexicographic ordering is preserved (UTF-8 sorts in code-point order),
     so a utf8 field is safe as a BTree key.
     """
     from typing import Annotated
 
-    tag = f"utf8[{max_bytes}]"
+    # "utf8[N]" truncates; "utf8[N!]" raises on overflow.
+    tag = f"utf8[{max_bytes}]" if truncate else f"utf8[{max_bytes}!]"
 
     class _Utf8Meta:
         loom_dtype = tag

@@ -55,6 +55,34 @@ def test_name_unique_across_namespaces(db):
         db.create_dataset("events", id="uint32")
 
 
+def test_collection_duplicate_and_retrieval(db):
+    from loom import Many
+
+    model = {"post_id": "utf8[32]", "name": "utf8[64]", "created_at": "int64"}
+    idx = {"post_id": "primary", "name": Many(sort="created_at", desc=True)}
+    posts = db.collection("posts", model, indexes=idx)
+    posts.insert({"post_id": "p1", "name": "alice", "created_at": 1})
+
+    # db[name] / `in` work for collections (not just datasets/structures)
+    assert "posts" in db
+    assert db["posts"] is not None
+    assert len(db["posts"]) == 1
+
+    # re-creating an existing collection raises a clear "Collection" error
+    with pytest.raises(DuplicateNameError, match="Collection"):
+        db.collection("posts", model, indexes=idx)
+    # exist_ok reopens it
+    again = db.collection("posts", model, indexes=idx, exist_ok=True)
+    assert len(again) == 1
+
+    # a dataset / structure cannot reuse a collection's name (db[name] ambiguity)
+    with pytest.raises(DuplicateNameError):
+        db.create_dataset("posts", id="int64")
+    tmp_ds = db.create_dataset("tmp_ds", id="int64")
+    with pytest.raises(DuplicateNameError):
+        db.create_list("posts", tmp_ds)
+
+
 def test_reopen_retrieves_via_getitem():
     tmp = tempfile.mkdtemp()
     path = os.path.join(tmp, "dup.db")

@@ -134,10 +134,46 @@ class TestUtf8Keys:
 class TestUtf8Pydantic:
     def test_schema_from_model(self):
         class Page(BaseModel):
-            url: Utf8(200)
+            url: Utf8(200)                 # raise by default → utf8[200!]
+            slug: Utf8(64, truncate=True)  # opt into truncation → utf8[64]
             title: str
 
-        assert schema_from_model(Page) == {"url": "utf8[200]", "title": "text"}
+        assert schema_from_model(Page) == {
+            "url": "utf8[200!]", "slug": "utf8[64]", "title": "text",
+        }
+
+    def test_overflow_raises_by_default(self, db):
+        class Tag(BaseModel):
+            name: Utf8(8)                  # raise by default
+
+        ds = db.create_dataset("tags", model=Tag)
+        assert ds._utf8_strict == {"name"}
+        ds.insert({"name": "short"})       # fits → OK
+        with pytest.raises(ValueError):
+            ds.insert({"name": "way_too_long_value"})
+
+    def test_truncate_true_still_truncates(self, db):
+        class Tag(BaseModel):
+            name: Utf8(8, truncate=True)
+
+        ds = db.create_dataset("tags", model=Tag)
+        ref = ds.insert({"name": "way_too_long_value"})
+        assert ds[ref.addr]["name"] == "way_too_"   # 8 bytes, no error
+
+    def test_strict_survives_reopen(self):
+        import os, tempfile
+        path = os.path.join(tempfile.mkdtemp(), "u.db")
+
+        class Tag(BaseModel):
+            name: Utf8(8)
+
+        with DB(path) as db:
+            db.create_dataset("tags", model=Tag)
+        with DB(path) as db:
+            ds = db.get_dataset("tags")
+            assert ds._utf8_strict == {"name"}
+            with pytest.raises(ValueError):
+                ds.insert({"name": "way_too_long_value"})
 
     def test_create_dataset_from_model(self, db):
         class Page(BaseModel):

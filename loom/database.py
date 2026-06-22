@@ -349,7 +349,8 @@ class DB:
         if field_name in dataset._blob_fields:
             return "blob"
         if field_name in getattr(dataset, "_utf8_fields", {}):
-            return f"utf8[{dataset._utf8_fields[field_name]}]"
+            strict = field_name in getattr(dataset, "_utf8_strict", set())
+            return f"utf8[{dataset._utf8_fields[field_name]}{'!' if strict else ''}]"
         if field_name in getattr(dataset, "_datetime_fields", set()):
             return "datetime"
         dtype = dataset.user_schema.fields[field_name][0]
@@ -483,6 +484,8 @@ class DB:
         if name in other:
             # name taken by the other kind — db[name] would be ambiguous
             raise DuplicateNameError(name, "Data structure" if in_dataset else "Dataset")
+        if self._is_collection(name):
+            raise DuplicateNameError(name, "Collection")
         return None
 
     def create_dataset(self, dataset_name, model=None, exist_ok=False, **schema):
@@ -586,11 +589,20 @@ class DB:
         if name in self._datasets:
             return self._datasets[name]
 
+        # Then collections (stored as header config, reopened on demand)
+        if self._is_collection(name):
+            return self.collection(name)
+
         raise StructureNotFoundError(name)
 
+    def _is_collection(self, name):
+        """True if `name` is a Collection (stored as a header config entry)."""
+        return self._db.has_header_field(f"__collection__::{name}")
+
     def __contains__(self, name):
-        """Check if a name exists in datasets or data structures."""
-        return name in self._datasets or name in self._datastructures
+        """Check if a name exists as a dataset, data structure, or collection."""
+        return (name in self._datasets or name in self._datastructures
+                or self._is_collection(name))
 
     def has_dataset(self, name):
         """Check if a dataset exists.
@@ -1306,7 +1318,7 @@ class DB:
         return idx
 
     def collection(self, name, model=None, indexes=None, key_size=64,
-                   index_key_size=192):
+                   index_key_size=192, exist_ok=False):
         """Create or reopen a Collection: a record store with typed indexes.
 
         Each field's index *kind* is declared and mapped to the right loom
@@ -1393,6 +1405,16 @@ class DB:
 
         # ── Create ──────────────────────────────────────────────────────
         self._ensure_writable()
+        if cfg:
+            # collection already exists — reopen it (exist_ok) or fail clearly
+            # (rather than the confusing internal "Dataset 'name__data' exists").
+            if exist_ok:
+                return self.collection(name)
+            raise DuplicateNameError(name, "Collection")
+        # the collection's public name must be free across all namespaces
+        if name in self._datasets or name in self._datastructures:
+            raise DuplicateNameError(name, "Dataset" if name in self._datasets
+                                     else "Data structure")
         specs = {f: _as_spec(s) for f, s in (indexes or {}).items()}
         primaries = [f for f, s in specs.items() if s.kind == "primary"]
         if len(primaries) != 1:

@@ -169,6 +169,8 @@ class Dataset:
         # — ~4× smaller than U{N} (UCS-4, 4 bytes/char) for ASCII, with no
         # BlobStore indirection.  N is a BYTE budget, not a char count.
         self._utf8_fields = {}
+        # utf8 fields declared "utf8[N!]" raise on overflow instead of truncating
+        self._utf8_strict = set()
         # Datetime fields: stored inline as int64 epoch-microseconds, encoded/
         # decoded to Python datetime transparently (see _dt_to_micros).
         self._datetime_fields = set()
@@ -189,8 +191,12 @@ class Dataset:
                 self._datetime_fields.add(field)
                 processed_schema.append((field, np.dtype("int64")))
             elif isinstance(dtype, str) and dtype.startswith("utf8[") and dtype.endswith("]"):
-                n = int(dtype[5:-1])
+                inner = dtype[5:-1]
+                strict = inner.endswith("!")
+                n = int(inner[:-1] if strict else inner)
                 self._utf8_fields[field] = n
+                if strict:
+                    self._utf8_strict.add(field)
                 processed_schema.append((field, np.dtype(f"S{n}")))
             else:
                 np_dtype = parse_dtype(dtype)
@@ -211,13 +217,21 @@ class Dataset:
         self._zero_record = self._serialize_zero()
 
     @staticmethod
-    def _utf8_pack(value, n):
-        """Encode a str to at most n UTF-8 bytes, truncating on a codepoint
-        boundary (never splits a multi-byte char → always valid UTF-8)."""
+    def _utf8_pack(value, n, strict=False, field=None):
+        """Encode a str to at most n UTF-8 bytes.
+
+        Truncates on a codepoint boundary (never splits a multi-byte char) by
+        default; if ``strict``, raises ValueError when the value exceeds the
+        byte budget instead of silently truncating."""
         if value is None:
             return b""
         enc = value.encode("utf-8") if isinstance(value, str) else bytes(value)
         if len(enc) > n:
+            if strict:
+                raise ValueError(
+                    f"utf8 field {field!r}: value is {len(enc)} bytes, exceeds the "
+                    f"{n}-byte budget (declared truncate=False)"
+                )
             # decode(errors="ignore") drops the trailing partial sequence
             enc = enc[:n].decode("utf-8", "ignore").encode("utf-8")
         return enc
@@ -276,7 +290,10 @@ class Dataset:
                         arr[field]["offset"] = value[0]
                         arr[field]["n_slots"] = value[1]
                 elif field in self._utf8_fields:
-                    arr[field] = self._utf8_pack(value, self._utf8_fields[field])
+                    arr[field] = self._utf8_pack(
+                        value, self._utf8_fields[field],
+                        field in self._utf8_strict, field,
+                    )
                 elif field in self._datetime_fields:
                     arr[field] = _dt_to_micros(value)
                 elif field in self._array_fields:
@@ -498,7 +515,10 @@ class Dataset:
 
         if field_name in self._utf8_fields:
             field_dtype = self.user_schema.fields[field_name][0]
-            packed = self._utf8_pack(value, self._utf8_fields[field_name])
+            packed = self._utf8_pack(
+                value, self._utf8_fields[field_name],
+                field_name in self._utf8_strict, field_name,
+            )
             data = np.array([packed], dtype=field_dtype).tobytes()
             self.db.write(address + field_offset, data)
             return
