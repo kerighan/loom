@@ -270,6 +270,29 @@ class Collection:
         records = list(dedup.values())
         with self._db.write_lock():
             with self._db.batch():
+                # Enforce unique constraints up front (before any write), both
+                # within the batch and against existing rows — a violation
+                # leaves the collection untouched.
+                for ix in self._indexes.values():
+                    if ix["spec"].kind != "unique":
+                        continue
+                    seen = {}
+                    for record, pk in zip(records, pks):
+                        key = self._index_key(ix, record, pk)
+                        if key is None:
+                            continue
+                        if key in seen:
+                            raise ValueError(
+                                f"duplicate value for unique index {ix['name']!r} "
+                                f"within the batch"
+                            )
+                        existing = ix["struct"].get(key)
+                        if existing is not None and str(existing["pk"]) != pk:
+                            raise ValueError(
+                                f"duplicate value for unique index {ix['name']!r}: "
+                                f"{record.get(ix['field'])!r}"
+                            )
+                        seen[key] = pk
                 # Upsert: drop stale index/search entries for pks already stored,
                 # so re-loading a batch with existing keys re-indexes cleanly.
                 for pk in pks:

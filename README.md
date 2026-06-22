@@ -96,8 +96,14 @@ with DB("mydata.db",
         auto_save_interval=100,       # metadata save frequency (default 100)
         cache_size=200_000,           # shared key→address LRU for the whole DB (default; 0 disables)
         sync_writes=False,            # False=fast (flush on close), True=safe (flush every write)
+        header_size=32768,            # metadata region; raise it for many structures/indexes
 ) as db:
     ...
+
+# header_size is stored in the file: after creation you can reopen with just
+# DB("mydata.db") and the real value is detected automatically (no need to
+# re-pass it). Raise it at creation if you hit HeaderTooLargeError (lots of
+# indexes/collections); it can't shrink/grow on an existing file.
 
 # db.batch() is useful mainly for text/blob fields — for fixed schemas the
 # lazy flush already makes per-call inserts as fast as batch inserts.
@@ -468,6 +474,8 @@ posts.delete("p1")                             # removed from every index
   exists and re-point every index (the old field values' entries are dropped
   first) — so re-loading a batch that contains existing keys stays consistent.
   Within one `insert_many` batch a repeated key keeps the last occurrence.
+  `unique` constraints are enforced by both `insert` and `insert_many` (a
+  duplicate value raises `ValueError` before anything is written).
 - **No duplication.** Secondary indexes store the *primary key*, not a copy of
   the record — a secondary lookup is one extra hop (`index → pk → record`). The
   full-text index keeps only postings (no record copy either).

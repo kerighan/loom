@@ -1425,6 +1425,35 @@ class DB:
             )
         primary_field = primaries[0]
 
+        ds_before = set(self._datasets)
+        struct_before = set(self._datastructures)
+        try:
+            return self._build_collection(
+                name, model, specs, primary_field, key_size, index_key_size, cfg_key,
+            )
+        except Exception:
+            # Roll back everything this call created, so a failed creation (e.g.
+            # header overflow on the final config save) leaves no orphan
+            # structures that would block a retry.  Disk is reclaimed by vacuum.
+            self._rollback_collection(ds_before, struct_before, cfg_key)
+            raise
+
+    def _rollback_collection(self, ds_before, struct_before, cfg_key):
+        """Undo a partially-created collection: unregister every dataset /
+        datastructure created since the snapshot, and drop the config key."""
+        hd = self._db._header_data
+        for n in list(set(self._datastructures) - struct_before):
+            self._datastructures.pop(n, None)
+            hd.pop(f"_ds_{n}_metadata", None)
+        for n in list(set(self._datasets) - ds_before):
+            self._datasets.pop(n, None)
+        hd.pop(cfg_key, None)
+        self._save_datastructures_registry()
+        self._save_registry()
+
+    def _build_collection(self, name, model, specs, primary_field,
+                          key_size, index_key_size, cfg_key):
+        from loom.collection import Collection
         from loom.dataset import Dataset
         if isinstance(model, Dataset):
             dataset = model

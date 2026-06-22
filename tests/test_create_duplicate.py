@@ -100,6 +100,49 @@ def test_collection_duplicate_and_retrieval(db):
         db.create_list("posts", tmp_ds)
 
 
+def test_unique_enforced_in_insert_many(db):
+    from loom import Unique
+
+    users = db.collection("users", {"uid": "utf8[8]", "email": "utf8[24]"},
+                          indexes={"uid": "primary", "email": "unique"})
+    # duplicate email within the batch → raises, nothing written
+    with pytest.raises(ValueError):
+        users.insert_many([{"uid": "u1", "email": "a@x"}, {"uid": "u2", "email": "a@x"}])
+    assert len(users) == 0
+
+    users.insert_many([{"uid": "u1", "email": "a@x"}, {"uid": "u2", "email": "b@x"}])
+    assert len(users) == 2
+    # reusing an existing email under a new pk → raises, length unchanged
+    with pytest.raises(ValueError):
+        users.insert_many([{"uid": "u3", "email": "a@x"}])
+    assert len(users) == 2
+    # upserting the same pk with an unchanged unique value is fine
+    users.insert_many([{"uid": "u1", "email": "a@x"}])
+    assert users.get("email", "a@x")["uid"] == "u1"
+
+
+def test_failed_collection_creation_rolls_back():
+    # A creation that overflows the header must not leave orphan internal
+    # structures that block a retry.
+    from loom import Many, Search
+    from loom.errors import HeaderTooLargeError, DuplicateNameError
+
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "rb.db")
+    with DB(path, header_size=2048) as db:   # tiny header → cfg save overflows
+        schema = {"id": "utf8[16]", "a": "utf8[16]", "b": "utf8[16]", "text": "text"}
+        idx = {"id": "primary", "a": Many(sort="id"), "b": Many(sort="id"),
+               "body": Search(fields=["text"], scoring="bm25")}
+        with pytest.raises(HeaderTooLargeError):
+            db.collection("posts", schema, indexes=idx)
+        assert "posts" not in db
+        assert not [n for n in db._datastructures if n.startswith("posts")]
+        assert not [n for n in db._datasets if n.startswith("posts")]
+        # the retry is not blocked by a DuplicateNameError from orphans
+        with pytest.raises(HeaderTooLargeError):
+            db.collection("posts", schema, indexes=idx)
+
+
 def test_reopen_retrieves_via_getitem():
     tmp = tempfile.mkdtemp()
     path = os.path.join(tmp, "dup.db")

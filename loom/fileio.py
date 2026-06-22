@@ -45,6 +45,7 @@ class ByteFileDB:
         self._freelist_dirty = False
         self._allocation_index_key = "_allocation_index"
         self._is_initialized_key = "_is_initialized"
+        self._header_size_key = "_header_size"  # persisted → self-describing on reopen
 
     def _grow_file_size(self, min_size):
         """Grow the file to at least min_size using exponential growth."""
@@ -75,6 +76,13 @@ class ByteFileDB:
             self.file_handle = open(self.filename, "r+b")
             self.mapped_file = mmap.mmap(self.file_handle.fileno(), 0)
             self.recover_from_log()
+        # Adopt the header_size the file was actually created with (stored in
+        # slot A, readable at a fixed offset) so reopening with a different /
+        # default header_size can't silently mis-read the header.
+        stored = self._peek_stored_header_size()
+        if stored is not None and stored != self.header_size:
+            self.header_size = stored
+            self._slot_size = (stored - 1) // 2
         self._load_header()
 
     def close(self):
@@ -173,6 +181,24 @@ class ByteFileDB:
         """Get the mmap offset of a header slot (0=A, 1=B)."""
         return 1 + slot * self._slot_size
 
+    def _peek_stored_header_size(self):
+        """Read the stored header_size from slot A WITHOUT relying on the
+        header_size we were constructed with.  Slot A always starts at byte
+        offset 1: [magic 4B][size 4B][pickle].  Returns int, or None for an
+        uninitialised file or one written before header_size was persisted."""
+        mf = self.mapped_file
+        if mf is None or len(mf) < 9 or bytes(mf[1:5]) != b"LOOM":
+            return None
+        try:
+            data_size = int(np.frombuffer(mf[5:9], dtype="uint32")[0])
+            if data_size <= 0 or 9 + data_size > len(mf):
+                return None
+            data = pickle.loads(bytes(mf[9 : 9 + data_size]))
+        except Exception:
+            return None
+        v = data.get(self._header_size_key) if isinstance(data, dict) else None
+        return int(v) if isinstance(v, int) and v > 0 else None
+
     def _read_slot(self, slot):
         """Try to deserialize header data from a slot. Returns dict or None."""
         offset = self._slot_offset(slot)
@@ -210,6 +236,9 @@ class ByteFileDB:
             return
 
         self._header_data = data
+        # Gracefully upgrade pre-existing files: record the header_size so the
+        # next save makes the file self-describing (persisted on next write).
+        self._header_data.setdefault(self._header_size_key, self.header_size)
         self._header_dirty = False
         self._load_freelist()
 
@@ -219,6 +248,7 @@ class ByteFileDB:
         self._header_data = {
             self._is_initialized_key: True,
             self._allocation_index_key: self.header_size,
+            self._header_size_key: self.header_size,
         }
         # Write to both slots for a clean start
         self.mapped_file[0] = 0  # Slot A active

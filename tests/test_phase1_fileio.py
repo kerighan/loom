@@ -463,5 +463,39 @@ class TestIntegration:
                 os.remove(filename)
 
 
+class TestHeaderSizeSelfDescribing:
+    """header_size is persisted and auto-detected on reopen."""
+
+    def test_reopen_without_header_size_auto_detects(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "h.db")
+            db = ByteFileDB(path, header_size=131072)
+            db.open()
+            db.set_header_field("x", "y")
+            db.close()
+
+            # reopen with the DEFAULT header_size → must adopt the real one
+            db2 = ByteFileDB(path)  # default 32768
+            db2.open()
+            assert db2.header_size == 131072
+            assert db2._slot_size == (131072 - 1) // 2
+            assert db2.get_header_field("x") == "y"
+            db2.close()
+
+    def test_reopen_with_wrong_header_size_adopts_stored(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "h.db")
+            db = ByteFileDB(path, header_size=65536)
+            db.open()
+            db.set_header_field("k", list(range(1000)))
+            db.close()
+
+            db2 = ByteFileDB(path, header_size=131072)  # different value
+            db2.open()
+            assert db2.header_size == 65536
+            assert db2.get_header_field("k") == list(range(1000))
+            db2.close()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
