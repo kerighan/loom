@@ -471,6 +471,11 @@ class Collection:
     def __len__(self):
         return len(self._primary)
 
+    def __iter__(self):
+        """Iterate over records (a Collection is a record store, so this yields
+        records — use keys()/items() for primary keys or (pk, record) pairs)."""
+        return self.values()
+
     def keys(self):
         return self._primary.keys()
 

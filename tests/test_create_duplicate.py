@@ -55,6 +55,23 @@ def test_name_unique_across_namespaces(db):
         db.create_dataset("events", id="uint32")
 
 
+def test_collection_iteration_yields_records(db):
+    col = db.collection("posts", {"post_id": "utf8[32]", "n": "int64"},
+                        indexes={"post_id": "primary"})
+    for i in range(5):
+        col.insert({"post_id": f"p{i}", "n": i})
+
+    # `for x in collection` yields records (not integer-indexed → no KeyError)
+    records = list(col)
+    assert len(records) == 5
+    assert sum(1 for _ in col) == 5
+    assert all(isinstance(r, dict) and "post_id" in r for r in records)
+    assert {r["post_id"] for r in records} == {f"p{i}" for i in range(5)}
+    # keys()/items() remain available for pks / pairs
+    assert set(col.keys()) == {f"p{i}" for i in range(5)}
+    assert all(isinstance(pk, str) for pk, _ in col.items())
+
+
 def test_collection_duplicate_and_retrieval(db):
     from loom import Many
 
