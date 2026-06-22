@@ -2,7 +2,7 @@
 
 **Persistent Python data structures that feel native.**
 
-loom is a file-backed database library that lets you work with `Dict`, `List`, `Queue`, `Set`, `BTree`, `Graph`, and **vector indexes** exactly like their in-memory counterparts — but stored on disk with mmap zero-copy access, crash-safe writes, and automatic space reclamation.
+loom is a file-backed database library that lets you work with `Dict`, `List`, `Queue`, `Set`, `BTree`, `Graph`, **vector indexes**, and **full-text search** exactly like their in-memory counterparts — but stored on disk with mmap zero-copy access, crash-safe writes, and automatic space reclamation. Higher-level `Collection`s bundle a record store with typed indexes kept in sync for you.
 
 No server. No ORM. No SQL. Just Python objects that persist.
 
@@ -362,54 +362,117 @@ Notes:
 
 ---
 
-## Collection — a record store with attached indexes
+## Collection — a record store with typed indexes
 
-Looking records up by more than one field normally means maintaining a second
-`Dict` by hand and keeping it in sync. A `Collection` does that for you: the
-record lives **once** in a primary index (keyed by your primary key), and you
-**attach** secondary indexes that map another field → the primary key. Every
-insert / update / delete updates all of them under one lock.
+Looking records up by more than one field normally means maintaining several
+structures by hand and keeping them in sync. A `Collection` does that for you:
+you **declare each field's index kind** and loom maps it to the right structure,
+kept in sync on every insert / update / delete under one lock. The record lives
+**once** in the primary index; every other index stores only the primary key.
+
+| Kind | Structure | Use it for |
+|------|-----------|------------|
+| `"primary"` | Dict | the record store + unique key (exactly one required) |
+| `"unique"` | Dict | a second 1:1 lookup key (enforces uniqueness) |
+| `"range"` | B+Tree | numeric / ordered range scans (`>=`, between) |
+| `Many(sort=, desc=)` | B+Tree | one-to-many groups, returned in sort order |
+| `Search(fields=, scoring=)` | SearchIndex | full-text (boolean or BM25) |
 
 ```python
 from pydantic import BaseModel, Field
+from loom import Many, Search
 
-class User(BaseModel):
-    username: str = Field(max_length=30)
-    email:    str = Field(max_length=40)
-    city:     str = Field(max_length=20)
+class Post(BaseModel):
+    id:         str = Field(max_length=32)
+    username:   str = Field(max_length=30)
+    created_at: int
+    engagement: int
+    text:       str
 
-users = db.collection(
-    "users", User,
-    key="username",                       # primary key field
-    indexes={
-        "email":    "email",              # field name → persisted, auto-restored
-        "city":     "city",
-        "email_lc": lambda r: r["email"].lower(),  # computed key → re-supply on reopen
-    },
-)
+posts = db.collection("posts", Post, indexes={
+    "id":         "primary",                          # record store, by id
+    "username":   Many(sort="created_at", desc=True), # a user's feed, recent first
+    "engagement": "range",                            # engagement >= x
+    "body":       Search(fields=["text"], scoring="bm25"),  # full-text
+})
 
-users.insert({"username": "alice", "email": "Alice@x.com", "city": "NYC"})
+posts.insert({"id": "p1", "username": "alice", "created_at": 170,
+              "engagement": 9, "text": "an inverted index in pure python"})
+posts.insert_many([...])                       # bulk (bulk-loads empty BTrees)
 
-users["alice"]                    # primary lookup
-users.get("email", "Alice@x.com") # secondary lookup → full record
-users.get("email_lc", "alice@x.com")
-users.get_pk("city", "NYC")       # → "alice"  (primary key only, no record read)
+posts["p1"]                                    # by primary key
+posts.find("username", "alice", limit=20)      # alice's 20 most-recent posts
+posts.range("engagement", 1000, None)          # engagement >= 1000, ordered
+posts.search("body", "inverted OR index")      # full-text → records
 
-users.update("alice", email="new@x.com")  # re-indexes the email automatically
-users.delete("alice")                      # removed from every index
+posts.increment("p1", "engagement", 1)         # atomic counter bump
+posts.update("p1", engagement=5000)            # re-indexes only changed fields
+posts["p1"]["engagement"] = 5000               # same thing — write-through record
+posts.delete("p1")                             # removed from every index
 ```
 
-`indexes` can also be a plain list of field names: `indexes=["email", "city"]`.
-
 - **No duplication.** Secondary indexes store the *primary key*, not a copy of
-  the record — a secondary lookup is one extra hop (`index → pk → record`).
-- **Persistence.** Field-name indexes are saved with the collection, so
-  `db.collection("users")` (no model) reopens it and rebuilds them
-  automatically. Lambda/computed indexes can't be serialised — re-pass them in
-  `indexes=` on reopen.
+  the record — a secondary lookup is one extra hop (`index → pk → record`). The
+  full-text index keeps only postings (no record copy either).
+- **Ordered & paginated for free.** `Many(sort="created_at", desc=True)` stores
+  composite keys in a B+Tree, so `find()` returns a group already in sort order
+  with cheap `limit` — ideal for recent-first feeds.
+- **Persistence.** The index declaration is saved with the collection, so
+  `db.collection("posts")` (no model) reopens it and restores every index
+  automatically.
 - **Atomicity.** Writes touch all indexes under `db.write_lock()` + `db.batch()`
   (serialised, grouped). This is not a full crash-atomic WAL across indexes; if
-  a crash ever desyncs an index, call `users.reindex()` to rebuild it.
+  a crash ever desyncs an index, call `posts.reindex()` to rebuild them.
+
+---
+
+## SearchIndex — full-text inverted index
+
+A persistent inverted index for boolean and ranked (BM25) full-text search.
+Documents live in one of your datasets; the index stores only the postings and
+keeps each document's address — text is never duplicated. Boolean queries
+(`AND` / `OR` / `AND NOT`, parentheses, `*` wildcards) are parsed by
+[`eldar`](https://pypi.org/project/eldar/) (`pip install eldar`).
+
+```python
+docs = db.create_dataset("docs", title="utf8[120]", body="text")
+idx  = db.create_search_index(
+    "idx", docs,
+    text_fields=["title", "body"],   # None → all string fields
+    scoring="bm25",                  # "boolean" (default) or "bm25"
+)
+
+i = idx.add({"title": "Fast search", "body": "an inverted index"})  # → doc-id
+idx.add_many([{"title": ..., "body": ...}, ...])
+
+# Boolean — unranked, doc-id order
+idx.search("inverted AND NOT slow", mode="boolean")   # → [records]
+
+# Ranked — BM25, best first (needs scoring="bm25"). Combine terms with
+# explicit operators; a bare "a b" is treated as a phrase, not "a OR b".
+idx.search("inverted OR index")                       # → [records]
+idx.search("inverted AND index", limit=10, with_scores=True)  # → [(record, score)]
+idx.search("invert*", return_ids=True)                # → [doc-ids] (no fetch)
+
+idx.get_document(i)   # the stored record for a doc-id
+idx.delete(i)         # tombstone a document
+```
+
+- **Compact postings.** Each term's posting list is stored as a delta + varint
+  blob (monotonically increasing doc-ids), rebuilt once per flush — small on
+  disk and fast to decode.
+- **Buffered build.** `add()` buffers; the index materialises on the next
+  `search()` or explicit `flush()` (one blob write per term, grouped). Bulk
+  loads stay cheap.
+- **Native results.** `search()` returns your records (Python types), or
+  `(record, score)` with `with_scores=True`, or raw doc-ids with
+  `return_ids=True`.
+
+Inside a `Collection`, declare a full-text index with `Search(...)` (e.g.
+`indexes={..., "body": Search(fields=["title", "body"], scoring="bm25")}`) and
+query it with `collection.search("body", "inverted index")`. The collection
+wires a doc-store-less `SearchIndex` (postings only, no record duplication) and
+maps results back to records for you.
 
 ---
 
@@ -806,6 +869,8 @@ Every public write method (`__setitem__`, `append`, `push`, `add`, …) acquires
 | Ordered data, range / prefix queries | **loom BTree** |
 | FIFO task queue, event stream | **loom Queue** |
 | Graph data, social / knowledge networks | **loom Graph** |
+| Full-text / boolean / BM25 search | **loom SearchIndex** |
+| Records looked up by several fields at once | **loom Collection** |
 | Large text content per record | **loom + `str` + brotli** |
 | Complex relational queries (JOINs) | SQLite / PostgreSQL |
 | Concurrent multi-writer | SQLite / PostgreSQL |
