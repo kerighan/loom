@@ -516,6 +516,12 @@ posts.delete("p1")                             # removed from every index
 - **Atomicity.** Writes touch all indexes under `db.write_lock()` + `db.batch()`
   (serialised, grouped). This is not a full crash-atomic WAL across indexes; if
   a crash ever desyncs an index, call `posts.reindex()` to rebuild them.
+- **Schema migration.** `db.migrate_collection(name, NewModel, transforms={...})`
+  rebuilds a collection under a new schema (add / drop / rename fields). Each
+  record is rebuilt from `transforms[field](old)` if given, else the old value,
+  else the field default; indexes are reused unless you pass new ones. Records
+  are read into memory first, so a mid-migration crash can't lose data.
+  `db.drop_collection(name)` removes a collection (space reclaimed by `vacuum()`).
 
 ---
 

@@ -1438,6 +1438,110 @@ class DB:
             self._rollback_collection(ds_before, struct_before, cfg_key)
             raise
 
+    def drop_collection(self, name):
+        """Delete a collection and unregister all its internal structures.
+
+        Disk space is reclaimed lazily by ``db.vacuum()`` (the arenas are
+        unlinked from the registry, not yet freed)."""
+        if not self._is_open:
+            raise DatabaseNotOpenError()
+        self._ensure_writable()
+        cfg_key = f"__collection__::{name}"
+        if not self._db.has_header_field(cfg_key):
+            raise StructureNotFoundError(name)
+        pat = f"{name}__"   # the collection's reserved namespace (incl. wrapped internals)
+        hd = self._db._header_data
+        for n in [n for n in list(self._datastructures) if pat in n]:
+            self._datastructures.pop(n, None)
+            hd.pop(f"_ds_{n}_metadata", None)
+        for n in [n for n in list(self._datasets) if pat in n]:
+            self._datasets.pop(n, None)
+        self._db.delete_header_field(cfg_key)
+        # Drop cached addresses: a recreated structure of the same name would
+        # otherwise read this collection's stale value addresses (the shared
+        # cache namespaces by name, and a fresh structure resets its gen to 0).
+        if self._shared_cache is not None:
+            self._shared_cache.clear()
+        self._save_datastructures_registry()
+        self._save_registry()
+
+    def migrate_collection(self, name, new_model, transforms=None, indexes=None,
+                           key_size=64, index_key_size=192):
+        """Migrate a collection to a new record schema (add / drop / rename
+        fields), rebuilding it in place.
+
+        For each existing record the new record is built field-by-field: a
+        ``transforms[field](old_record)`` callable if given, else the old value
+        if the field still exists, else the schema default.  Indexes are reused
+        unless `indexes` is supplied.  All records are read into memory first,
+        so a crash mid-migration cannot lose data already on disk.
+
+        Example (split `name` into first/last):
+            db.migrate_collection("users", UserV2, transforms={
+                "first_name": lambda r: r["name"].split()[0],
+                "last_name":  lambda r: r["name"].split()[-1],
+            })
+        """
+        if not self._is_open:
+            raise DatabaseNotOpenError()
+        self._ensure_writable()
+        from loom.collection import Many, Range, Unique, Search
+        from loom.dataset import Dataset
+
+        cfg_key = f"__collection__::{name}"
+        cfg = self._db.get_header_field(cfg_key)
+        if not cfg:
+            raise StructureNotFoundError(name)
+        old = self.collection(name)
+        transforms = transforms or {}
+
+        # New schema's field names (to know what to keep / default).
+        if isinstance(new_model, Dataset):
+            new_fields = list(new_model.user_schema.names)
+        elif isinstance(new_model, dict):
+            new_fields = list(new_model)
+        else:
+            from loom.schema import schema_from_model
+            new_fields = list(schema_from_model(new_model))
+
+        # Reconstruct the index declaration from the stored config unless given.
+        if indexes is None:
+            indexes = {cfg["primary_field"]: "primary"}
+            for idx_name, ic in cfg["indexes"].items():
+                field = ic.get("field", idx_name)
+                fld = None if field == idx_name else field
+                if ic["kind"] == "unique":
+                    indexes[idx_name] = Unique(field=fld)
+                elif ic["kind"] == "range":
+                    indexes[idx_name] = Range(field=fld)
+                else:
+                    indexes[idx_name] = Many(sort=ic.get("sort"),
+                                             desc=ic.get("desc", False), field=fld)
+            for field, sc in cfg.get("search", {}).items():
+                si = old._search[field]["index"]
+                indexes[field] = Search(fields=sc["fields"], scoring=si._scoring,
+                                        bm25_k1=si._k1, bm25_b=si._b)
+
+        # Read + transform every record FIRST (so the drop below can't lose data).
+        migrated = []
+        for pk, rec in old._primary.items():
+            rec = dict(rec)
+            new_rec = {}
+            for f in new_fields:
+                if f in transforms:
+                    new_rec[f] = transforms[f](rec)
+                elif f in rec:
+                    new_rec[f] = rec[f]
+                # else: omitted → dataset writes the field default
+            migrated.append(new_rec)
+
+        self.drop_collection(name)
+        col = self.collection(name, new_model, indexes=indexes,
+                              key_size=key_size, index_key_size=index_key_size)
+        if migrated:
+            col.insert_many(migrated)
+        return col
+
     def _rollback_collection(self, ds_before, struct_before, cfg_key):
         """Undo a partially-created collection: unregister every dataset /
         datastructure created since the snapshot, and drop the config key."""
