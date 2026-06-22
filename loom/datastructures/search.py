@@ -227,7 +227,12 @@ class SearchIndex(DataStructure):
 
     @classmethod
     def _from_registry_params(cls, name, db, params):
-        dsname = params.pop("dataset_name")
+        # Copy: the registry dict is shared with the DB header — mutating it
+        # (pop) would persist a params dict missing "dataset_name" on the next
+        # header save, breaking the following reopen.  pop(..., None) also
+        # recovers files already corrupted by that earlier bug.
+        params = dict(params)
+        dsname = params.pop("dataset_name", None)
         ds = db.get_dataset(dsname) if dsname else None
         return cls(name, db, ds, **params)
 

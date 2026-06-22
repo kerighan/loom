@@ -268,3 +268,16 @@ class TestSearch:
             assert sorted(r["id"] for r in c.search("content", "python")) == ["a1", "a3", "a4"]
         finally:
             db2.close()
+
+    def test_survives_repeated_reopen(self):
+        # Regression: SearchIndex._from_registry_params used to pop("dataset_name")
+        # from the shared registry dict; close() then persisted a params dict
+        # missing it → the *second* reopen raised KeyError('dataset_name').
+        import os, tempfile
+        path = os.path.join(tempfile.mkdtemp(), "art.db")
+        with DB(path) as db:
+            make_articles(db).insert_many(ARTICLES)
+        for _ in range(3):
+            with DB(path) as db:
+                c = db["articles"]
+                assert sorted(r["id"] for r in c.search("content", "python")) == ["a1", "a3"]
