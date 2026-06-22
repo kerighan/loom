@@ -1062,6 +1062,43 @@ class DB:
         self._save_datastructures_registry()
         return q
 
+    def create_priority_queue(self, name, schema=None, max_first=True):
+        """Create or reopen a persistent PriorityQueue (BTree-backed).
+
+        push(item, priority) / pop() / peek() in O(log n).  The highest
+        priority pops first by default (max_first=True); set max_first=False
+        for a min-priority queue.  Equal priorities pop in FIFO order.
+        Priorities may be int, float or datetime (order-preserving encoded).
+
+        Args:
+            name:      Unique name.
+            schema:    Pydantic model / dict of dtypes / Dataset for the items.
+                       Omit to reopen an existing queue.
+            max_first: True (default) → highest priority first; False → lowest.
+
+        Returns:
+            PriorityQueue instance.
+
+        Example:
+            pq = db.create_priority_queue("jobs", {"task": "utf8[40]"})
+            pq.push({"task": "send email"}, priority=5)
+            pq.push({"task": "reindex"},    priority=9)
+            pq.pop()        # -> {"task": "reindex"}   (priority 9 first)
+        """
+        if not self._is_open:
+            raise DatabaseNotOpenError()
+        self._ensure_writable()
+
+        from loom.datastructures.priority_queue import PriorityQueue
+
+        if name in self._datastructures:
+            return self._datastructures[name]
+
+        pq = PriorityQueue(name, self, schema, max_first=max_first)
+        self._datastructures[name] = pq
+        self._save_datastructures_registry()
+        return pq
+
     def create_lru_dict(
         self,
         name,

@@ -3,6 +3,7 @@
 from loom.database import DB
 from loom.collection import Collection, Primary, Unique, Range, Many, Search
 from loom.datastructures.search import SearchIndex
+from loom.datastructures.priority_queue import PriorityQueue, PriorityQueueEmpty
 from loom.client import (
     LoomClient,
     LoomClientError,
@@ -36,6 +37,13 @@ __all__ = [
     "DB",
     "Collection",
     "SearchIndex",
+    "PriorityQueue",
+    "PriorityQueueEmpty",
+    "Primary",
+    "Unique",
+    "Range",
+    "Many",
+    "Search",
     "Dataset",
     "List",
     "BloomFilter",

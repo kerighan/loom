@@ -58,6 +58,19 @@ _FLOAT_DTYPES = {"float16", "float32", "float64"}
 _ARRAY_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9_]*)\[(\d+(?:,\d+)*)\]$")
 
 
+def _np_kind(dtype_str: str):
+    """Return (kind, itemsize) for a numpy-style dtype string, or (None, 0).
+
+    Dataset schemas report numpy dtype strings ("<i8", "|S32", "<U50"), so we
+    normalise those alongside the canonical loom names ("int64", ...).
+    """
+    try:
+        dt = np.dtype(dtype_str)
+    except TypeError:
+        return None, 0
+    return dt.kind, dt.itemsize
+
+
 def _py_type_for_dtype(dtype_str: str):
     """Map a loom dtype string to (python_type, pydantic Field or None)."""
     from pydantic import Field
@@ -66,6 +79,8 @@ def _py_type_for_dtype(dtype_str: str):
 
     if _ARRAY_RE.match(s):
         return list[float], None
+    if s in ("text", "blob"):
+        return str, None
     if s in _INT_DTYPES:
         return int, None
     if s in _FLOAT_DTYPES:
@@ -76,8 +91,18 @@ def _py_type_for_dtype(dtype_str: str):
     m = re.match(r"^[<>|]?U(\d+)$", s)
     if m:
         return str, Field(..., max_length=int(m.group(1)))
-    if s in ("text", "blob"):
-        return str, None
+
+    kind, itemsize = _np_kind(s)
+    if kind in ("i", "u"):
+        return int, None
+    if kind == "f":
+        return float, None
+    if kind == "b":
+        return bool, None
+    if kind == "S":  # fixed-width / utf8 bytes — N bytes
+        return str, Field(..., max_length=itemsize)
+    if kind == "U":
+        return str, Field(..., max_length=itemsize // 4)
     return Any, None
 
 
@@ -119,7 +144,7 @@ def _structure_schema(obj) -> Optional[dict[str, str]]:
         return None
 
     # Prefer the underlying user dataset
-    for attr in ("_user_dataset", "_values_dataset", "_items_dataset"):
+    for attr in ("_user_dataset", "_values_dataset", "_items_dataset", "_dataset"):
         ds = getattr(obj, attr, None)
         if ds is not None and hasattr(ds, "user_schema"):
             return _dataset_schema(ds)
@@ -133,6 +158,31 @@ def _structure_schema(obj) -> Optional[dict[str, str]]:
 # ---------------------------------------------------------------------------
 # JSON conversion (numpy → native python)
 # ---------------------------------------------------------------------------
+
+
+def _coerce_scalar(dtype_str: str, raw):
+    """Coerce a query-string value to the python type implied by a loom dtype.
+
+    Range bounds and lookup keys arrive as strings; numeric index keys must be
+    compared as numbers, not lexically, so we cast them to match the field.
+    """
+    if raw is None:
+        return None
+    s = str(dtype_str)
+    if s in _INT_DTYPES:
+        return int(raw)
+    if s in _FLOAT_DTYPES:
+        return float(raw)
+    if s == "bool":
+        return str(raw).lower() in ("1", "true", "yes", "on")
+    kind, _ = _np_kind(s)
+    if kind in ("i", "u"):
+        return int(raw)
+    if kind == "f":
+        return float(raw)
+    if kind == "b":
+        return str(raw).lower() in ("1", "true", "yes", "on")
+    return raw
 
 
 def _to_jsonable(value):
@@ -197,6 +247,8 @@ def build_app(
     from loom.datastructures.btree import BTree
     from loom.datastructures.queue import Queue
     from loom.datastructures.lru_dict import LRUDict
+    from loom.datastructures.search import SearchIndex
+    from loom.datastructures.priority_queue import PriorityQueue, PriorityQueueEmpty
 
     @asynccontextmanager
     async def lifespan(app):
@@ -371,12 +423,18 @@ def build_app(
             }
             if dashboard:
                 docs["dashboard"] = "/dashboard"
+            collections = sorted(
+                k[len("__collection__::"):]
+                for k in db._db._header_data
+                if k.startswith("__collection__::")
+            )
             return {
                 "filename": db.filename,
                 "read_only": read_only,
                 "structures": {
                     n: type(s).__name__ for n, s in db._datastructures.items()
                 },
+                "collections": collections,
                 "docs": docs,
             }
 
@@ -668,11 +726,12 @@ def build_app(
         start: Optional[str] = Query(None),
         end: Optional[str] = Query(None),
         limit: int = Query(1000, ge=1, le=100_000),
+        reverse: bool = Query(False, description="iterate high→low"),
     ):
         with lock:
             t = _get_structure(name, BTree)
             out = []
-            for i, (k, v) in enumerate(t.range(start, end)):
+            for i, (k, v) in enumerate(t.range(start, end, reverse=reverse)):
                 if i >= limit:
                     break
                 out.append({"key": k, "value": _to_jsonable(v)})
@@ -872,6 +931,387 @@ def build_app(
             except KeyError:
                 raise HTTPException(404, f"key {key!r} not found")
             return None
+
+    # ========================================================= search indexes
+    def _si_meta(si):
+        si._ensure_loaded()
+        return {
+            "name": si.name,
+            "length": len(si),
+            "scoring": si._scoring,
+            "store_documents": si._store_docs,
+            "text_fields": list(si._text_fields) if si._text_fields else None,
+            "schema": _structure_schema(si) if si._store_docs else None,
+        }
+
+    @app.get(
+        "/search_indexes/{name}",
+        tags=["search_indexes"],
+        summary="SearchIndex metadata",
+    )
+    def search_info(name: str):
+        with lock:
+            si = _get_structure(name, SearchIndex)
+            return _si_meta(si)
+
+    @app.get(
+        "/search_indexes/{name}/search",
+        tags=["search_indexes"],
+        summary="Full-text query: ?q=&mode=&limit=&with_scores=",
+    )
+    def search_query(
+        name: str,
+        q: str = Query(..., description="boolean (AND/OR/AND NOT, *) or ranked query"),
+        mode: Optional[str] = Query(None, description="boolean | bm25 | tfidf"),
+        limit: Optional[int] = Query(None, ge=1, le=100_000),
+        with_scores: bool = Query(False),
+    ):
+        with lock:
+            si = _get_structure(name, SearchIndex)
+            # store_documents=False indexes (managed by a collection) hold no
+            # documents — return raw doc-ids instead of None payloads.
+            return_ids = not si._store_docs
+            try:
+                res = si.search(q, return_ids=return_ids, mode=mode,
+                                limit=limit, with_scores=with_scores)
+            except ValueError as e:
+                raise HTTPException(422, str(e))
+            if with_scores:
+                key = "doc_id" if return_ids else "document"
+                return [{key: _to_jsonable(d), "score": float(s)} for d, s in res]
+            return [_to_jsonable(d) for d in res]
+
+    @app.get(
+        "/search_indexes/{name}/documents/{doc_id}",
+        tags=["search_indexes"],
+        summary="Read a stored document by doc-id",
+    )
+    def search_get_document(name: str, doc_id: int):
+        with lock:
+            si = _get_structure(name, SearchIndex)
+            if not si._store_docs:
+                raise HTTPException(
+                    422,
+                    f"{name!r} does not store documents "
+                    "(it is managed by a collection); query it via /search",
+                )
+            if doc_id not in si:  # out of range or tombstoned
+                raise HTTPException(404, f"doc-id {doc_id} not found")
+            return _to_jsonable(si.get_document(doc_id))
+
+    @app.post(
+        "/search_indexes/{name}/documents",
+        tags=["search_indexes"],
+        summary="Index a document",
+        status_code=201,
+    )
+    def search_add(name: str, record: dict = Body(...)):
+        with lock:
+            si = _get_structure(name, SearchIndex)
+            if not si._store_docs:
+                raise HTTPException(
+                    422,
+                    f"{name!r} is managed by a collection; "
+                    "add documents through that collection instead",
+                )
+            schema = _structure_schema(si) or {}
+            data = _validate("search", name, record, schema)
+            doc_id = si.add(data)
+            return {"doc_id": int(doc_id)}
+
+    @app.delete(
+        "/search_indexes/{name}/documents/{doc_id}",
+        tags=["search_indexes"],
+        summary="Delete (tombstone) a document",
+        status_code=204,
+    )
+    def search_delete(name: str, doc_id: int):
+        with lock:
+            si = _get_structure(name, SearchIndex)
+            si.delete(doc_id)
+            return None
+
+    # ============================================================= collections
+    _collection_cache: dict[str, Any] = {}
+    _COLL_PREFIX = "__collection__::"
+
+    def _collection_names():
+        return sorted(
+            k[len(_COLL_PREFIX):]
+            for k in db._db._header_data
+            if k.startswith(_COLL_PREFIX)
+        )
+
+    def _get_collection(name: str):
+        col = _collection_cache.get(name)
+        if col is not None:
+            return col
+        if not db._db.has_header_field(_COLL_PREFIX + name):
+            raise HTTPException(404, f"Collection {name!r} not found")
+        col = db.collection(name)
+        _collection_cache[name] = col
+        return col
+
+    def _coll_index_map(col):
+        out = {f: ix["spec"].kind for f, ix in col._indexes.items()}
+        for f, si in col._search.items():
+            out[f] = "search"
+        return out
+
+    @app.get("/collections/{name}", tags=["collections"], summary="Collection metadata")
+    def collection_info(name: str):
+        with lock:
+            col = _get_collection(name)
+            return {
+                "name": col.name,
+                "length": len(col),
+                "primary_field": col._key_field,
+                "indexes": _coll_index_map(col),
+                "schema": _dataset_schema(col.dataset),
+            }
+
+    @app.get(
+        "/collections/{name}/records",
+        tags=["collections"],
+        summary="List records (?limit=)",
+    )
+    def collection_list(name: str, limit: int = Query(100, ge=1, le=100_000)):
+        with lock:
+            col = _get_collection(name)
+            out = []
+            for i, (pk, rec) in enumerate(col.items()):
+                if i >= limit:
+                    break
+                out.append({"pk": str(pk), "record": _to_jsonable(dict(rec))})
+            return out
+
+    @app.get(
+        "/collections/{name}/records/{pk}",
+        tags=["collections"],
+        summary="Read a record by primary key",
+    )
+    def collection_get(name: str, pk: str):
+        with lock:
+            col = _get_collection(name)
+            rec = col.get_primary(pk)
+            if rec is None:
+                raise HTTPException(404, f"key {pk!r} not found")
+            return _to_jsonable(dict(rec))
+
+    @app.post(
+        "/collections/{name}/records",
+        tags=["collections"],
+        summary="Insert a record (returns its primary key)",
+        status_code=201,
+    )
+    def collection_insert(name: str, record: dict = Body(...)):
+        with lock:
+            col = _get_collection(name)
+            schema = _dataset_schema(col.dataset)
+            data = _validate("collection", name, record, schema)
+            try:
+                pk = col.insert(data)
+            except (ValueError, KeyError) as e:
+                raise HTTPException(422, str(e))
+            return {"pk": str(pk)}
+
+    @app.put(
+        "/collections/{name}/records/{pk}",
+        tags=["collections"],
+        summary="Update a record (partial; re-indexes changed fields)",
+    )
+    def collection_update(name: str, pk: str, changes: dict = Body(...)):
+        with lock:
+            col = _get_collection(name)
+            if pk not in col:
+                raise HTTPException(404, f"key {pk!r} not found")
+            try:
+                rec = col.update(pk, **changes)
+            except (ValueError, KeyError) as e:
+                raise HTTPException(422, str(e))
+            return _to_jsonable(dict(rec))
+
+    @app.post(
+        "/collections/{name}/records/{pk}/increment",
+        tags=["collections"],
+        summary="Atomically increment a numeric field",
+    )
+    def collection_increment(
+        name: str,
+        pk: str,
+        body: dict = Body(..., examples=[{"field": "engagement", "amount": 1}]),
+    ):
+        with lock:
+            col = _get_collection(name)
+            field = body.get("field")
+            amount = body.get("amount", 1)
+            if not isinstance(field, str):
+                raise HTTPException(422, "body must be {'field': <str>, 'amount': <number>}")
+            if pk not in col:
+                raise HTTPException(404, f"key {pk!r} not found")
+            try:
+                value = col.increment(pk, field, amount)
+            except (ValueError, KeyError) as e:
+                raise HTTPException(422, str(e))
+            return {"pk": str(pk), "field": field, "value": _to_jsonable(value)}
+
+    @app.delete(
+        "/collections/{name}/records/{pk}",
+        tags=["collections"],
+        summary="Delete a record (from every index)",
+        status_code=204,
+    )
+    def collection_delete(name: str, pk: str):
+        with lock:
+            col = _get_collection(name)
+            try:
+                col.delete(pk)
+            except KeyError:
+                raise HTTPException(404, f"key {pk!r} not found")
+            return None
+
+    @app.get(
+        "/collections/{name}/find/{index}",
+        tags=["collections"],
+        summary="One-to-many / unique lookup: ?value=&limit=",
+    )
+    def collection_find(
+        name: str,
+        index: str,
+        value: str = Query(...),
+        limit: Optional[int] = Query(None, ge=1, le=100_000),
+    ):
+        with lock:
+            col = _get_collection(name)
+            ix = col._indexes.get(index)
+            if ix is None:
+                raise HTTPException(404, f"index {index!r} not found")
+            schema = _dataset_schema(col.dataset)
+            val = _coerce_scalar(schema.get(index, "text"), value)
+            kind = ix["spec"].kind
+            if kind == "many":
+                rows = col.find(index, val, limit=limit)
+                return [_to_jsonable(dict(r)) for r in rows]
+            if kind == "unique":
+                rec = col.get(index, val)
+                return [] if rec is None else [_to_jsonable(dict(rec))]
+            raise HTTPException(
+                422, f"index {index!r} is '{kind}'; use /range or /search instead"
+            )
+
+    @app.get(
+        "/collections/{name}/range/{index}",
+        tags=["collections"],
+        summary="Range scan on a 'range' index: ?low=&high=&limit=",
+    )
+    def collection_range(
+        name: str,
+        index: str,
+        low: Optional[str] = Query(None),
+        high: Optional[str] = Query(None),
+        limit: Optional[int] = Query(None, ge=1, le=100_000),
+        desc: bool = Query(False, description="highest-value-first (e.g. most recent)"),
+    ):
+        with lock:
+            col = _get_collection(name)
+            ix = col._indexes.get(index)
+            if ix is None:
+                raise HTTPException(404, f"index {index!r} not found")
+            if ix["spec"].kind != "range":
+                raise HTTPException(
+                    422, f"index {index!r} is not a 'range' index"
+                )
+            dt = _dataset_schema(col.dataset).get(index, "text")
+            rows = col.range(
+                index,
+                _coerce_scalar(dt, low),
+                _coerce_scalar(dt, high),
+                limit=limit,
+                desc=desc,
+            )
+            return [_to_jsonable(dict(r)) for r in rows]
+
+    @app.get(
+        "/collections/{name}/search/{index}",
+        tags=["collections"],
+        summary="Full-text search on a 'search' index: ?q=&mode=&limit=&with_scores=",
+    )
+    def collection_search(
+        name: str,
+        index: str,
+        q: str = Query(...),
+        mode: Optional[str] = Query(None),
+        limit: Optional[int] = Query(None, ge=1, le=100_000),
+        with_scores: bool = Query(False),
+    ):
+        with lock:
+            col = _get_collection(name)
+            if index not in col._search:
+                raise HTTPException(404, f"search index {index!r} not found")
+            try:
+                res = col.search(index, q, mode=mode, limit=limit,
+                                 with_scores=with_scores)
+            except ValueError as e:
+                raise HTTPException(422, str(e))
+            if with_scores:
+                return [{"record": _to_jsonable(dict(r)), "score": float(s)}
+                        for r, s in res]
+            return [_to_jsonable(dict(r)) for r in res]
+
+    # ========================================================= priority queues
+    @app.get(
+        "/priority_queues/{name}",
+        tags=["priority_queues"],
+        summary="PriorityQueue metadata",
+    )
+    def pq_info(name: str):
+        with lock:
+            pq = _get_structure(name, PriorityQueue)
+            pq._ensure_loaded()
+            return {
+                "name": pq.name,
+                "length": len(pq),
+                "max_first": pq._max_first,
+                "schema": _structure_schema(pq._bt),
+            }
+
+    @app.post(
+        "/priority_queues/{name}/push",
+        tags=["priority_queues"],
+        summary="Enqueue an item with a priority",
+        status_code=201,
+    )
+    def pq_push(
+        name: str,
+        body: dict = Body(..., examples=[{"item": {"task": "send"}, "priority": 5}]),
+    ):
+        with lock:
+            pq = _get_structure(name, PriorityQueue)
+            if "item" not in body or "priority" not in body:
+                raise HTTPException(422, "body must be {'item': {...}, 'priority': <number>}")
+            pq._ensure_loaded()
+            schema = _structure_schema(pq._bt) or {}
+            item = _validate("pq", name, body["item"], schema)
+            pq.push(item, body["priority"])
+            return {"length": len(pq)}
+
+    @app.get("/priority_queues/{name}/peek", tags=["priority_queues"], summary="Peek top item")
+    def pq_peek(name: str):
+        with lock:
+            pq = _get_structure(name, PriorityQueue)
+            try:
+                return _to_jsonable(pq.peek())
+            except PriorityQueueEmpty:
+                raise HTTPException(404, "priority queue empty")
+
+    @app.post("/priority_queues/{name}/pop", tags=["priority_queues"], summary="Pop top item")
+    def pq_pop(name: str):
+        with lock:
+            pq = _get_structure(name, PriorityQueue)
+            try:
+                return _to_jsonable(pq.pop())
+            except PriorityQueueEmpty:
+                raise HTTPException(404, "priority queue empty")
 
     if read_only:
 

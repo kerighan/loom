@@ -1095,6 +1095,49 @@ class BTree(DataStructure):
         for j in range(i + 1, nk + 1):
             yield from self._inorder_entries(node["children"][j])
 
+    def _materialize(self, value_addr, key):
+        """Read a value record (re-wrapping nested structures if needed)."""
+        value_data = self._values_dataset[value_addr]
+        if not self._is_nested:
+            return value_data
+        inner_class = self._template.ds_class
+        result = inner_class.from_ref(self._db, value_data)
+        if result.needs_shared_datasets():
+            result.set_shared_datasets(self._shared_datasets)
+        result._parent = self
+        result._parent_key = key
+        return result
+
+    def _inorder_entries_rev(self, node_addr):
+        """Reverse in-order traversal yielding (key, value_addr), high→low."""
+        node = self._read_node(node_addr)
+        if node["is_leaf"]:
+            for i in range(node["num_keys"] - 1, -1, -1):
+                yield node["keys"][i], node["children"][i]
+        else:
+            for i in range(node["num_keys"], -1, -1):
+                yield from self._inorder_entries_rev(node["children"][i])
+
+    def _inorder_from_rev(self, node_addr, end, end_inclusive):
+        """Reverse in-order entries with key <= end (or < end), pruning every
+        subtree entirely right of `end`.  Descends one path to the end leaf —
+        O(log n) — then yields the rest high→low, mirroring _inorder_from."""
+        node = self._read_node(node_addr)
+        nk = node["num_keys"]
+        if node["is_leaf"]:
+            for i in range(nk - 1, -1, -1):
+                k = node["keys"][i]
+                if k < end or (end_inclusive and k == end):
+                    yield k, node["children"][i]
+            return
+        # Rightmost child whose subtree can hold keys <= end.
+        i = nk
+        while i > 0 and node["keys"][i - 1] > end:
+            i -= 1
+        yield from self._inorder_from_rev(node["children"][i], end, end_inclusive)
+        for j in range(i - 1, -1, -1):
+            yield from self._inorder_entries_rev(node["children"][j])
+
     def values(self):
         """Iterate over values in key-sorted order."""
         if self.root_addr == 0:
@@ -1157,21 +1200,40 @@ class BTree(DataStructure):
 
     # ========== Range Queries ==========
 
-    def range(self, start=None, end=None, inclusive=(True, True)):
+    def range(self, start=None, end=None, inclusive=(True, True), reverse=False):
         """Iterate over (key, value) pairs in a key range.
 
         Args:
             start: Lower bound (None for no lower bound)
             end: Upper bound (None for no upper bound)
             inclusive: Tuple of (start_inclusive, end_inclusive)
+            reverse: If True, yield high→low (seeks to `end`, walks down to
+                `start`) instead of low→high.  O(log n + k) either way.
 
         Yields:
-            (key, value) pairs in sorted order
+            (key, value) pairs in sorted (or reverse-sorted) order
         """
         if self.root_addr == 0:
             return
 
         start_inc, end_inc = inclusive
+
+        if reverse:
+            # Seek to the end leaf (O(log n)), walk down, stop at the lower bound.
+            if end is not None:
+                entries = self._inorder_from_rev(self.root_addr, end, end_inc)
+            else:
+                entries = self._inorder_entries_rev(self.root_addr)
+            for key, value_addr in entries:
+                if start is not None:
+                    if start_inc:
+                        if key < start:
+                            break
+                    else:
+                        if key <= start:
+                            break
+                yield key, self._materialize(value_addr, key)
+            return
 
         # Seek straight to the start leaf (O(log n)) instead of scanning the
         # whole tree from the smallest key.

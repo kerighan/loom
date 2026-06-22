@@ -23,8 +23,10 @@ Index kinds → structures:
                                 group + sort + pk → prefix-scan gives an
                                 ordered group for free)
 
-Range/many keys are order-preserving encoded (signed ints zero-padded, strings
-as-is) so the BTree's lexicographic order matches the natural order.
+Range/many keys are order-preserving encoded (signed ints zero-padded, floats
+via IEEE-754 munging, datetime/date via microsecond keys, strings as-is) so the
+BTree's lexicographic order matches the natural order — sort by an int, float or
+timestamp criterion with desc=True/False.
 
 Sync: insert/update/delete/increment run under db.write_lock() + db.batch().
 Not a crash-atomic cross-index transaction — reindex() rebuilds if needed.
@@ -34,10 +36,34 @@ Full-text ("search") indexes are planned (SearchIndex integration).
 from __future__ import annotations
 
 import numbers
+import struct
+from datetime import date, datetime
 
 _SEP = "\x00"          # composite-key separator (numpy U preserves embedded NULs)
 _INT_OFFSET = 1 << 63  # map signed int64 → unsigned for zero-padded ordering
 _UINT_MAX = (1 << 64) - 1
+
+
+def _desc_str(s):
+    """Reverse-lexicographic order for a string: complement each codepoint."""
+    return "".join(chr(0x10FFFF - ord(c)) for c in s)
+
+
+def _float_key(value, desc=False):
+    """Order-preserving 20-digit key for a float (IEEE-754 bit munging).
+
+    Flipping the sign bit for positives and all bits for negatives makes the
+    raw 64-bit pattern sort in the same order as the float value.  NaN is not
+    ordered meaningfully (don't index NaN).
+    """
+    bits = struct.unpack(">Q", struct.pack(">d", float(value)))[0]
+    if bits & 0x8000000000000000:        # negative → flip everything
+        bits ^= 0xFFFFFFFFFFFFFFFF
+    else:                                 # positive → flip just the sign bit
+        bits ^= 0x8000000000000000
+    if desc:
+        bits = _UINT_MAX - bits
+    return f"{bits:020d}"
 
 
 # ── index-kind specs ──────────────────────────────────────────────────────────
@@ -93,7 +119,11 @@ def encode_value(value, desc=False):
     """Encode a value to a string that sorts in natural (or reverse) order.
 
     Signed integers → 20-digit zero-padded (offset so negatives sort first);
-    bools → 0/1; everything else → str().  desc=True reverses.
+    floats → 20-digit IEEE-754 munged key; datetime/date → microsecond key
+    (chronological); bools → 0/1; everything else → str().  desc=True reverses.
+
+    Index a field with ONE consistent type — int, float, datetime and str keys
+    use different encodings, so they must not be mixed within one index.
     """
     if isinstance(value, bool):
         value = int(value)
@@ -105,11 +135,15 @@ def encode_value(value, desc=False):
         if desc:
             u = _UINT_MAX - u
         return f"{u:020d}"
+    # numbers.Real also catches numpy floats (np.float64/np.float32).
+    if isinstance(value, numbers.Real):
+        return _float_key(value, desc)
+    if isinstance(value, (datetime, date)):
+        from loom.schema import dt_key
+        s = dt_key(value, "microsecond")
+        return _desc_str(s) if desc else s
     s = str(value)
-    if desc:
-        # reverse lexicographic order for strings: complement each codepoint
-        return "".join(chr(0x10FFFF - ord(c)) for c in s)
-    return s
+    return _desc_str(s) if desc else s
 
 
 class Collection:
@@ -360,16 +394,21 @@ class Collection:
                     break
         return out
 
-    def range(self, index_name, low=None, high=None, limit=None):
+    def range(self, index_name, low=None, high=None, limit=None, desc=False):
         """Range scan on a 'range' index → records with low <= value <= high
-        (either bound may be None for an open end)."""
+        (either bound may be None for an open end).
+
+        desc=True returns highest-value-first — e.g. the most recent items of a
+        timestamp index, or a relevance feed, with a cheap `limit` and no need
+        for a grouping field:  inbox.range("created_at", limit=50, desc=True)."""
         ix = self._indexes[index_name]
         if ix["spec"].kind != "range":
             raise ValueError(f"range() needs a 'range' index for {index_name!r}")
         start = None if low is None else encode_value(low)
         end = None if high is None else encode_value(high) + "\x01"
         out = []
-        for _key, entry in ix["struct"].range(start, end, inclusive=(True, False)):
+        for _key, entry in ix["struct"].range(start, end, inclusive=(True, False),
+                                              reverse=desc):
             rec = self._primary.get(str(entry["pk"]))
             if rec is not None:
                 out.append(self._wrap(entry["pk"], rec))

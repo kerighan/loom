@@ -172,6 +172,25 @@ print(len(q))
 
 When a block is exhausted by `pop()`, it is returned to the shared ByteFileDB freelist. In steady state (push rate ≈ pop rate), **the file does not grow**.
 
+### PriorityQueue — highest-priority-first, O(log n) push/pop
+
+A persistent priority queue backed by a BTree. The highest priority pops first by default (`max_first=False` for lowest-first); items sharing a priority pop in **FIFO** order. Priorities can be **int, float or datetime** — all order-preserving encoded.
+
+```python
+pq = db.create_priority_queue("jobs", {"task": "utf8[40]"})
+
+pq.push({"task": "send email"}, priority=5)
+pq.push({"task": "reindex"},    priority=9)
+pq.push_many([({"task": "warm cache"}, 7.5), ...])   # bulk (bulk_load when empty)
+
+pq.peek()                         # -> {"task": "reindex"}   (priority 9, not removed)
+pq.pop()                          # -> {"task": "reindex"}
+pq.pop(default=None)              # None instead of raising on empty
+len(pq)
+```
+
+`push`/`pop`/`peek` are O(log n) (BTree `min()` + delete). Priorities use the same order-preserving encoding as Collection indexes, so a float score or a `datetime` deadline sorts correctly.
+
 ### BTree — ordered key-value with range queries
 
 ```python
@@ -186,9 +205,14 @@ for k in idx.keys():              # sorted order
 for k, v in idx.range("A", "C"):  # range query
     print(k, v)
 
+for k, v in idx.range(reverse=True):   # descending (seek to end, walk down)
+    print(k, v)                        # → great for "latest N" with a limit
+
 for k, v in idx.prefix("Beta"):   # prefix search
     print(k, v)
 ```
+
+`range()` is O(log n + k) in both directions — it seeks straight to the start (or, with `reverse=True`, the end) leaf rather than scanning from the smallest key.
 
 ### Set — unique string collection
 
@@ -402,7 +426,8 @@ posts.insert_many([...])                       # bulk (bulk-loads empty BTrees)
 
 posts["p1"]                                    # by primary key
 posts.find("username", "alice", limit=20)      # alice's 20 most-recent posts
-posts.range("engagement", 1000, None)          # engagement >= 1000, ordered
+posts.range("engagement", 1000, None)          # engagement >= 1000, ascending
+posts.range("created_at", limit=50, desc=True) # 50 most recent — no grouping needed
 posts.search("body", "inverted OR index")      # full-text → records
 
 posts.increment("p1", "engagement", 1)         # atomic counter bump
@@ -416,7 +441,16 @@ posts.delete("p1")                             # removed from every index
   full-text index keeps only postings (no record copy either).
 - **Ordered & paginated for free.** `Many(sort="created_at", desc=True)` stores
   composite keys in a B+Tree, so `find()` returns a group already in sort order
-  with cheap `limit` — ideal for recent-first feeds.
+  with cheap `limit` — ideal for recent-first feeds. The sort/range criterion may
+  be an **int, float or datetime** (all order-preserving encoded), with
+  `desc=True`/`False`.
+- **Latest-N with no grouping.** A `range` index iterates either direction:
+  `range("created_at", limit=50, desc=True)` returns the 50 most recent items
+  (seek to the high end, walk down — O(log n + k)), no group field needed.
+  Use `Many(sort=..., desc=True)` instead when you want a *per-group* ordered
+  feed (e.g. each user's timeline); `range(desc=True)` is the single-axis
+  "most-relevant/most-recent first" feed, and `range("relevance", 3.0, None)`
+  still filters by score.
 - **Persistence.** The index declaration is saved with the collection, so
   `db.collection("posts")` (no model) reopens it and restores every index
   automatically.
@@ -550,9 +584,12 @@ Then point your browser at:
 | `http://127.0.0.1:8000/docs` | **Swagger UI** — interactive try-it-out for every endpoint |
 | `http://127.0.0.1:8000/redoc` | **ReDoc** — clean reference-style docs |
 | `http://127.0.0.1:8000/openapi.json` | Raw OpenAPI 3 schema (feed it to Postman, codegen, etc.) |
-| `http://127.0.0.1:8000/` | Index: filename, datasets, structures, links to the docs |
+| `http://127.0.0.1:8000/` | Index: filename, structures, collections, links to the docs |
 
-Every dataset, `Dict`, `List`, `Set`, `BTree`, `Queue`, `BloomFilter`, `LRUDict` you create gets a CRUD route family automatically (`/datasets/<name>`, `/dicts/<name>/items/<key>`, `/btrees/<name>/range`, …). Request bodies are validated against your loom schema via Pydantic models generated on the fly.
+Every `Dict`, `List`, `Set`, `BTree`, `Queue`, `PriorityQueue`, `BloomFilter`, `LRUDict`, `SearchIndex` and `Collection` you create gets a CRUD route family automatically (`/dicts/<name>/items/<key>`, `/btrees/<name>/range`, …). Request bodies are validated against your loom schema via Pydantic models generated on the fly.
+
+- **`SearchIndex`** → `/search_indexes/<name>`: `GET /search?q=&mode=&limit=&with_scores=` (boolean or BM25), `POST/GET/DELETE /documents[/<doc_id>]`.
+- **`Collection`** → `/collections/<name>`: `GET/POST/PUT/DELETE /records[/<pk>]`, `POST /records/<pk>/increment`, and per-index lookups `GET /find/<index>`, `GET /range/<index>`, `GET /search/<index>`. Collections are listed under the `collections` key of the index route.
 
 ```python
 # Mount inside your own ASGI stack instead of using db.serve()
@@ -868,6 +905,7 @@ Every public write method (`__setitem__`, `append`, `push`, `add`, …) acquires
 | Fast persistent key-value, read-heavy | **loom Dict** |
 | Ordered data, range / prefix queries | **loom BTree** |
 | FIFO task queue, event stream | **loom Queue** |
+| Priority scheduling, ranked work | **loom PriorityQueue** |
 | Graph data, social / knowledge networks | **loom Graph** |
 | Full-text / boolean / BM25 search | **loom SearchIndex** |
 | Records looked up by several fields at once | **loom Collection** |
