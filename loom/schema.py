@@ -7,6 +7,8 @@ Maps Python/Pydantic types to numpy dtypes used by Dataset:
     bool                        → bool
     str                         → text   (variable-length via BlobStore)
     str with max_length         → U{N}   (fixed-length numpy unicode)
+    Literal["a", "bb", ...]     → utf8[N] strict, N = longest value's byte length
+    datetime / date             → datetime (int64 epoch-µs, transparent)
 
 Three equivalent ways to declare a fixed-length string field:
 
@@ -44,7 +46,7 @@ Usage:
 
 from __future__ import annotations
 
-from typing import Any, get_args, get_origin, Union
+from typing import Any, Literal, get_args, get_origin, Union
 
 # numpy dtype strings for common Python types
 from datetime import date as _date, datetime as _datetime
@@ -71,6 +73,25 @@ def _resolve_str_field(field_info) -> str:
     return "text"
 
 
+def _literal_dtype(values):
+    """Pick the smallest loom dtype for a Literal's allowed values.
+
+    String literals → a strict utf8 field sized to the longest value's UTF-8
+    byte length (so it takes exactly what's needed and refuses anything bigger);
+    int literals → int64; bool literals → bool.  Returns None if mixed/unknown."""
+    non_none = [v for v in values if v is not None]
+    if not non_none:
+        return None
+    if all(isinstance(v, str) for v in non_none):
+        n = max(len(v.encode("utf-8")) for v in non_none) or 1
+        return f"utf8[{n}!]"      # closed set → strict: never bigger than needed
+    if all(isinstance(v, bool) for v in non_none):
+        return "bool"
+    if all(isinstance(v, int) and not isinstance(v, bool) for v in non_none):
+        return "int64"
+    return None
+
+
 def _resolve_type(annotation: Any, field_info: Any = None) -> str:
     """Map a Python type annotation to a loom dtype string."""
     # Check field_info.metadata for Vec marker first
@@ -95,6 +116,12 @@ def _resolve_type(annotation: Any, field_info: Any = None) -> str:
             inner = [a for a in args if a is not type(None)]
             if len(inner) == 1:
                 annotation = inner[0]
+
+    # Literal[...] (incl. Optional[Literal[...]]) → smallest dtype for its values
+    if get_origin(annotation) is Literal:
+        dt = _literal_dtype(get_args(annotation))
+        if dt is not None:
+            return dt
 
     if annotation is str:
         return _resolve_str_field(field_info) if field_info else "text"

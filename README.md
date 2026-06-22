@@ -49,6 +49,7 @@ Define your record schema as a Pydantic model. loom maps types automatically:
 | `float` | `float64` | |
 | `bool` | `bool` | |
 | `datetime` / `date` | `datetime` | **Stored inline as int64 epoch-µs**, read/written as Python `datetime` — naturally ordered (range/sort/PriorityQueue work) |
+| `Literal["a", "b", …]` | `utf8[N]` | Closed string set → strict utf8 **sized to the longest value** (minimal space, refuses anything bigger). `Literal[1, 2]` → `int64`, `Literal[True, False]` → `bool` |
 | `str` | `text` | Variable-length, compressed via BlobStore |
 | `Utf8(N)` | `utf8[N]` | **Fixed-width inline UTF-8, N bytes** — ~4× smaller than `U{N}` for ASCII, same read speed. **Raises** if a value exceeds N bytes; `Utf8(N, truncate=True)` to truncate instead |
 | `str = Field(max_length=N)` | `U{N}` | Fixed-length numpy UCS-4 (4 bytes/char) |

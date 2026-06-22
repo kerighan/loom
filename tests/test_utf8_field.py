@@ -184,3 +184,35 @@ class TestUtf8Pydantic:
         assert "url" in ds._utf8_fields and ds._utf8_fields["url"] == 64
         ref = ds.insert({"id": 1, "url": "https://example.com/héllo"})
         assert ds[ref.addr]["url"] == "https://example.com/héllo"
+
+
+class TestLiteralFields:
+    def test_literal_maps_to_sized_utf8(self):
+        from typing import Literal, Optional
+
+        class Post(BaseModel):
+            leaning: Literal["left", "right", "center", ""]   # max "center" = 6
+            rating: Literal[1, 2, 3, 4, 5]
+            flag: Literal[True, False]
+            tag: Optional[Literal["a", "bb", "ccc"]]          # → utf8[3!]
+
+        assert schema_from_model(Post) == {
+            "leaning": "utf8[6!]",
+            "rating": "int64",
+            "flag": "bool",
+            "tag": "utf8[3!]",
+        }
+
+    def test_literal_roundtrip_and_strict(self, db):
+        from typing import Literal
+
+        class Tag(BaseModel):
+            kind: Literal["a", "bb", "ccc"]
+
+        ds = db.create_dataset("tags", model=Tag)
+        assert ds._utf8_fields["kind"] == 3 and "kind" in ds._utf8_strict
+        ref = ds.insert({"kind": "ccc"})
+        assert ds[ref.addr]["kind"] == "ccc"
+        # a value longer than the longest allowed literal is rejected
+        with pytest.raises(ValueError):
+            ds.insert({"kind": "way_too_long"})
