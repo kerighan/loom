@@ -294,7 +294,7 @@ class DB:
             schema = info["schema"]
 
             # Pass blob_store if the schema uses variable-length fields
-            needs_blobs = any(v in ("blob", "text") for v in schema.values())
+            needs_blobs = any(v in ("blob", "text", "json") for v in schema.values())
             blob_store = self.blob_store if needs_blobs else None
 
             # Recreate Dataset instance
@@ -346,6 +346,8 @@ class DB:
 
         if field_name in dataset._text_fields:
             return "text"
+        if field_name in getattr(dataset, "_json_fields", set()):
+            return "json"
         if field_name in dataset._blob_fields:
             return "blob"
         if field_name in getattr(dataset, "_utf8_fields", {}):
@@ -529,7 +531,7 @@ class DB:
         identifier = self._get_next_identifier()
 
         # Pass blob_store if schema uses variable-length fields
-        needs_blobs = any(v in ("blob", "text") for v in schema.values())
+        needs_blobs = any(v in ("blob", "text", "json") for v in schema.values())
         blob_store = self.blob_store if needs_blobs else None
 
         # Create dataset

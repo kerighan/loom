@@ -1,3 +1,4 @@
+import json
 import re
 import numpy as np
 
@@ -164,6 +165,7 @@ class Dataset:
         # Track special variable-length fields
         self._blob_fields = set()   # raw bytes via BlobStore
         self._text_fields = set()   # UTF-8 strings via BlobStore (transparent)
+        self._json_fields = set()   # arbitrary JSON values via BlobStore (json.dumps/loads)
         # Fixed-width UTF-8 string fields: field_name → byte budget N.
         # Stored inline as numpy S{N} (raw bytes), encoded/decoded transparently
         # — ~4× smaller than U{N} (UCS-4, 4 bytes/char) for ASCII, with no
@@ -186,6 +188,9 @@ class Dataset:
                 processed_schema.append((field, BLOB_DTYPE))
             elif dtype == "text":
                 self._text_fields.add(field)
+                processed_schema.append((field, BLOB_DTYPE))
+            elif dtype == "json":
+                self._json_fields.add(field)
                 processed_schema.append((field, BLOB_DTYPE))
             elif dtype == "datetime":
                 self._datetime_fields.add(field)
@@ -241,7 +246,7 @@ class Dataset:
         values = [self.identifier]
         for field in self.user_schema.names:
             dtype = self.user_schema.fields[field][0]
-            if field in self._text_fields or field in self._blob_fields:
+            if field in self._text_fields or field in self._blob_fields or field in self._json_fields:
                 values.append((0, 0))
             elif field in self._utf8_fields:
                 values.append(b"")
@@ -283,6 +288,15 @@ class Dataset:
                     else:
                         encoded = value.encode("utf-8") if isinstance(value, str) else value
                         offset, n_slots = self.blob_store.write(encoded)
+                        arr[field]["offset"] = offset
+                        arr[field]["n_slots"] = n_slots
+                elif field in self._json_fields:
+                    if value is None:
+                        pass  # NULL_BLOB → None on read
+                    else:
+                        offset, n_slots = self.blob_store.write(
+                            json.dumps(value, separators=(",", ":")).encode("utf-8")
+                        )
                         arr[field]["offset"] = offset
                         arr[field]["n_slots"] = n_slots
                 elif field in self._blob_fields:
@@ -329,6 +343,9 @@ class Dataset:
             for field in self._text_fields:
                 off, ns = result[field]
                 result[field] = "" if (off == 0 and ns == 0) else self.blob_store.read(int(off)).decode("utf-8")
+            for field in self._json_fields:
+                off, ns = result[field]
+                result[field] = None if (off == 0 and ns == 0) else json.loads(self.blob_store.read(int(off)).decode("utf-8"))
             for field in self._blob_fields:
                 off, ns = result[field]
                 result[field] = None if (off == 0 and ns == 0) else (int(off), int(ns))
@@ -343,6 +360,9 @@ class Dataset:
             if field in self._text_fields:
                 offset, n_slots = int(value["offset"]), int(value["n_slots"])
                 result[field] = "" if (offset == 0 and n_slots == 0) else self.blob_store.read(offset).decode("utf-8")
+            elif field in self._json_fields:
+                offset, n_slots = int(value["offset"]), int(value["n_slots"])
+                result[field] = None if (offset == 0 and n_slots == 0) else json.loads(self.blob_store.read(offset).decode("utf-8"))
             elif field in self._blob_fields:
                 offset, n_slots = int(value["offset"]), int(value["n_slots"])
                 result[field] = None if (offset == 0 and n_slots == 0) else (offset, n_slots)
@@ -439,6 +459,11 @@ class Dataset:
                         offset = int(value["offset"])
                         n_slots = int(value["n_slots"])
                         d[field] = "" if (offset == 0 and n_slots == 0) else self.blob_store.read(offset).decode("utf-8")
+                    elif field in self._json_fields:
+                        value = rec[field]
+                        offset = int(value["offset"])
+                        n_slots = int(value["n_slots"])
+                        d[field] = None if (offset == 0 and n_slots == 0) else json.loads(self.blob_store.read(offset).decode("utf-8"))
                     elif field in self._blob_fields:
                         value = rec[field]
                         offset = int(value["offset"])
@@ -467,10 +492,10 @@ class Dataset:
         Args:
             address: Address of record to delete
         """
-        if self._text_fields:
+        if self._text_fields or self._json_fields:
             data = self.db.read(address, self.record_size)
             arr = np.frombuffer(data, dtype=self.schema)[0]
-            for field in self._text_fields:
+            for field in (self._text_fields | self._json_fields):
                 value = arr[field]
                 offset = int(value["offset"])
                 n_slots = int(value["n_slots"])
@@ -510,6 +535,22 @@ class Dataset:
                 new_offset, new_n_slots = self.blob_store.write(encoded)
                 new_ref = np.array([(new_offset, new_n_slots)], dtype=BLOB_DTYPE)
 
+            self.db.write(address + field_offset, new_ref.tobytes())
+            return
+
+        if field_name in self._json_fields:
+            old_data = self.db.read(address + field_offset, BLOB_DTYPE.itemsize)
+            old_ref = np.frombuffer(old_data, dtype=BLOB_DTYPE)[0]
+            o, n = int(old_ref["offset"]), int(old_ref["n_slots"])
+            if o != 0 or n != 0:
+                self.blob_store.delete(o, n)
+            if value is None:
+                new_ref = np.array([_NULL_BLOB], dtype=BLOB_DTYPE)
+            else:
+                no, nn = self.blob_store.write(
+                    json.dumps(value, separators=(",", ":")).encode("utf-8")
+                )
+                new_ref = np.array([(no, nn)], dtype=BLOB_DTYPE)
             self.db.write(address + field_offset, new_ref.tobytes())
             return
 
@@ -562,6 +603,9 @@ class Dataset:
         if field_name in self._text_fields:
             off, ns = int(value["offset"]), int(value["n_slots"])
             return "" if (off == 0 and ns == 0) else self.blob_store.read(off).decode("utf-8")
+        if field_name in self._json_fields:
+            off, ns = int(value["offset"]), int(value["n_slots"])
+            return None if (off == 0 and ns == 0) else json.loads(self.blob_store.read(off).decode("utf-8"))
         if field_name in self._blob_fields:
             off, ns = int(value["offset"]), int(value["n_slots"])
             return None if (off == 0 and ns == 0) else self.blob_store.read(off)

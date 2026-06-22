@@ -328,6 +328,8 @@ class DataStructure(ABC):
             for name in ds.user_schema.names:
                 if hasattr(ds, "_text_fields") and name in ds._text_fields:
                     result[name] = "text"
+                elif name in getattr(ds, "_json_fields", set()):
+                    result[name] = "json"
                 elif hasattr(ds, "_blob_fields") and name in ds._blob_fields:
                     result[name] = "blob"
                 elif name in getattr(ds, "_utf8_fields", {}):

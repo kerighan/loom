@@ -86,6 +86,8 @@ def _py_type_for_dtype(dtype_str: str):
     if s == "datetime":
         from datetime import datetime
         return datetime, None
+    if s == "json":
+        return Any, None
     if s in ("text", "blob"):
         return str, None
     if s in _INT_DTYPES:
@@ -137,6 +139,8 @@ def _dataset_schema(ds) -> dict[str, str]:
     for name in ds.user_schema.names:
         if name in getattr(ds, "_text_fields", set()):
             out[name] = "text"
+        elif name in getattr(ds, "_json_fields", set()):
+            out[name] = "json"
         elif name in getattr(ds, "_blob_fields", set()):
             out[name] = "blob"
         elif name in getattr(ds, "_datetime_fields", set()):

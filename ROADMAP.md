@@ -124,7 +124,7 @@ with db.write_lock():
 
 ---
 
-## 4. Schema migration
+## 4. Schema migration — ✅ DONE (db.migrate_collection / db.drop_collection)
 
 **Problem:** adding/removing/renaming fields in a Pydantic model does not
 migrate existing records.
@@ -145,7 +145,7 @@ entry.  Old data kept as backup until `db.drop_backup("users")`.
 
 ---
 
-## 5. Global vacuum / compaction
+## 5. Global vacuum / compaction — ✅ DONE (db.vacuum(), collections)
 
 **Problem:** fragmentation accumulates over time in long-lived databases
 (soft-deleted records, Dict hash tables with many deleted slots, BTree

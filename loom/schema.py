@@ -126,6 +126,10 @@ def _resolve_type(annotation: Any, field_info: Any = None) -> str:
     if annotation is str:
         return _resolve_str_field(field_info) if field_info else "text"
 
+    # dict / typed dict → JSON blob (json.dumps/loads, transparent)
+    if annotation is dict or get_origin(annotation) is dict:
+        return "json"
+
     dtype = _TYPE_MAP.get(annotation)
     if dtype:
         return dtype
@@ -238,6 +242,27 @@ def Utf8(max_bytes: int, truncate: bool = False):
         loom_dtype = tag
 
     return Annotated[str, _Utf8Meta]
+
+
+def Json():
+    """JSON field (→ 'json', stored as a json.dumps blob, loaded with json.loads).
+
+    Accepts any JSON-serialisable value (dict, list, nested) and returns it
+    parsed.  A bare ``dict`` annotation maps here automatically; use ``Json()``
+    for lists or mixed values.  None round-trips as None.
+
+    Example:
+        class Event(BaseModel):
+            id:   int
+            meta: dict          # → 'json'
+            tags: Json()        # → 'json' (a list)
+    """
+    from typing import Annotated, Any
+
+    class _JsonMeta:
+        loom_dtype = "json"
+
+    return Annotated[Any, _JsonMeta]
 
 
 def Datetime():
