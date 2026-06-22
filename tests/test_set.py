@@ -247,7 +247,7 @@ class TestSetPersistence:
 
             # Session 2: Verify data persists
             with DB(db_path) as db:
-                s = db.create_set("users")
+                s = db["users"]
                 assert len(s) == 3
                 assert "alice" in s
                 assert "bob" in s
@@ -267,7 +267,7 @@ class TestSetPersistence:
 
             # Session 2: Verify removal persists
             with DB(db_path) as db:
-                s = db.create_set("users")
+                s = db["users"]
                 assert len(s) == 1
                 assert "alice" not in s
                 assert "bob" in s

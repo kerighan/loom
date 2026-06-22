@@ -77,8 +77,15 @@ def _py_type_for_dtype(dtype_str: str):
 
     s = str(dtype_str)
 
+    # utf8[N] is a fixed-width string, NOT an array — check before _ARRAY_RE
+    # (which would otherwise match the "name[digits]" shape).
+    if s.startswith("utf8[") and s.endswith("]"):
+        return str, Field(..., max_length=int(s[5:-1]))
     if _ARRAY_RE.match(s):
         return list[float], None
+    if s == "datetime":
+        from datetime import datetime
+        return datetime, None
     if s in ("text", "blob"):
         return str, None
     if s in _INT_DTYPES:
@@ -132,6 +139,10 @@ def _dataset_schema(ds) -> dict[str, str]:
             out[name] = "text"
         elif name in getattr(ds, "_blob_fields", set()):
             out[name] = "blob"
+        elif name in getattr(ds, "_datetime_fields", set()):
+            out[name] = "datetime"
+        elif name in getattr(ds, "_utf8_fields", {}):
+            out[name] = f"utf8[{ds._utf8_fields[name]}]"
         else:
             raw = ds.user_schema.fields[name][0]
             out[name] = raw if isinstance(raw, str) else dtype_to_str(raw)
@@ -169,6 +180,9 @@ def _coerce_scalar(dtype_str: str, raw):
     if raw is None:
         return None
     s = str(dtype_str)
+    if s == "datetime":
+        from datetime import datetime
+        return datetime.fromisoformat(raw)
     if s in _INT_DTYPES:
         return int(raw)
     if s in _FLOAT_DTYPES:
@@ -186,6 +200,10 @@ def _coerce_scalar(dtype_str: str, raw):
 
 
 def _to_jsonable(value):
+    from datetime import date, datetime
+
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
     if isinstance(value, dict):
         return {k: _to_jsonable(v) for k, v in value.items() if k != "valid"}
     if isinstance(value, np.ndarray):

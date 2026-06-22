@@ -503,6 +503,35 @@ def test_priority_queue_dashboard_support(db):
     assert client.get("/").json()["structures"]["jobs"] == "PriorityQueue"
 
 
+def test_collection_datetime_field_over_http(db):
+    from datetime import datetime
+    from loom import Many
+
+    db.collection("events", {"id": "utf8[16]", "created_at": "datetime", "box": "utf8[8]"},
+                  indexes={"id": "primary", "created_at": "range",
+                           "box": Many(sort="created_at", desc=True)})
+    client = TestClient(db.fastapi_app())
+
+    # schema introspection reports the datetime kind
+    assert client.get("/collections/events").json()["schema"]["created_at"] == "datetime"
+
+    for i in range(3):
+        r = client.post("/collections/events/records",
+                        json={"id": f"e{i}", "created_at": f"2026-01-0{i+1}T00:00:00", "box": "main"})
+        assert r.status_code == 201
+
+    # round-trips as ISO 8601
+    assert client.get("/collections/events/records/e0").json()["created_at"] == "2026-01-01T00:00:00"
+
+    # descending range (most recent first), bounds parsed from ISO strings
+    ids = [r["id"] for r in client.get("/collections/events/range/created_at",
+                                       params={"desc": "true", "limit": 2}).json()]
+    assert ids == ["e2", "e1"]
+    ids = [r["id"] for r in client.get("/collections/events/range/created_at",
+                                       params={"low": "2026-01-02T00:00:00"}).json()]
+    assert sorted(ids) == ["e1", "e2"]
+
+
 def test_serve_mounts_optional_dashboard(monkeypatch, db):
     import loom.server as server
 

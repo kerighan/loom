@@ -5,7 +5,7 @@ import mmh3
 from loom.datastructures.base import DataStructure, write_op
 from loom.datastructures.template import DataStructureTemplate
 from loom.datastructures.counting_bloomfilter import CountingBloomFilter
-from loom.dataset import _to_native
+from loom.dataset import _to_native, as_record
 from loom.ref import Ref
 
 
@@ -806,7 +806,7 @@ class Dict(DataStructure):
         Args:
             items: iterable of (key, value) pairs
         """
-        items = list(items)
+        items = [(k, as_record(v)) for k, v in items]   # accept Pydantic models
         # If the current arena can't hold the whole batch, open one fresh arena
         # sized to fit it — so the batch lands contiguously (one mmap-slice run
         # for to_dict) and the per-item inserts below never trigger growth.
@@ -1028,6 +1028,7 @@ class Dict(DataStructure):
         if isinstance(key, tuple) and len(key) == 2:
             self._set_field(key[0], key[1], value)
             return
+        value = as_record(value)   # accept a Pydantic model
         if atomic:
             self._setitem_atomic(key, value)
         else:

@@ -333,7 +333,7 @@ class TestDeletionPersistence:
 
             # Session 2: Verify deletions persisted
             with DB(filename) as db:
-                lst = db.create_list("test", {"id": "uint64"})
+                lst = db["test"]
 
                 assert len(lst) == 17
 
@@ -372,7 +372,7 @@ class TestDeletionPersistence:
 
             # Session 2: Verify compaction persisted
             with DB(filename) as db:
-                lst = db.create_list("test", {"id": "uint64"})
+                lst = db["test"]
 
                 assert len(lst) == 60
                 assert lst.length == lst.valid_count  # No waste

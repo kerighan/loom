@@ -360,7 +360,7 @@ class TestListPersistence:
 
             # Session 2: Reload and verify
             with DB(filename) as db:
-                lst = db.create_list("test", {"id": "uint64", "name": "U50"})
+                lst = db["test"]
 
                 assert len(lst) == 100
                 assert lst[0] == {"id": 0, "name": "item_0"}
@@ -384,7 +384,7 @@ class TestListPersistence:
 
             # Session 2: Append more
             with DB(filename) as db:
-                lst = db.create_list("test", {"id": "uint64"})
+                lst = db["test"]
                 assert len(lst) == 50
 
                 for i in range(50, 100):
@@ -394,7 +394,7 @@ class TestListPersistence:
 
             # Session 3: Verify
             with DB(filename) as db:
-                lst = db.create_list("test", {"id": "uint64"})
+                lst = db["test"]
                 assert len(lst) == 100
                 assert lst[0] == {"id": 0}
                 assert lst[99] == {"id": 99}
@@ -571,9 +571,9 @@ class TestMultipleDataStructures:
 
             # Session 2: Reload and verify
             with DB(filename) as db:
-                list1 = db.create_list("tasks", {"id": "uint64", "task": "U200"})
-                list2 = db.create_list("users", {"id": "uint64", "name": "U50"})
-                bf = db.create_bloomfilter("seen", expected_items=1000)
+                list1 = db["tasks"]
+                list2 = db["users"]
+                bf = db["seen"]
 
                 assert len(list1) == 100
                 assert len(list2) == 100

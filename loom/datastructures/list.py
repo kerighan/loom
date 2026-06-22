@@ -14,6 +14,7 @@ import json
 
 from loom.datastructures.base import DataStructure, write_op
 from loom.datastructures.template import DataStructureTemplate
+from loom.dataset import as_record
 
 
 class List(DataStructure):
@@ -498,6 +499,7 @@ class List(DataStructure):
             # Regular list: append data
             if item is None:
                 raise ValueError("Cannot append None to data list")
+            item = as_record(item)   # accept a Pydantic model
             if atomic:
                 # Use atomic one-item batch
                 self.append_many([item], atomic=True)
@@ -532,7 +534,7 @@ class List(DataStructure):
                 self.append(item, atomic=atomic)
             return
 
-        items = list(items)
+        items = [as_record(it) for it in items]
         if not items:
             return
 
@@ -540,6 +542,10 @@ class List(DataStructure):
             # Non-atomic fast path: mirror repeated append() calls
             for item in items:
                 self.append(item)
+            # Checkpoint metadata once at the end of the bulk op, so a bulk
+            # insert is durable even without an explicit close()/flush().
+            self.save()
+            self._ops_since_save = 0
             return
 
         # Atomic path: single WAL-backed batch
@@ -576,8 +582,9 @@ class List(DataStructure):
             # Update overall length after planning all items
             self.length = index
 
-        # Auto-save metadata if needed
-        self._auto_save_check()
+        # Checkpoint metadata at the end of the bulk op (durable without close).
+        self.save()
+        self._ops_since_save = 0
 
     def _append_item(self, item):
         """Internal method to append item dict to storage.
@@ -974,6 +981,8 @@ class List(DataStructure):
 
         if index < 0 or index >= self.valid_count:
             raise IndexError("list index out of range")
+
+        item = as_record(item)   # accept a Pydantic model
 
         # Fast path: no deletions
         if self.length == self.valid_count:

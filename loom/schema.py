@@ -47,10 +47,14 @@ from __future__ import annotations
 from typing import Any, get_args, get_origin, Union
 
 # numpy dtype strings for common Python types
+from datetime import date as _date, datetime as _datetime
+
 _TYPE_MAP: dict[type, str] = {
     int: "int64",
     float: "float64",
     bool: "bool",
+    _datetime: "datetime",   # stored inline as int64 epoch-µs, transparent
+    _date: "datetime",
 }
 
 
@@ -101,7 +105,7 @@ def _resolve_type(annotation: Any, field_info: Any = None) -> str:
 
     raise TypeError(
         f"Cannot map type {annotation!r} to a loom dtype. "
-        f"Supported: int, float, bool, str, Vec(N) (+ Optional variants)."
+        f"Supported: int, float, bool, str, datetime/date, Vec(N) (+ Optional variants)."
     )
 
 
@@ -201,6 +205,32 @@ def Utf8(max_bytes: int):
         loom_dtype = tag
 
     return Annotated[str, _Utf8Meta]
+
+
+def Datetime():
+    """Datetime field (→ 'datetime', stored inline as int64 epoch-microseconds).
+
+    Declare it directly as ``created_at: datetime`` in a Pydantic model — this
+    helper is just the explicit Annotated form.  You read and write Python
+    ``datetime`` objects; loom handles the int64 conversion transparently, and
+    the field is naturally ordered, so range/sort/PriorityQueue work on it.
+
+    Naive datetimes are treated as UTC; timezone-aware ones are converted to
+    UTC and returned naive (UTC) on read.  8 bytes, no BlobStore hop.
+
+    Example:
+        from datetime import datetime
+        class Event(BaseModel):
+            id:         int
+            created_at: datetime          # → 'datetime'
+    """
+    from datetime import datetime
+    from typing import Annotated
+
+    class _DatetimeMeta:
+        loom_dtype = "datetime"
+
+    return Annotated[datetime, _DatetimeMeta]
 
 
 def FixedStr(max_length: int):

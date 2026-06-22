@@ -56,6 +56,7 @@ Performance
 import numpy as np
 
 from loom.datastructures.base import DataStructure, write_op
+from loom.dataset import as_record
 
 
 class Queue(DataStructure):
@@ -231,6 +232,7 @@ class Queue(DataStructure):
 
         Performance: O(1) amortized (occasional block allocation)
         """
+        item = as_record(item)   # accept a Pydantic model
         if not isinstance(item, dict):
             raise TypeError(f"item must be a dict, got {type(item).__name__}")
 
@@ -311,7 +313,7 @@ class Queue(DataStructure):
         Args:
             items: Iterable of item dicts
         """
-        items = list(items)
+        items = [as_record(it) for it in items]   # accept Pydantic models
         if not items:
             return
 
@@ -329,7 +331,9 @@ class Queue(DataStructure):
             self._tail_offset += 1
             self._size += 1
 
-        self._auto_save_check()
+        # Checkpoint metadata at the end of the bulk op (durable without close).
+        self.save()
+        self._ops_since_save = 0
 
     # ── Iteration (non-destructive) ───────────────────────────────────────────
 

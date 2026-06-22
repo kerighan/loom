@@ -15,6 +15,7 @@ allowing flexible value sizes and nested structures.
 from .base import DataStructure, write_op
 from loom.datastructures.template import DataStructureTemplate
 from loom.ref import Ref
+from loom.dataset import as_record
 
 
 class BTree(DataStructure):
@@ -558,7 +559,7 @@ class BTree(DataStructure):
         """
         if self.root_addr != 0 or self.size != 0:
             raise ValueError("bulk_load requires an empty BTree")
-        items = sorted(((str(k), v) for k, v in items), key=lambda kv: kv[0])
+        items = sorted(((str(k), as_record(v)) for k, v in items), key=lambda kv: kv[0])
         if not items:
             return
 
@@ -898,6 +899,9 @@ class BTree(DataStructure):
         """Insert or update a key-value pair."""
         if not isinstance(key, str):
             key = str(key)
+
+        if not self._is_nested:
+            value = as_record(value)   # accept a Pydantic model
 
         if self._is_nested:
             expected_type = self._template.ds_class

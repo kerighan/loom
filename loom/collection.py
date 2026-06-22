@@ -39,6 +39,8 @@ import numbers
 import struct
 from datetime import date, datetime
 
+from loom.dataset import as_record
+
 _SEP = "\x00"          # composite-key separator (numpy U preserves embedded NULs)
 _INT_OFFSET = 1 << 63  # map signed int64 → unsigned for zero-padded ordering
 _UINT_MAX = (1 << 64) - 1
@@ -231,6 +233,7 @@ class Collection:
                 del si["pk2docid"][pk]
 
     def insert(self, record):
+        record = as_record(record)
         pk = self._pk_of(record)
         with self._db.write_lock():
             with self._db.batch():
@@ -240,7 +243,7 @@ class Collection:
         return pk
 
     def insert_many(self, records):
-        records = list(records)
+        records = [as_record(r) for r in records]
         pks = [self._pk_of(r) for r in records]
         with self._db.write_lock():
             with self._db.batch():
@@ -358,6 +361,22 @@ class Collection:
 
     # ── reads ────────────────────────────────────────────────────────────
 
+    def _coerce_field_value(self, field, value):
+        """Coerce a query value to the field's numeric type so it encodes the
+        same way the stored values do (an int field encodes ints; a float field
+        encodes floats — passing 40 to a float index would otherwise mis-sort)."""
+        if value is None or field not in self.dataset.user_schema.names:
+            return value
+        if field in getattr(self.dataset, "_datetime_fields", set()):
+            return value   # datetime / ISO str handled by encode_value
+        if isinstance(value, numbers.Real) and not isinstance(value, bool):
+            kind = self.dataset.user_schema.fields[field][0].kind
+            if kind == "f":
+                return float(value)
+            if kind in ("i", "u"):
+                return int(value)
+        return value
+
     def _wrap(self, pk, record):
         return Record(self, str(pk), record) if record is not None else None
 
@@ -375,6 +394,7 @@ class Collection:
             raise ValueError(
                 f"get() needs a 'unique' index; use find()/range() for {index_name!r}"
             )
+        value = self._coerce_field_value(ix["field"], value)
         entry = ix["struct"].get(encode_value(value))
         if entry is None:
             return default
@@ -385,6 +405,7 @@ class Collection:
         ix = self._indexes[index_name]
         if ix["spec"].kind != "many":
             raise ValueError(f"find() needs a 'many' index for {index_name!r}")
+        value = self._coerce_field_value(ix["field"], value)
         out = []
         for _key, entry in ix["struct"].prefix(encode_value(value) + _SEP):
             rec = self._primary.get(str(entry["pk"]))
@@ -404,6 +425,8 @@ class Collection:
         ix = self._indexes[index_name]
         if ix["spec"].kind != "range":
             raise ValueError(f"range() needs a 'range' index for {index_name!r}")
+        low = self._coerce_field_value(ix["field"], low)
+        high = self._coerce_field_value(ix["field"], high)
         start = None if low is None else encode_value(low)
         end = None if high is None else encode_value(high) + "\x01"
         out = []

@@ -9,7 +9,9 @@ Provides high-level API with:
 - Dict-like access
 """
 
+import atexit
 import threading
+import weakref
 from contextlib import contextmanager
 
 from loom.fileio import ByteFileDB
@@ -22,6 +24,27 @@ from loom.errors import (
     ReadOnlyError,
     StructureNotFoundError,
 )
+
+
+# Best-effort safety net: close any still-open writable DBs at interpreter exit,
+# so a script that forgets close()/`with` still persists structure metadata
+# (lengths, counters).  Data pages are flushed by the OS regardless, but the
+# in-memory metadata is only written to the header by close()/flush()/save().
+# atexit is far more reliable than __del__ at shutdown; everything is wrapped so
+# a teardown error never escapes.
+_OPEN_DBS = weakref.WeakSet()
+
+
+def _close_open_dbs_at_exit():
+    for db in list(_OPEN_DBS):
+        try:
+            if getattr(db, "_is_open", False) and not getattr(db, "read_only", False):
+                db.close()
+        except Exception:
+            pass
+
+
+atexit.register(_close_open_dbs_at_exit)
 
 
 class DB:
@@ -181,6 +204,7 @@ class DB:
 
         self._db.open()
         self._is_open = True
+        _OPEN_DBS.add(self)   # auto-close at interpreter exit if not closed
         self._load_registry()
 
         # Load blob compression setting from header (for existing DBs)
@@ -326,6 +350,8 @@ class DB:
             return "blob"
         if field_name in getattr(dataset, "_utf8_fields", {}):
             return f"utf8[{dataset._utf8_fields[field_name]}]"
+        if field_name in getattr(dataset, "_datetime_fields", set()):
+            return "datetime"
         dtype = dataset.user_schema.fields[field_name][0]
         return dtype_to_str(dtype)
 
@@ -357,11 +383,15 @@ class DB:
         return next_id
 
     def flush(self):
-        """Flush all pending mmap writes to disk immediately.
+        """Persist everything to disk immediately: in-memory structure metadata
+        (lengths, counters …) AND the mmap data pages.
 
         In the default sync_writes=False mode, writes accumulate in the
         OS page cache and are only guaranteed on disk after close() or
-        this method.
+        this method.  Structure metadata is otherwise only checkpointed every
+        ``auto_save_interval`` ops and at the end of bulk ops (append_many …),
+        so call flush()/close() (or use ``with DB(...)``) before relying on a
+        reopened len()/count.
 
         For long-running servers, call this periodically:
             import schedule
@@ -373,8 +403,18 @@ class DB:
         """
         if not self._is_open:
             return
-        if self._blob_store is not None and not self.read_only:
-            self._blob_store._save_freelist()
+        if not self.read_only:
+            # Persist in-memory structure metadata (lengths, counters …) too,
+            # not just the mmap data pages — otherwise len()/counts can read
+            # stale values after a flush without close.
+            for ds in self._datastructures.values():
+                if hasattr(ds, "save"):
+                    try:
+                        ds.save(force=True)
+                    except TypeError:
+                        ds.save()
+            if self._blob_store is not None:
+                self._blob_store._save_freelist()
         self._db.flush()
 
     def _ensure_writable(self):
@@ -427,7 +467,25 @@ class DB:
         finally:
             pass
 
-    def create_dataset(self, dataset_name, model=None, **schema):
+    def _reserve_name(self, name, in_dataset, exist_ok):
+        """Validate a new name across BOTH the dataset and datastructure
+        namespaces (so ``db[name]`` is never ambiguous).
+
+        Returns the existing object when it already exists in its OWN namespace
+        and ``exist_ok`` is True; raises DuplicateNameError on any other clash.
+        """
+        own = self._datasets if in_dataset else self._datastructures
+        other = self._datastructures if in_dataset else self._datasets
+        if name in own:
+            if exist_ok:
+                return own[name]
+            raise DuplicateNameError(name, "Dataset" if in_dataset else "Data structure")
+        if name in other:
+            # name taken by the other kind — db[name] would be ambiguous
+            raise DuplicateNameError(name, "Data structure" if in_dataset else "Dataset")
+        return None
+
+    def create_dataset(self, dataset_name, model=None, exist_ok=False, **schema):
         """Create a new dataset with automatic identifier assignment.
 
         Args:
@@ -460,8 +518,9 @@ class DB:
 
             schema = schema_from_model(model)
 
-        if dataset_name in self._datasets:
-            raise DuplicateNameError(dataset_name, "Dataset")
+        existing = self._reserve_name(dataset_name, in_dataset=True, exist_ok=exist_ok)
+        if existing is not None:
+            return existing
 
         # Get next identifier
         identifier = self._get_next_identifier()
@@ -658,7 +717,7 @@ class DB:
 
     # Data Structure Factory Methods
 
-    def create_bloomfilter(self, name, expected_items=10000, false_positive_rate=0.01):
+    def create_bloomfilter(self, name, expected_items=10000, false_positive_rate=0.01, exist_ok=False):
         """Create a Bloom filter.
 
         Args:
@@ -680,8 +739,9 @@ class DB:
         self._ensure_writable()
 
         # Return existing if already loaded
-        if name in self._datastructures:
-            return self._datastructures[name]
+        existing = self._reserve_name(name, in_dataset=False, exist_ok=exist_ok)
+        if existing is not None:
+            return existing
 
         bf = BloomFilter(name, self, expected_items, false_positive_rate)
         self._datastructures[name] = bf  # Register for auto-save on close
@@ -689,7 +749,8 @@ class DB:
         return bf
 
     def create_counting_bloomfilter(
-        self, name, expected_items=10000, false_positive_rate=0.01, max_count=255
+        self, name, expected_items=10000, false_positive_rate=0.01, max_count=255,
+        exist_ok=False,
     ):
         """Create a Counting Bloom filter (supports removal).
 
@@ -712,8 +773,9 @@ class DB:
         self._ensure_writable()
 
         # Return existing if already loaded
-        if name in self._datastructures:
-            return self._datastructures[name]
+        existing = self._reserve_name(name, in_dataset=False, exist_ok=exist_ok)
+        if existing is not None:
+            return existing
 
         cbf = CountingBloomFilter(
             name, self, expected_items, false_positive_rate, max_count
@@ -722,7 +784,7 @@ class DB:
         self._save_datastructures_registry()  # Persist registry
         return cbf
 
-    def create_list(self, name, dataset_or_template):
+    def create_list(self, name, dataset_or_template, exist_ok=False):
         """Create a persistent List.
 
         Args:
@@ -749,8 +811,9 @@ class DB:
         self._ensure_writable()
 
         # Return existing if already loaded
-        if name in self._datastructures:
-            return self._datastructures[name]
+        existing = self._reserve_name(name, in_dataset=False, exist_ok=exist_ok)
+        if existing is not None:
+            return existing
 
         lst = List(name, self, dataset_or_template)
         self._datastructures[name] = lst  # Register for caching and auto-save
@@ -769,6 +832,7 @@ class DB:
         store_key=True,
         max_key_len=100,
         key_dtype=None,
+        exist_ok=False,
     ):
         """Create a persistent Dict.
 
@@ -805,8 +869,9 @@ class DB:
         from loom.datastructures.dict import Dict
 
         # Return existing if already loaded
-        if name in self._datastructures:
-            return self._datastructures[name]
+        existing = self._reserve_name(name, in_dataset=False, exist_ok=exist_ok)
+        if existing is not None:
+            return existing
 
         dct = Dict(
             name,
@@ -825,7 +890,7 @@ class DB:
         self._save_datastructures_registry()  # Persist registry
         return dct
 
-    def create_set(self, name, key_size=50, use_bloom=True):
+    def create_set(self, name, key_size=50, use_bloom=True, exist_ok=False):
         """Create a persistent Set.
 
         Args:
@@ -849,15 +914,16 @@ class DB:
         self._ensure_writable()
 
         # Return existing if already loaded
-        if name in self._datastructures:
-            return self._datastructures[name]
+        existing = self._reserve_name(name, in_dataset=False, exist_ok=exist_ok)
+        if existing is not None:
+            return existing
 
         s = Set(name, self, key_size=key_size, use_bloom=use_bloom)
         self._datastructures[name] = s  # Register for caching and auto-save
         self._save_datastructures_registry()  # Persist registry
         return s
 
-    def create_btree(self, name, dataset, key_size=50):
+    def create_btree(self, name, dataset, key_size=50, exist_ok=False):
         """Create a persistent BTree with ordered keys.
 
         BTree provides O(log n) operations with ordered iteration
@@ -893,8 +959,9 @@ class DB:
         from loom.datastructures.btree import BTree
 
         # Return existing if already loaded
-        if name in self._datastructures:
-            return self._datastructures[name]
+        existing = self._reserve_name(name, in_dataset=False, exist_ok=exist_ok)
+        if existing is not None:
+            return existing
 
         btree = BTree(name, self, dataset, key_size=key_size)
         self._datastructures[name] = btree  # Register for caching and auto-save
@@ -903,7 +970,7 @@ class DB:
 
     def create_graph(
         self, name, node_schema, edge_schema, directed=True, node_id_max_len=50,
-        label_field=None,
+        label_field=None, exist_ok=False,
     ):
         """Create a persistent Graph.
 
@@ -936,8 +1003,9 @@ class DB:
 
         from loom.datastructures.graph import Graph
 
-        if name in self._datastructures:
-            return self._datastructures[name]
+        existing = self._reserve_name(name, in_dataset=False, exist_ok=exist_ok)
+        if existing is not None:
+            return existing
 
         g = Graph(
             name,
@@ -965,6 +1033,7 @@ class DB:
         bm25_k1=1.5,
         bm25_b=0.75,
         store_documents=True,
+        exist_ok=False,
     ):
         """Create or reopen a full-text SearchIndex over a documents dataset.
 
@@ -1004,8 +1073,9 @@ class DB:
 
         from loom.datastructures.search import SearchIndex
 
-        if name in self._datastructures:
-            return self._datastructures[name]
+        existing = self._reserve_name(name, in_dataset=False, exist_ok=exist_ok)
+        if existing is not None:
+            return existing
 
         si = SearchIndex(
             name,
@@ -1025,7 +1095,7 @@ class DB:
         self._save_datastructures_registry()
         return si
 
-    def create_queue(self, name, schema, block_size=64):
+    def create_queue(self, name, schema, block_size=64, exist_ok=False):
         """Create a persistent FIFO Queue.
 
         Args:
@@ -1054,15 +1124,16 @@ class DB:
 
         from loom.datastructures.queue import Queue
 
-        if name in self._datastructures:
-            return self._datastructures[name]
+        existing = self._reserve_name(name, in_dataset=False, exist_ok=exist_ok)
+        if existing is not None:
+            return existing
 
         q = Queue(name, self, schema, block_size=block_size)
         self._datastructures[name] = q
         self._save_datastructures_registry()
         return q
 
-    def create_priority_queue(self, name, schema=None, max_first=True):
+    def create_priority_queue(self, name, schema=None, max_first=True, exist_ok=False):
         """Create or reopen a persistent PriorityQueue (BTree-backed).
 
         push(item, priority) / pop() / peek() in O(log n).  The highest
@@ -1091,8 +1162,9 @@ class DB:
 
         from loom.datastructures.priority_queue import PriorityQueue
 
-        if name in self._datastructures:
-            return self._datastructures[name]
+        existing = self._reserve_name(name, in_dataset=False, exist_ok=exist_ok)
+        if existing is not None:
+            return existing
 
         pq = PriorityQueue(name, self, schema, max_first=max_first)
         self._datastructures[name] = pq
@@ -1107,6 +1179,7 @@ class DB:
         key_size=50,
         hash_keys=False,
         hash_bits=128,
+        exist_ok=False,
     ):
         """Create a persistent LRU Dict (fixed-capacity, evicts LRU on insert).
 
@@ -1135,8 +1208,9 @@ class DB:
 
         from loom.datastructures.lru_dict import LRUDict
 
-        if name in self._datastructures:
-            return self._datastructures[name]
+        existing = self._reserve_name(name, in_dataset=False, exist_ok=exist_ok)
+        if existing is not None:
+            return existing
 
         lru = LRUDict(
             name,
@@ -1151,7 +1225,7 @@ class DB:
         self._save_datastructures_registry()
         return lru
 
-    def create_flat_index(self, name, dim, metric="cosine"):
+    def create_flat_index(self, name, dim, metric="cosine", exist_ok=False):
         """Create a FlatIndex for exact vector similarity search.
 
         Args:
@@ -1170,8 +1244,9 @@ class DB:
         self._ensure_writable()
         from loom.datastructures.vector_index import FlatIndex
 
-        if name in self._datastructures:
-            return self._datastructures[name]
+        existing = self._reserve_name(name, in_dataset=False, exist_ok=exist_ok)
+        if existing is not None:
+            return existing
         idx = FlatIndex(name, self, dim=dim, metric=metric)
         self._datastructures[name] = idx
         self._save_datastructures_registry()
@@ -1186,6 +1261,7 @@ class DB:
         pq=False,
         n_sub=16,
         n_bits=8,
+        exist_ok=False,
     ):
         """Create an IVFIndex for approximate vector similarity search.
 
@@ -1212,8 +1288,9 @@ class DB:
         self._ensure_writable()
         from loom.datastructures.vector_index import IVFIndex
 
-        if name in self._datastructures:
-            return self._datastructures[name]
+        existing = self._reserve_name(name, in_dataset=False, exist_ok=exist_ok)
+        if existing is not None:
+            return existing
         idx = IVFIndex(
             name,
             self,

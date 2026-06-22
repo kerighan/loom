@@ -68,6 +68,61 @@ def _to_native(value):
     return value.item() if isinstance(value, np.generic) else value
 
 
+def as_record(value):
+    """Coerce a record argument to a plain dict.
+
+    Accepts a dict (returned unchanged) or a Pydantic model — so you can do
+    ``posts.append(Post(...))`` instead of ``posts.append(post.model_dump())``.
+    Pydantic v2 (`model_dump`) and v1 (`dict`) are both supported; anything
+    else is passed through untouched."""
+    if value is None or isinstance(value, dict):
+        return value
+    dump = getattr(value, "model_dump", None)   # pydantic v2
+    if callable(dump):
+        return dump()
+    legacy = getattr(value, "dict", None)        # pydantic v1
+    if callable(legacy) and type(value).__module__.startswith("pydantic"):
+        return legacy()
+    return value
+
+
+# ── Datetime ↔ int64 (epoch microseconds) ──────────────────────────────────
+# "datetime" fields are stored inline as int64 microseconds since 1970-01-01,
+# encoded/decoded transparently.  8 bytes, naturally ordered (range/sort work),
+# no BlobStore hop.  Naive datetimes are treated as UTC; aware ones are
+# converted to UTC; on read you get a naive (UTC) datetime back.
+from datetime import date as _date, datetime as _datetime, timedelta as _timedelta, timezone as _timezone
+
+_EPOCH = _datetime(1970, 1, 1)
+
+
+def _dt_to_micros(value):
+    """Encode a datetime/date (or raw int micros) to int64 epoch-microseconds."""
+    if value is None:
+        return 0
+    if isinstance(value, _datetime):
+        dt = value
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(_timezone.utc).replace(tzinfo=None)
+    elif isinstance(value, _date):
+        dt = _datetime(value.year, value.month, value.day)
+    elif isinstance(value, (int, np.integer)):
+        return int(value)            # already microseconds — pass through
+    elif isinstance(value, str):
+        dt = _datetime.fromisoformat(value)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(_timezone.utc).replace(tzinfo=None)
+    else:
+        raise TypeError(f"datetime field expects datetime/date/int/ISO str, got {type(value)!r}")
+    delta = dt - _EPOCH
+    return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
+
+
+def _micros_to_dt(micros):
+    """Decode int64 epoch-microseconds back to a naive (UTC) datetime."""
+    return _EPOCH + _timedelta(microseconds=int(micros))
+
+
 class Dataset:
     """A typed dataset with prefix-based identification.
 
@@ -114,11 +169,14 @@ class Dataset:
         # — ~4× smaller than U{N} (UCS-4, 4 bytes/char) for ASCII, with no
         # BlobStore indirection.  N is a BYTE budget, not a char count.
         self._utf8_fields = {}
+        # Datetime fields: stored inline as int64 epoch-microseconds, encoded/
+        # decoded to Python datetime transparently (see _dt_to_micros).
+        self._datetime_fields = set()
 
         # Track array (vector) fields for proper serialization
         self._array_fields = {}   # field_name → shape tuple
 
-        # Convert dtype strings, handling "blob", "text", "utf8[N]", and "float32[N]"
+        # Convert dtype strings, handling "blob", "text", "utf8[N]", "datetime", "float32[N]"
         processed_schema = []
         for field, dtype in schema.items():
             if dtype == "blob":
@@ -127,6 +185,9 @@ class Dataset:
             elif dtype == "text":
                 self._text_fields.add(field)
                 processed_schema.append((field, BLOB_DTYPE))
+            elif dtype == "datetime":
+                self._datetime_fields.add(field)
+                processed_schema.append((field, np.dtype("int64")))
             elif isinstance(dtype, str) and dtype.startswith("utf8[") and dtype.endswith("]"):
                 n = int(dtype[5:-1])
                 self._utf8_fields[field] = n
@@ -216,6 +277,8 @@ class Dataset:
                         arr[field]["n_slots"] = value[1]
                 elif field in self._utf8_fields:
                     arr[field] = self._utf8_pack(value, self._utf8_fields[field])
+                elif field in self._datetime_fields:
+                    arr[field] = _dt_to_micros(value)
                 elif field in self._array_fields:
                     # numpy array field — assign directly
                     arr[field] = np.asarray(value, dtype=self.user_schema.fields[field][0].base)
@@ -252,6 +315,8 @@ class Dataset:
             for field in self._blob_fields:
                 off, ns = result[field]
                 result[field] = None if (off == 0 and ns == 0) else (int(off), int(ns))
+            for field in self._datetime_fields:
+                result[field] = _micros_to_dt(result[field])
             return result
 
         # Vector path: keep arrays as numpy (never item() a whole vector).
@@ -266,6 +331,8 @@ class Dataset:
                 result[field] = None if (offset == 0 and n_slots == 0) else (offset, n_slots)
             elif field in self._utf8_fields:
                 result[field] = bytes(value).rstrip(b"\x00").decode("utf-8")
+            elif field in self._datetime_fields:
+                result[field] = _micros_to_dt(int(value))
             elif field in self._array_fields:
                 result[field] = np.array(value)
             else:
@@ -362,6 +429,8 @@ class Dataset:
                         d[field] = None if (offset == 0 and n_slots == 0) else (offset, n_slots)
                     elif field in self._utf8_fields:
                         d[field] = bytes(rec[field]).rstrip(b"\x00").decode("utf-8")
+                    elif field in self._datetime_fields:
+                        d[field] = _micros_to_dt(int(rec[field]))
                     else:
                         d[field] = _to_native(rec[field])
                 if prefix == -self.identifier:
@@ -434,6 +503,9 @@ class Dataset:
             self.db.write(address + field_offset, data)
             return
 
+        if field_name in self._datetime_fields:
+            value = _dt_to_micros(value)
+
         # Standard field update
         field_dtype = self.user_schema.fields[field_name][0]
         data = np.array([value], dtype=field_dtype).tobytes()
@@ -473,6 +545,8 @@ class Dataset:
         if field_name in self._blob_fields:
             off, ns = int(value["offset"]), int(value["n_slots"])
             return None if (off == 0 and ns == 0) else self.blob_store.read(off)
+        if field_name in self._datetime_fields:
+            return _micros_to_dt(int(value))
         return _to_native(value)
 
     def exists(self, address):
@@ -524,13 +598,15 @@ class Dataset:
             return
         if isinstance(address, Ref):
             address = address.addr
+        record = as_record(record)
         if not isinstance(record, dict):
-            raise TypeError(f"Record must be a dict, got {type(record).__name__}")
+            raise TypeError(f"Record must be a dict or Pydantic model, got {type(record).__name__}")
         self.write(address, **record)
 
     def insert(self, record):
+        record = as_record(record)
         if not isinstance(record, dict):
-            raise TypeError(f"Record must be a dict, got {type(record).__name__}")
+            raise TypeError(f"Record must be a dict or Pydantic model, got {type(record).__name__}")
         addr = self.allocate_block(1)
         self[addr] = record
         return Ref(self, int(addr))

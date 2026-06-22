@@ -290,8 +290,7 @@ class TestBTreePersistence:
 
             # Session 2: Verify data persists
             with DB(db_path) as db:
-                user_ds = db.get_dataset("users")
-                btree = db.create_btree("users_btree", user_ds)
+                btree = db["users_btree"]
 
                 assert len(btree) == 3
                 assert btree["alice"]["name"] == "Alice"
@@ -317,8 +316,7 @@ class TestBTreePersistence:
 
             # Session 2: Verify deletion persists
             with DB(db_path) as db:
-                user_ds = db.get_dataset("users")
-                btree = db.create_btree("users_btree", user_ds)
+                btree = db["users_btree"]
 
                 assert len(btree) == 1
                 assert "alice" not in btree

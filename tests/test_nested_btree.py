@@ -55,7 +55,7 @@ class TestDictOfBtrees:
         db.close()
 
         db = DB(self.temp_path)
-        teams = db.create_dict("teams", None)
+        teams = db["teams"]
 
         eng = teams["engineering"]
         assert eng["alice"]["name"] == "Alice"
@@ -108,7 +108,7 @@ class TestBtreeOfDicts:
         db.close()
 
         db = DB(self.temp_path, header_size=1024 * 1024)
-        teams = db.create_btree("teams", None)
+        teams = db["teams"]
 
         eng = teams["engineering"]
         assert eng["alice"]["name"] == "Alice"

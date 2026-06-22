@@ -129,3 +129,6 @@ loom_old/
 
 # Windows specific files
 Thumbs.db
+
+# Large benchmark datasets (downloaded on demand)
+benchmarks/data/

@@ -18,6 +18,7 @@ correctly.  Use one consistent priority type per queue.
 from __future__ import annotations
 
 from loom.collection import _SEP, encode_value
+from loom.dataset import as_record
 from loom.datastructures.base import DataStructure
 
 
@@ -106,7 +107,7 @@ class PriorityQueue(DataStructure):
     def push(self, item, priority):
         """Enqueue ``item`` with the given ``priority`` (O(log n))."""
         self._ensure_loaded()
-        self._bt[self._key(priority, self._seq)] = item
+        self._bt[self._key(priority, self._seq)] = as_record(item)
         self._seq += 1
         self._meta["seq"] = {"v": self._seq}
 
@@ -118,7 +119,7 @@ class PriorityQueue(DataStructure):
         self._ensure_loaded()
         batch = []
         for item, priority in items:
-            batch.append((self._key(priority, self._seq), item))
+            batch.append((self._key(priority, self._seq), as_record(item)))
             self._seq += 1
         if not batch:
             return

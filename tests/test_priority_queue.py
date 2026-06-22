@@ -106,7 +106,7 @@ def test_priority_queue_reopen():
         pq.push({"task": "b"}, 5)
 
     with DB(path) as db:
-        pq = db.create_priority_queue("jobs")  # reopen, no schema
+        pq = db["jobs"]  # reopen via getter
         assert len(pq) == 2
         assert pq.peek()["task"] == "b"
         # a fresh push must not collide with persisted sequence numbers

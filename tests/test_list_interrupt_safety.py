@@ -67,7 +67,7 @@ class TestInterruptSafety:
 
             # Check what was saved
             with DB(filename) as db:
-                lst = db.create_list("test", {"id": "uint64", "value": "U50"})
+                lst = db["test"]
 
                 saved_count = len(lst)
                 print(f"\n  Inserted: {interrupt_at + 1} items")
@@ -112,7 +112,7 @@ class TestInterruptSafety:
 
             # Check what was saved
             with DB(filename) as db:
-                lst = db.create_list("test", {"id": "uint64", "value": "U50"})
+                lst = db["test"]
 
                 saved_count = len(lst)
                 print(f"\n  Inserted: {interrupt_at + 1} items")
@@ -142,13 +142,13 @@ class TestInterruptSafety:
 
             # Check session 1
             with DB(filename) as db:
-                lst = db.create_list("test", {"id": "uint64", "value": "U50"})
+                lst = db["test"]
                 count1 = len(lst)
                 print(f"\n  Session 1 saved: {count1} items")
 
             # Session 2: Continue inserting (should append)
             with DB(filename) as db:
-                lst = db.create_list("test", {"id": "uint64", "value": "U50"})
+                lst = db["test"]
 
                 # Append more items
                 for i in range(count1, count1 + 500):
@@ -159,7 +159,7 @@ class TestInterruptSafety:
 
             # Session 3: Verify all data
             with DB(filename) as db:
-                lst = db.create_list("test", {"id": "uint64", "value": "U50"})
+                lst = db["test"]
 
                 final_count = len(lst)
                 assert final_count == count2
@@ -191,7 +191,7 @@ class TestInterruptSafety:
 
             # Verify all 2500 items saved
             with DB(filename) as db:
-                lst = db.create_list("test", {"id": "uint64", "value": "U50"})
+                lst = db["test"]
 
                 assert len(lst) == 2500
                 print(f"\n  ✓ All 2500 items saved with proper close")
@@ -229,9 +229,9 @@ class TestMultiStructureInterruptSafety:
 
             # Verify all structures saved
             with DB(filename) as db:
-                list1 = db.create_list("list1", {"id": "uint64"})
-                list2 = db.create_list("list2", {"id": "uint64"})
-                bf = db.create_bloomfilter("bloom", expected_items=1000)
+                list1 = db["list1"]
+                list2 = db["list2"]
+                bf = db["bloom"]
 
                 assert len(list1) == 500
                 assert len(list2) == 500
@@ -274,7 +274,7 @@ class TestAutoSaveInterval:
 
             # Verify
             with DB(filename) as db:
-                lst = db.create_list("test", {"id": "uint64"})
+                lst = db["test"]
 
                 # Should have at least 200 items
                 saved = len(lst)
@@ -304,7 +304,7 @@ class TestAutoSaveInterval:
 
             # Verify
             with DB(filename) as db:
-                lst = db.create_list("test", {"id": "uint64"})
+                lst = db["test"]
 
                 # Should have all 100 items (manual save)
                 assert len(lst) == 100

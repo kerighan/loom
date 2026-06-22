@@ -48,6 +48,7 @@ Define your record schema as a Pydantic model. loom maps types automatically:
 | `int` | `int64` | |
 | `float` | `float64` | |
 | `bool` | `bool` | |
+| `datetime` / `date` | `datetime` | **Stored inline as int64 epoch-µs**, read/written as Python `datetime` — naturally ordered (range/sort/PriorityQueue work) |
 | `str` | `text` | Variable-length, compressed via BlobStore |
 | `Utf8(N)` | `utf8[N]` | **Fixed-width inline UTF-8, N bytes** — ~4× smaller than `U{N}` for ASCII, same read speed |
 | `str = Field(max_length=N)` | `U{N}` | Fixed-length numpy UCS-4 (4 bytes/char) |
@@ -57,10 +58,13 @@ Define your record schema as a Pydantic model. loom maps types automatically:
 from pydantic import BaseModel, Field
 from loom.schema import FixedStr, Utf8
 
+from datetime import datetime
+
 class Message(BaseModel):
-    id:      int
-    role:    Utf8(20)   # → utf8[20], 20 B inline, fast key
-    content: str        # → text, variable-length
+    id:         int
+    role:       Utf8(20)   # → utf8[20], 20 B inline, fast key
+    content:    str        # → text, variable-length
+    created_at: datetime   # → datetime; write/read datetime objects directly
 
 class Product(BaseModel):
     sku:    Utf8(20)    # → utf8[20]
@@ -76,6 +80,8 @@ db.create_dataset("events", id="uint32", ts="int64", kind="utf8[20]")
 ```
 
 **Rule of thumb:** use `Utf8(N)` for short bounded strings used as keys or in frequent filters (inline, compact, fast) — it's ~4× smaller than `U{N}` for ASCII. Use plain `str` (→ `text`) for anything long or variable — body text, descriptions, JSON payloads. Reach for `U{N}`/`FixedStr(N)` only when you specifically need fixed UCS-4.
+
+**Datetimes** are first-class: declare a field as `datetime` (or use `Datetime()`) and read/write Python `datetime` objects — loom stores them inline as **int64 epoch-microseconds** (8 bytes, no BlobStore hop) and handles the conversion for you. They're naturally ordered, so a `datetime` field works directly as a Collection `range`/`many` criterion (e.g. `range("created_at", limit=50, desc=True)` for the 50 most recent) or a `PriorityQueue` priority. Naive datetimes are treated as UTC; timezone-aware values are converted to UTC and returned naive.
 
 ### The DB object
 
@@ -101,6 +107,24 @@ with db.batch():
 # Long-running servers: call flush() periodically instead of sync_writes=True
 db.flush()  # force mmap writeback without closing
 ```
+
+**Creating vs. retrieving.** Names are unique across the whole DB (a dataset and a
+data structure can't share a name — `db[name]` would be ambiguous). `create_*`
+**raises `DuplicateNameError`** if the name already exists, so re-running a script
+or reopening a DB won't silently re-create or duplicate anything:
+
+```python
+ds   = db.create_dataset("posts", Post)
+feed = db.create_list("feed", ds)
+
+db["feed"]                       # retrieve an existing structure (or dataset)
+"feed" in db                     # membership test
+db.create_list("feed", ds)                 # → DuplicateNameError
+db.create_list("feed", ds, exist_ok=True)  # idempotent: returns the existing one
+```
+
+After reopening a DB, get your structures back with `db["name"]` (they're already
+loaded) — or pass `exist_ok=True` to `create_*` for an explicit open-or-create.
 
 ---
 
@@ -857,7 +881,7 @@ At this scale FlatIndex reads ~150 MB of mmap data per query — it becomes the 
 **Crash safety**
 - Double-buffer header: two alternating slots, single-byte atomic flip. If the process crashes mid-write, the previous slot is intact.
 - Write-Ahead Log (WAL) for multi-write atomic transactions (`db.apply_writes()`).
-- `auto_save_interval=N` controls how often metadata is flushed to disk (default: every 100 ops per structure). Set lower for more durability, higher for more speed.
+- `auto_save_interval=N` controls how often structure metadata (lengths, counters) is checkpointed to disk (default: every 100 ops per structure). Bulk ops (`append_many`, `push_many`) also checkpoint at the end, and `flush()`/`close()` persist it immediately. An `atexit` safety net also closes any still-open DB on a clean interpreter exit, so a script that forgets `close()`/`with` still persists its metadata. Prefer `with DB(...)` (or an explicit `close()`/`flush()`) anyway — `atexit` does not run on `kill -9` or a hard crash.
 
 **Durability modes**
 
