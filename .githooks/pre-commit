@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Rebuild the Sphinx docs when loom/ or docs/ changes and refuse the commit if
+# the build is not clean (warnings = errors). Keeps the docs in sync with the
+# docstrings. Local only — output (docs/_build) is gitignored.
+#
+# Enabled via:  git config core.hooksPath .githooks
+set -euo pipefail
+
+# Only run when source or docs are part of this commit.
+if ! git diff --cached --name-only | grep -qE '^(loom/|docs/)'; then
+    exit 0
+fi
+
+# Skip gracefully if Sphinx isn't installed (don't block commits on a missing
+# optional dev dependency).
+if ! python -c "import sphinx, myst_parser, furo" >/dev/null 2>&1; then
+    echo "pre-commit: Sphinx/myst/furo not installed — skipping docs build."
+    echo "            (pip install -r docs/requirements.txt to enable the check)"
+    exit 0
+fi
+
+echo "pre-commit: building docs (warnings = errors)…"
+if ! python -m sphinx -b html -W --keep-going -q docs docs/_build/html; then
+    echo
+    echo "pre-commit: ✗ docs build failed (warnings treated as errors)."
+    echo "            Fix the docstring/doc above, or commit with --no-verify to skip."
+    exit 1
+fi
+echo "pre-commit: ✓ docs build clean."
+exit 0

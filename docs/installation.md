@@ -23,6 +23,23 @@ pip install numpy pydantic lru-dict eldar mmh3
 pip install "fastapi[standard]" brotli      # optional extras
 ```
 
+## Building the docs
+
+```bash
+pip install -r docs/requirements.txt
+cd docs && make html        # → docs/_build/html/index.html
+```
+
+A pre-commit hook rebuilds the docs (warnings = errors) whenever `loom/` or
+`docs/` changes, so the docs stay in sync with the docstrings. Enable it once
+per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+(Skip a one-off check with `git commit --no-verify`.)
+
 ## Sanity check
 
 ```python
