@@ -490,6 +490,12 @@ posts.delete("p1")                             # removed from every index
 - **No duplication.** Secondary indexes store the *primary key*, not a copy of
   the record — a secondary lookup is one extra hop (`index → pk → record`). The
   full-text index keeps only postings (no record copy either).
+- **Key sizing is automatic.** Index storage is sized from the declared field
+  widths, so a long primary key (e.g. a `Utf8(256)` URL) is never truncated in
+  index entries. A `unique`/`many` index on an **unbounded** field (`text`,
+  `dict`/`json`) is indexed by a 128-bit **hash** of the value — so you can
+  group by a long text (an "argument", an article title): `find("argument", x)`
+  works (equality), but `range` on such a field is rejected (no ordering).
 - **Ordered & paginated for free.** `Many(sort="created_at", desc=True)` stores
   composite keys in a B+Tree, so `find()` returns a group already in sort order
   with cheap `limit` — ideal for recent-first feeds. The sort/range criterion may

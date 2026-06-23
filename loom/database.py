@@ -1383,6 +1383,7 @@ class DB:
                     "name": idx_name, "spec": spec, "field": field,
                     "struct": self._datastructures[ic["struct"]],
                     "sources": sources,
+                    "hashed": ic.get("hashed", False),
                 }
             return objs
 
@@ -1739,6 +1740,29 @@ class DB:
         self._save_datastructures_registry()
         self._save_registry()
 
+    @staticmethod
+    def _field_enc_width(ds, field):
+        """Max bytes encode_value() produces for a field (None if unbounded).
+
+        Used to size index keys so a long primary key / value is never
+        truncated in an index entry."""
+        if field in getattr(ds, "_datetime_fields", set()):
+            return 22
+        if field in getattr(ds, "_utf8_fields", {}):
+            return ds._utf8_fields[field]
+        if (field in getattr(ds, "_text_fields", set())
+                or field in getattr(ds, "_json_fields", set())
+                or field in getattr(ds, "_blob_fields", set())):
+            return None
+        dt = ds.user_schema.fields[field][0]
+        if dt.kind in ("i", "u", "f"):
+            return 20
+        if dt.kind == "b":
+            return 1
+        if dt.kind in ("U", "S"):
+            return dt.itemsize          # bytes; the value's utf8 never exceeds this
+        return 20
+
     def _build_collection(self, name, model, specs, primary_field,
                           key_size, index_key_size, cfg_key):
         from loom.collection import Collection
@@ -1749,6 +1773,43 @@ class DB:
             dataset = self.create_dataset(f"{name}__data", **model)
         else:
             dataset = self.create_dataset(f"{name}__data", model)
+
+        # Auto-size key_size / index_key_size from the declared field widths so
+        # a long primary key (e.g. a URL) is never truncated in index entries —
+        # otherwise find()/range()/search() silently drop rows.  An index on an
+        # unbounded field (text/blob/json) is *hashed* (fixed 32-byte group key,
+        # equality only) so possibly-long text values can be indexed too.
+        _HASH_W = 32
+        pk_w = self._field_enc_width(dataset, primary_field)
+        if pk_w is not None:
+            key_size = max(key_size, pk_w)
+        eff_pk = pk_w if pk_w is not None else key_size   # text pk: caller's budget
+        need_ik = eff_pk + 4
+        hashed_index = {}
+        for idx_name, spec in specs.items():
+            if spec.kind in ("primary", "search"):
+                continue
+            fld = getattr(spec, "field", None) or idx_name
+            vw = self._field_enc_width(dataset, fld)
+            hashed = vw is None                      # text/blob/json → hash the group
+            if hashed and spec.kind == "range":
+                raise ValueError(
+                    f"collection {name!r}: range index {idx_name!r} needs an "
+                    f"orderable (bounded) field, not {fld!r} (text/blob/json)"
+                )
+            hashed_index[idx_name] = hashed
+            vw = _HASH_W if hashed else vw
+            sw = 0
+            if spec.kind == "many" and spec.sort is not None:
+                sw = self._field_enc_width(dataset, spec.sort)
+                if sw is None:
+                    raise ValueError(
+                        f"collection {name!r}: many index {idx_name!r} sort field "
+                        f"{spec.sort!r} must be orderable (bounded), not text/blob/json"
+                    )
+            need_ik = max(need_ik, vw + sw + eff_pk + 4)
+        index_key_size = max(index_key_size, need_ik)
+
         primary = self.create_dict(
             f"{name}__primary", dataset, key_size=key_size, max_key_len=key_size
         )
@@ -1778,12 +1839,14 @@ class DB:
             idx_objs[idx_name] = {
                 "name": idx_name, "spec": spec, "field": field,
                 "struct": struct, "sources": sources,
+                "hashed": hashed_index[idx_name],
             }
             cfg_indexes[idx_name] = {
                 "kind": spec.kind, "field": field,
                 "sort": getattr(spec, "sort", None),
                 "desc": getattr(spec, "desc", False),
                 "struct": struct.name,
+                "hashed": hashed_index[idx_name],
             }
 
         # Full-text (search) indexes: a doc-store-less SearchIndex (postings +

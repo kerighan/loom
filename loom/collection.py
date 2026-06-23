@@ -39,7 +39,17 @@ import numbers
 import struct
 from datetime import date, datetime
 
+import mmh3
+
 from loom.dataset import as_record
+
+
+def _hash_value(value):
+    """Fixed-width 128-bit murmur hash (32 hex chars) of a value — used as the
+    group key for indexes on unbounded (text/blob/json) fields, so possibly-long
+    values (e.g. an argument or article title) can be indexed without truncation.
+    No order is preserved (equality grouping only)."""
+    return f"{mmh3.hash128(str(value), signed=False):032x}"
 
 _SEP = "\x00"          # composite-key separator (numpy U preserves embedded NULs)
 _INT_OFFSET = 1 << 63  # map signed int64 → unsigned for zero-padded ordering
@@ -188,17 +198,22 @@ class Collection:
             raise KeyError(f"record missing primary-key field {self._key_field!r}")
         return str(record[self._key_field])
 
+    def _group_key(self, ix, val):
+        """Encode the value/group part of an index key — hashed (fixed width)
+        for unbounded fields, order-preserving otherwise."""
+        return _hash_value(val) if ix.get("hashed") else encode_value(val)
+
     def _index_key(self, ix, record, pk):
         spec = ix["spec"]
         val = record.get(ix["field"])
         if val is None:
             return None
         if spec.kind == "unique":
-            return encode_value(val)
+            return self._group_key(ix, val)
         if spec.kind == "range":
             return encode_value(val) + _SEP + pk
         if spec.kind == "many":
-            parts = [encode_value(val)]
+            parts = [self._group_key(ix, val)]
             if spec.sort is not None:
                 parts.append(encode_value(record.get(spec.sort), desc=spec.desc))
             parts.append(pk)
@@ -448,7 +463,7 @@ class Collection:
                 f"get() needs a 'unique' index; use find()/range() for {index_name!r}"
             )
         value = self._coerce_field_value(ix["field"], value)
-        entry = ix["struct"].get(encode_value(value))
+        entry = ix["struct"].get(self._group_key(ix, value))
         if entry is None:
             return default
         return self.get_primary(entry["pk"], default)
@@ -470,7 +485,7 @@ class Collection:
         if spec.kind != "many":
             raise ValueError(f"find() needs a 'many' index for {index_name!r}")
         value = self._coerce_field_value(ix["field"], value)
-        group = encode_value(value)
+        group = self._group_key(ix, value)
         struct = ix["struct"]
 
         if start is None and end is None:
