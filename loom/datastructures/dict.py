@@ -1348,7 +1348,8 @@ class Dict(DataStructure):
         Returns:
             The value (for nested dicts) or None
 
-        Example:
+        Example::
+
             # Fast path
             users.set("alice", {"id": 1, "name": "Alice"})
 

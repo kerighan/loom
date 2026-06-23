@@ -303,7 +303,8 @@ class DataStructure(ABC):
         Returns:
             DataStructureTemplate instance
 
-        Example:
+        Example::
+
             UserList = List.template(user_dataset)
             teams = db.create_list('teams', UserList)
             eng = teams.append()  # Creates nested List
@@ -359,7 +360,8 @@ class DataStructure(ABC):
         Returns:
             Dict mapping config field names to numpy dtypes
 
-        Example:
+        Example::
+
             return {
                 'growth_factor': 'float64',
                 'p_init': 'uint32',

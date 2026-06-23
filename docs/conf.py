@@ -39,9 +39,9 @@ html_theme_options = {
 # ── autodoc ─────────────────────────────────────────────────────────────────
 autodoc_member_order = "bysource"
 autodoc_typehints = "description"
+# No "members: True" default — each directive in api.rst lists exactly the
+# members to document, so internal helpers aren't pulled in.
 autodoc_default_options = {
-    "members": True,
-    "undoc-members": False,
     "show-inheritance": True,
 }
 # Pydantic / numpy may be heavy or optional at doc-build time — mock if missing.

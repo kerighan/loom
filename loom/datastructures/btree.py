@@ -35,7 +35,8 @@ class BTree(DataStructure):
     _int_keys = False   # class default for paths that bypass __init__ (nested from_ref)
     """Persistent B-tree with O(log n) operations and range queries.
 
-    Usage:
+    Usage::
+
         with DB("mydata.db") as db:
             user_ds = db.create_dataset("users", id="uint32", name="U50")
             users = db.create_btree("users_btree", user_ds)
@@ -1349,7 +1350,8 @@ class BTree(DataStructure):
         Yields:
             (key_str, value) pairs — same as range()
 
-        Example:
+        Example::
+
             from datetime import datetime
             from loom.schema import dt_key, key_dt
 

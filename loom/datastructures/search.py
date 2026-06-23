@@ -74,7 +74,8 @@ def _iter_varint(buf: bytes):
 class SearchIndex(DataStructure):
     """Inverted index over a user Dataset, with boolean + BM25 search.
 
-    Example:
+    Example::
+
         docs = db.create_dataset("docs", title="utf8[120]", body="text")
         idx = db.create_search_index("idx", docs, text_fields=["title", "body"],
                                      scoring="bm25")

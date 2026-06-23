@@ -25,7 +25,8 @@ class BloomFilter(DataStructure):
     _inner_types_supported = ()
     """Optimized Bloom filter for fast membership testing.
 
-    Usage:
+    Usage::
+
         # Create
         bf = BloomFilter('seen_users', db, expected_items=10000, false_positive_rate=0.01)
 

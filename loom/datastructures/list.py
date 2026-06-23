@@ -24,7 +24,8 @@ class List(DataStructure):
     reallocation and copying. Supports soft deletion with automatic
     compaction when waste exceeds threshold.
 
-    Usage:
+    Usage::
+
         lst = List('tasks', db, item_schema={'id': 'uint64', 'task': 'U200'})
 
         # Append items

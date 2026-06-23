@@ -16,7 +16,8 @@ class DataStructureTemplate:
 
     Templates enable nested structures like List[List[User]].
 
-    Example:
+    Example::
+
         # Create template
         UserList = List.template(user_dataset)
 

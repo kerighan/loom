@@ -52,7 +52,8 @@ class DB:
 
     Manages multiple datasets with automatic schema persistence.
 
-    Usage:
+    Usage::
+
         # Create and use
         db = DB('app.db')
         users = db.create_dataset('users', id='uint64', name='U50')
@@ -432,7 +433,8 @@ class DB:
         Data is still written to mmap immediately, only the header
         (allocation index, metadata) flush is deferred.
 
-        Example:
+        Example::
+
             with db.batch():
                 for i in range(10000):
                     dataset.insert({'id': i, 'content': 'hello'})
@@ -502,7 +504,8 @@ class DB:
         Returns:
             Dataset instance
 
-        Examples:
+        Examples::
+
             # Classic kwargs
             users = db.create_dataset('users', id='uint64', name='U50', age='int32')
 
@@ -577,7 +580,8 @@ class DB:
         Raises:
             KeyError: If name not found
 
-        Example:
+        Example::
+
             users = db["users"]  # Get existing list/dataset by name
         """
         if not self._is_open:
@@ -711,7 +715,8 @@ class DB:
         at `/dashboard` on the same server.
         Pass `auth_token="..."` to protect the API, docs, and dashboard.
 
-        Example:
+        Example::
+
             with DB("app.db") as db:
                 db.create_dataset("users", User)
                 db.serve(port=8000)
@@ -742,7 +747,8 @@ class DB:
         Returns:
             BloomFilter instance
 
-        Example:
+        Example::
+
             bf = db.create_bloomfilter('seen_users', expected_items=100000)
             bf.add("user123")
             if "user123" in bf:
@@ -777,7 +783,8 @@ class DB:
         Returns:
             CountingBloomFilter instance
 
-        Example:
+        Example::
+
             cbf = db.create_counting_bloomfilter('cache', expected_items=10000)
             cbf.add("item")
             cbf.remove("item")  # Can remove!
@@ -808,7 +815,8 @@ class DB:
         Returns:
             List instance
 
-        Example:
+        Example::
+
             # Regular list
             user_ds = db.create_dataset('users', id='uint64', name='U50')
             users = db.create_list('users_list', user_ds)
@@ -864,7 +872,8 @@ class DB:
         Returns:
             Dict instance
 
-        Example:
+        Example::
+
             # Regular dict
             user_ds = db.create_dataset('users', id='uint64', name='U50')
             users = db.create_dict('users_dict', user_ds)
@@ -915,7 +924,8 @@ class DB:
         Returns:
             Set instance
 
-        Example:
+        Example::
+
             active_users = db.create_set('active_users')
             active_users.add('alice')
             active_users.add('bob')
@@ -953,7 +963,8 @@ class DB:
         Returns:
             BTree instance
 
-        Example:
+        Example::
+
             user_ds = db.create_dataset('users', id='uint32', name='U50')
             users = db.create_btree('users_btree', user_ds)
 
@@ -999,7 +1010,8 @@ class DB:
         Returns:
             Graph instance
 
-        Example:
+        Example::
+
             from pydantic import BaseModel
 
             class Person(BaseModel):
@@ -1075,7 +1087,8 @@ class DB:
         Returns:
             SearchIndex instance.
 
-        Example:
+        Example::
+
             docs = db.create_dataset("docs", title="utf8[120]", body="text")
             idx = db.create_search_index("idx", docs, text_fields=["title", "body"],
                                          scoring="bm25")
@@ -1123,7 +1136,8 @@ class DB:
         Returns:
             Queue instance
 
-        Example:
+        Example::
+
             from pydantic import BaseModel, Field
 
             class Task(BaseModel):
@@ -1166,7 +1180,8 @@ class DB:
         Returns:
             PriorityQueue instance.
 
-        Example:
+        Example::
+
             pq = db.create_priority_queue("jobs", {"task": "utf8[40]"})
             pq.push({"task": "send email"}, priority=5)
             pq.push({"task": "reindex"},    priority=9)
@@ -1207,7 +1222,8 @@ class DB:
             hash_keys: Hash keys before storage (for long/arbitrary keys)
             hash_bits: Hash length in bits (64 or 128 recommended)
 
-        Example:
+        Example::
+
             from pydantic import BaseModel
 
             class Profile(BaseModel):
@@ -1249,7 +1265,8 @@ class DB:
             dim:    Vector dimensionality (e.g. 1536 for text-embedding-3-small)
             metric: "cosine" (default), "l2", or "dot"
 
-        Example:
+        Example::
+
             idx = db.create_flat_index("passages", dim=1536)
             idx.add("doc_1", embedding)
             results = idx.search(query, k=10)
@@ -1292,7 +1309,8 @@ class DB:
             n_sub:      Number of PQ sub-vectors (default 16; higher → less compression)
             n_bits:     Bits per sub-quantizer (default 8 → 256 centroids each)
 
-        Example:
+        Example::
+
             ivf = db.create_ivf_index("passages", dim=1536,
                                        n_clusters=256, pq=True, n_sub=16)
             ivf.train(sample_matrix)           # train on a representative sample
@@ -1341,7 +1359,8 @@ class DB:
 
         Kinds → structures: primary/unique → Dict; range/many → BTree.
 
-        Example:
+        Example::
+
             from loom import Many
             posts = db.collection("posts", Post, indexes={
                 "id":         "primary",
@@ -1481,7 +1500,8 @@ class DB:
         unless `indexes` is supplied.  All records are read into memory first,
         so a crash mid-migration cannot lose data already on disk.
 
-        Example (split `name` into first/last):
+        Example — split ``name`` into first/last::
+
             db.migrate_collection("users", UserV2, transforms={
                 "first_name": lambda r: r["name"].split()[0],
                 "last_name":  lambda r: r["name"].split()[-1],

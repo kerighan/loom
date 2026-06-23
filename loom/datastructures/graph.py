@@ -20,7 +20,8 @@ class Graph(DataStructure):
     Edges are double-indexed via nested Dict[Dict] for O(1) lookup
     in both directions.
 
-    Usage:
+    Usage::
+
         from pydantic import BaseModel
 
         class Person(BaseModel):
@@ -550,7 +551,8 @@ class Graph(DataStructure):
             nodes: Iterable of (node_id, attrs_dict) tuples, or a dict
                    mapping node_id → attrs_dict.
 
-        Example:
+        Example::
+
             g.add_nodes([
                 ("alice", {"name": "Alice", "age": 30}),
                 ("bob",   {"name": "Bob",   "age": 25}),
@@ -578,7 +580,8 @@ class Graph(DataStructure):
         Args:
             edges: Iterable of (src, dst, attrs_dict) tuples.
 
-        Example:
+        Example::
+
             g.add_edges([
                 ("alice", "bob",   {"weight": 0.9}),
                 ("alice", "carol", {"weight": 0.5}),
@@ -614,7 +617,8 @@ class Graph(DataStructure):
         Returns:
             List of result dicts
 
-        Examples:
+        Examples::
+
             g.query("MATCH (a)-[r]->(b) WHERE a.age > 25 RETURN a.name, b.name")
             g.query("MATCH (a)->(b) WHERE a.name == 'Alice' RETURN b")
         """

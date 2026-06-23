@@ -16,7 +16,8 @@ class Set(DataStructure):
     Stores unique items with fast membership testing via bloom filters.
     Backed by Dict internally.
 
-    Usage:
+    Usage::
+
         with DB("mydata.db") as db:
             users = db.create_set("active_users", key_size=50)
 
@@ -70,7 +71,8 @@ class Set(DataStructure):
         Returns:
             SetTemplate instance
 
-        Example:
+        Example::
+
             TagSet = Set.template(key_size=50)
             user_tags = db.create_dict('user_tags', TagSet)
         """
@@ -546,7 +548,8 @@ class SetTemplate(DataStructureTemplate):
     Inherits from DataStructureTemplate but doesn't require a dataset
     since Sets only store keys (strings), not structured data.
 
-    Example:
+    Example::
+
         TagSet = Set.template(key_size=50)
         user_tags = db.create_dict('user_tags', TagSet)
     """

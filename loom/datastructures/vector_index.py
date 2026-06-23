@@ -11,7 +11,8 @@ IVFIndex  — Approximate search using Inverted File Index.
   Best for > 100K vectors.
   O(nprobe · cell_size · [d or M]) per query.
 
-Usage:
+Usage::
+
     with DB("embeddings.db") as db:
         # Exact search
         idx = db.create_flat_index("passages", dim=1536)

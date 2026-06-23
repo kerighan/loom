@@ -35,7 +35,8 @@ class CountingBloomFilter(DataStructure):
     Uses uint8 counters (0-255) instead of bits. Since NumPy bool uses 8 bits anyway,
     this costs NO extra space but enables removal!
 
-    Usage:
+    Usage::
+
         # Create
         cbf = CountingBloomFilter('cache', db, expected_items=10000)
 
@@ -287,7 +288,8 @@ class CountingBloomFilter(DataStructure):
         Args:
             item: Item to remove
 
-        Example:
+        Example::
+
             del cbf["item"]  # Same as cbf.remove("item")
         """
         self.remove(item)

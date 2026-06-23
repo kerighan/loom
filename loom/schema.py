@@ -31,7 +31,8 @@ Three equivalent ways to declare a fixed-length string field:
 All three produce U20 (80 bytes per record, fast lookups).
 Use plain `str` for variable-length content (→ text, compressed BlobStore).
 
-Usage:
+Usage::
+
     from pydantic import BaseModel
     from loom.schema import schema_from_model
 
@@ -149,7 +150,8 @@ def schema_from_model(model_class) -> dict[str, str]:
     Returns:
         Dict mapping field names to loom dtype strings
 
-    Example:
+    Example::
+
         class User(BaseModel):
             id: int
             name: str
@@ -176,7 +178,8 @@ def Vec(*shape: int):
     Returns:
         An Annotated type that loom maps to 'float32[N]' or 'float32[M,N]'
 
-    Example:
+    Example::
+
         class Passage(BaseModel):
             text:      str
             embedding: Vec(1536)    # → stores 1536×float32 inline (6 KB/record)
@@ -222,7 +225,8 @@ def Utf8(max_bytes: int, truncate: bool = False):
 
     IMPORTANT: `max_bytes` is a **byte** budget, not a character count.
 
-    Example:
+    Example::
+
         from loom.schema import Utf8
 
         class Page(BaseModel):
@@ -251,7 +255,8 @@ def Json():
     parsed.  A bare ``dict`` annotation maps here automatically; use ``Json()``
     for lists or mixed values.  None round-trips as None.
 
-    Example:
+    Example::
+
         class Event(BaseModel):
             id:   int
             meta: dict          # → 'json'
@@ -276,7 +281,8 @@ def Datetime():
     Naive datetimes are treated as UTC; timezone-aware ones are converted to
     UTC and returned naive (UTC) on read.  8 bytes, no BlobStore hop.
 
-    Example:
+    Example::
+
         from datetime import datetime
         class Event(BaseModel):
             id:         int
@@ -298,7 +304,8 @@ def FixedStr(max_length: int):
     are used as keys, where a fixed max length is known upfront.
     Plain `str` gives variable-length text instead.
 
-    Example:
+    Example::
+
         from loom.schema import FixedStr
 
         class User(BaseModel):
@@ -351,7 +358,8 @@ def dt_key(dt, precision: str = "second") -> str:
     Returns:
         str — lexicographically sortable datetime key
 
-    Example:
+    Example::
+
         from loom.schema import dt_key, key_dt
         from datetime import datetime
 
@@ -383,7 +391,8 @@ def key_dt(key: str, precision: str = "second"):
     Returns:
         datetime.datetime
 
-    Example:
+    Example::
+
         from loom.schema import dt_key, key_dt
         k = "20240115T143000"
         dt = key_dt(k)   # datetime(2024, 1, 15, 14, 30, 0)
@@ -398,7 +407,8 @@ def key_dt(key: str, precision: str = "second"):
 def dt_key_size(precision: str = "second") -> int:
     """Return the key_size value to pass to BTree for a given precision.
 
-    Example:
+    Example::
+
         btree = db.create_btree("ticks", ohlcv_ds,
                                 key_size=dt_key_size("second"))
     """
