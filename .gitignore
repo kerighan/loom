@@ -132,3 +132,6 @@ Thumbs.db
 
 # Large benchmark datasets (downloaded on demand)
 benchmarks/data/
+
+# Sphinx build output
+docs/_build/
