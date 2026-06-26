@@ -91,3 +91,48 @@ def test_collection_accepts_model(db):
     col.insert_many([_post(2, 50.0), _post(3, 99.0)])
     assert col["p1"]["id"] == "p1"
     assert {r["id"] for r in col.range("score", 40, None)} == {"p2", "p3"}
+
+
+# ── auto-backing-dataset shorthand: pass a model / schema directly ────────────
+
+def test_dict_auto_dataset_from_model(db):
+    # No explicit create_dataset — backing dataset is created automatically.
+    d = db.create_dict("by_id", Post)
+    d["p1"] = _post(1, 7.0)
+    assert d["p1"]["score"] == 7.0
+    assert "_by_id_ds" in db._datasets  # hidden backing dataset
+
+
+def test_dict_auto_dataset_from_schema(db):
+    d = db.create_dict("cfg", {"k": "utf8[20]", "n": "int64"})
+    d["a"] = {"k": "a", "n": 42}
+    assert d["a"] == {"k": "a", "n": 42}
+
+
+def test_list_auto_dataset_from_model(db):
+    lst = db.create_list("feed", Post)
+    lst.append(_post(1))
+    assert lst[0]["id"] == "p1"
+
+
+def test_btree_auto_dataset_from_model(db):
+    bt = db.create_btree("bt", Post, key_size=16)
+    bt["p1"] = _post(1, 5.0)
+    assert bt["p1"]["score"] == 5.0
+
+
+def test_auto_dataset_survives_reopen(tmp_path):
+    path = str(tmp_path / "reopen.db")
+    db = DB(path)
+    db.open()
+    db.create_dict("meta", Post)["p1"] = _post(1, 3.0)
+    db.create_list("feed", Post).append(_post(2))
+    db.create_btree("bt", Post, key_size=16)["p3"] = _post(3)
+    db.close()
+
+    db2 = DB(path)
+    db2.open()
+    assert db2["meta"]["p1"]["id"] == "p1"
+    assert db2["feed"][0]["id"] == "p2"
+    assert db2["bt"]["p3"]["id"] == "p3"
+    db2.close()

@@ -548,6 +548,27 @@ class DB:
 
         return dataset
 
+    def _dataset_for(self, struct_name, spec):
+        """Coerce a dict's/list's/btree's value-store spec into a Dataset.
+
+        Accepts what these structures have always accepted — a Dataset (passed
+        through) or a DataStructureTemplate (nested, passed through) — and, as a
+        convenience, a Pydantic model class or a plain schema dict, in which
+        case a backing dataset named ``_{struct_name}_ds`` is auto-created.
+        This lets ``db.create_dict("metadata", Metadata)`` replace the explicit
+        ``ds = db.create_dataset("metadata_ds", Metadata)`` + ``create_dict``.
+        """
+        from loom.datastructures.template import DataStructureTemplate
+
+        if spec is None or isinstance(spec, (Dataset, DataStructureTemplate)):
+            return spec
+        auto_name = f"_{struct_name}_ds"
+        if isinstance(spec, dict):
+            return self.create_dataset(auto_name, exist_ok=True, **spec)
+        if hasattr(spec, "model_fields"):  # Pydantic BaseModel subclass
+            return self.create_dataset(auto_name, spec, exist_ok=True)
+        return spec
+
     def get_dataset(self, name):
         """Get an existing dataset by name.
 
@@ -810,17 +831,22 @@ class DB:
 
         Args:
             name: Unique name for this list
-            dataset_or_template: Dataset (for regular list) or DataStructureTemplate (for nested list)
+            dataset_or_template: A Dataset, a Pydantic model class or a schema
+                dict (a backing dataset ``_{name}_ds`` is then auto-created), or
+                a DataStructureTemplate (for a nested list).
 
         Returns:
             List instance
 
         Example::
 
-            # Regular list
+            # Pydantic model — backing dataset created automatically
+            users = db.create_list('users_list', User)
+            users.append({'id': 1, 'name': 'Alice'})
+
+            # Or pass an explicit Dataset
             user_ds = db.create_dataset('users', id='uint64', name='U50')
             users = db.create_list('users_list', user_ds)
-            users.append({'id': 1, 'name': 'Alice'})
 
             # Nested list (list of lists)
             UserList = List.template(user_ds)
@@ -837,6 +863,7 @@ class DB:
         if existing is not None:
             return existing
 
+        dataset_or_template = self._dataset_for(name, dataset_or_template)
         lst = List(name, self, dataset_or_template)
         self._datastructures[name] = lst  # Register for caching and auto-save
         self._save_datastructures_registry()  # Persist registry
@@ -860,7 +887,9 @@ class DB:
 
         Args:
             name: Unique name for this dict
-            dataset_or_template: Dataset (for regular dict) or DataStructureTemplate (for nested dict)
+            dataset_or_template: A Dataset, a Pydantic model class or a schema
+                dict (a backing dataset ``_{name}_ds`` is then auto-created), or
+                a DataStructureTemplate (for a nested dict).
             use_bloom: Whether to use bloom filters for acceleration
             max_key_len: Byte budget for the stored key (used for iteration
                 recovery via keys()/items()).  Default 100.  Smaller = smaller
@@ -874,10 +903,13 @@ class DB:
 
         Example::
 
-            # Regular dict
+            # Pydantic model — backing dataset created automatically
+            users = db.create_dict('users_dict', User)
+            users['alice'] = {'id': 1, 'name': 'Alice'}
+
+            # Or pass an explicit Dataset
             user_ds = db.create_dataset('users', id='uint64', name='U50')
             users = db.create_dict('users_dict', user_ds)
-            users['alice'] = {'id': 1, 'name': 'Alice'}
 
             # Nested dict (dict of dicts)
             UserDict = Dict.template(user_ds)
@@ -896,6 +928,7 @@ class DB:
         if existing is not None:
             return existing
 
+        dataset_or_template = self._dataset_for(name, dataset_or_template)
         dct = Dict(
             name,
             self,
@@ -955,7 +988,9 @@ class DB:
 
         Args:
             name: Unique name for this BTree
-            dataset: Dataset for storing values
+            dataset: A Dataset, a Pydantic model class or a schema dict for the
+                stored values (a backing dataset ``_{name}_ds`` is auto-created
+                for the latter two).
             key_size: Maximum length of string keys (default: 50)
             int_keys: If True, keys are integers ordered numerically (stored
                 order-preserving); keys()/items()/range() take and return ints.
@@ -990,6 +1025,7 @@ class DB:
         if existing is not None:
             return existing
 
+        dataset = self._dataset_for(name, dataset)
         btree = BTree(name, self, dataset, key_size=key_size, int_keys=int_keys)
         self._datastructures[name] = btree  # Register for caching and auto-save
         self._save_datastructures_registry()  # Persist registry
