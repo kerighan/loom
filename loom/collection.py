@@ -632,6 +632,46 @@ class Collection:
         for pk, rec in self._primary.items():
             yield str(pk), self._wrap(pk, rec)
 
+    def sample(self, n=10, random=True, seed=None):
+        """Return up to ``n`` records — a quick peek at what the collection holds.
+
+        Handy for understanding the data (e.g. handing an LLM a few example
+        records to infer the shape, field meanings and value ranges).
+
+        Args:
+            n: Maximum number of records to return.
+            random: If True (default), a uniform random sample (reservoir
+                sampling — one full pass, no count needed). If False, the first
+                ``n`` records in store iteration order (fast, stops early, no
+                full scan).
+            seed: Optional int for a reproducible random sample.
+
+        Returns:
+            A list of records (fewer than ``n`` if the collection is smaller).
+        """
+        n = max(0, int(n))
+        if n == 0:
+            return []
+        if not random:
+            out = []
+            for rec in self.values():
+                out.append(rec)
+                if len(out) >= n:
+                    break
+            return out
+        import random as _random
+
+        rng = _random.Random(seed)
+        reservoir = []
+        for i, rec in enumerate(self.values()):
+            if i < n:
+                reservoir.append(rec)
+            else:
+                j = rng.randint(0, i)
+                if j < n:
+                    reservoir[j] = rec
+        return reservoir
+
     @property
     def index_names(self):
         return list(self._indexes.keys())

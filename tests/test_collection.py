@@ -327,3 +327,41 @@ class TestSearch:
             with DB(path) as db:
                 c = db["articles"]
                 assert sorted(r["id"] for r in c.search("content", "python")) == ["a1", "a3"]
+
+
+class TestSample:
+    def test_sample_size_and_membership(self, db):
+        posts = seed(make_posts(db))
+        s = posts.sample(3)
+        assert len(s) == 3
+        ids = {r["id"] for r in s}
+        assert ids <= {"p1", "p2", "p3", "p4", "p5"}
+        assert len(ids) == 3  # distinct records
+
+    def test_sample_more_than_len_returns_all(self, db):
+        posts = seed(make_posts(db))
+        s = posts.sample(100)
+        assert {r["id"] for r in s} == {"p1", "p2", "p3", "p4", "p5"}
+
+    def test_sample_seed_reproducible(self, db):
+        posts = seed(make_posts(db))
+        assert [r["id"] for r in posts.sample(3, seed=7)] == \
+               [r["id"] for r in posts.sample(3, seed=7)]
+
+    def test_sample_head_no_random(self, db):
+        posts = seed(make_posts(db))
+        head = [r["id"] for r in posts.sample(2, random=False)]
+        assert len(head) == 2
+        # deterministic: same first-n on repeated calls
+        assert head == [r["id"] for r in posts.sample(2, random=False)]
+
+    def test_sample_zero_and_empty(self, db):
+        posts = make_posts(db)
+        assert posts.sample(5) == []   # empty collection
+        seed(posts)
+        assert posts.sample(0) == []
+
+    def test_sample_returns_records(self, db):
+        posts = seed(make_posts(db))
+        r = posts.sample(1)[0]
+        assert isinstance(r, dict) and "text" in r
