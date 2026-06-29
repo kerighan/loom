@@ -157,6 +157,42 @@ class TestMutations:
         with pytest.raises(ValueError):
             posts.update("p1", id="pX")
 
+
+class TestSingleFieldSubscript:
+    def test_set_nonindexed_field_inplace(self, db):
+        posts = seed(make_posts(db))
+        posts["p1", "text"] = "edited"
+        assert posts["p1", "text"] == "edited"        # single-field read
+        assert posts["p1"]["text"] == "edited"        # full record reflects it
+        assert posts["p1"]["username"] == "alice"     # other fields untouched
+
+    def test_set_indexed_field_reindexes(self, db):
+        posts = seed(make_posts(db))
+        # username feeds the Many index → assignment must re-index
+        posts["p1", "username"] = "bob"
+        assert "p1" not in [p["id"] for p in posts.find("username", "alice")]
+        assert "p1" in [p["id"] for p in posts.find("username", "bob")]
+
+    def test_set_range_field_reindexes(self, db):
+        posts = seed(make_posts(db))
+        posts["p1", "engagement"] = 5000
+        assert "p1" in [p["id"] for p in posts.range("engagement", 1000, None)]
+
+    def test_primary_key_field_rejected(self, db):
+        posts = seed(make_posts(db))
+        with pytest.raises(ValueError):
+            posts["p1", "id"] = "pX"
+
+    def test_missing_pk_raises(self, db):
+        posts = seed(make_posts(db))
+        with pytest.raises(KeyError):
+            posts["nope", "text"] = "x"
+
+    def test_whole_record_assignment_rejected(self, db):
+        posts = seed(make_posts(db))
+        with pytest.raises(TypeError):
+            posts["p1"] = {"id": "p1", "text": "x"}
+
     def test_insert_existing_pk_upserts_and_reindexes(self, db):
         posts = seed(make_posts(db))
         # re-insert p1 with changed indexed fields → record replaced, indexes clean

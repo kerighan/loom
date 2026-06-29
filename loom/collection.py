@@ -454,7 +454,36 @@ class Collection:
         return Record(self, str(pk), record) if record is not None else None
 
     def __getitem__(self, pk):
+        # col[pk, field] → just that field's value (no full-record read)
+        if isinstance(pk, tuple) and len(pk) == 2:
+            key, field = pk
+            return self._primary[str(key), field]
         return self._wrap(pk, self._primary[str(pk)])
+
+    def __setitem__(self, key, value):
+        """``col[pk, field] = value`` — update a single field by primary key.
+
+        Fast in-place field write when the field feeds no index; routed through
+        :meth:`update` (which re-indexes) when it backs a secondary or full-text
+        index. Raises ``KeyError`` if ``pk`` doesn't exist, ``ValueError`` for
+        the primary-key field. (Assigning a whole record — ``col[pk] = {...}`` —
+        is not supported; use :meth:`insert` / :meth:`update`.)
+        """
+        if not (isinstance(key, tuple) and len(key) == 2):
+            raise TypeError(
+                "assign a single field: col[pk, field] = value "
+                "(use insert()/update() for whole records)"
+            )
+        pk, field = str(key[0]), key[1]
+        if field == self._key_field:
+            raise ValueError("cannot change the primary key")
+        if field in self._indexed_fields or field in self._search_fields:
+            self.update(pk, **{field: value})
+            return
+        with self._db.write_lock():
+            if pk not in self._primary:
+                raise KeyError(pk)
+            self._primary[pk, field] = value
 
     def __delitem__(self, pk):
         """``del col[pk]`` — alias for :meth:`delete` (raises KeyError if absent)."""
