@@ -139,6 +139,19 @@ class TestMutations:
         assert [p["id"] for p in posts.find("username", "alice")] == ["p2", "p1"]
         assert "p3" not in [p["id"] for p in posts.range("engagement", 100, None)]
 
+    def test_delitem_alias(self, db):
+        posts = seed(make_posts(db))
+        del posts["p3"]                       # del col[pk] == col.delete(pk)
+        assert "p3" not in posts and len(posts) == 4
+        assert [p["id"] for p in posts.find("username", "alice")] == ["p2", "p1"]
+
+    def test_delete_missing_raises(self, db):
+        posts = seed(make_posts(db))
+        with pytest.raises(KeyError):
+            posts.delete("nope")
+        with pytest.raises(KeyError):
+            del posts["nope"]
+
     def test_cannot_change_primary_key(self, db):
         posts = seed(make_posts(db))
         with pytest.raises(ValueError):

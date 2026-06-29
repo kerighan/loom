@@ -394,6 +394,11 @@ class Collection:
         return new
 
     def delete(self, pk):
+        """Delete the record with primary key ``pk`` (also ``del col[pk]``).
+
+        Removes it from the primary store and every secondary / full-text index
+        in one transaction. Raises ``KeyError`` if no such record exists.
+        """
         pk = str(pk)
         record = self._primary.get(pk)
         if record is None:
@@ -450,6 +455,10 @@ class Collection:
 
     def __getitem__(self, pk):
         return self._wrap(pk, self._primary[str(pk)])
+
+    def __delitem__(self, pk):
+        """``del col[pk]`` — alias for :meth:`delete` (raises KeyError if absent)."""
+        self.delete(pk)
 
     def get_primary(self, pk, default=None):
         rec = self._primary.get(str(pk))
