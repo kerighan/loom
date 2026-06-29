@@ -1608,6 +1608,10 @@ class Dict(DataStructure):
         """
         yield from self._iter_entries()
 
+    def _sample_iter(self):
+        # sample()/describe() show (key, value) pairs for a Dict
+        return self.items()
+
     def _iter_entries(self):
         """Iterate over all (key, value) pairs efficiently.
 

@@ -51,6 +51,16 @@ def dtype_to_str(dtype):
             pass
         shape_str = ",".join(str(d) for d in dtype.shape)
         return f"{base_str}[{shape_str}]"
+    # Friendly named form ('int64', 'uint32', 'float64', 'bool') rather than the
+    # raw numpy code ('<i8'), as the docstring promises. Both round-trip through
+    # np.dtype() / parse_dtype(), so this stays backward-compatible for reading
+    # older registries that stored the '<i8' form.
+    named = str(dtype)
+    try:
+        if np.dtype(named) == dtype:
+            return named
+    except TypeError:
+        pass
     return dtype.str
 
 # Blob reference dtype: (offset: uint64, n_slots: uint16)

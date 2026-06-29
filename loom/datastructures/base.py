@@ -350,6 +350,65 @@ class DataStructure(ABC):
             # Already a dict
             return dataset_or_dict
 
+    # ── introspection: sample / describe ──────────────────────────────────────
+
+    def _sample_iter(self):
+        """Iterable of the structure's natural elements (overridable).
+
+        Default is ``iter(self)`` — items for a List, elements for a Set.
+        Key/value stores (Dict, BTree) override this to yield ``(key, value)``.
+        """
+        return iter(self)
+
+    def sample(self, n=10, random=True, seed=None):
+        """Return up to ``n`` elements — a quick peek at the contents.
+
+        Handy for understanding the data (e.g. handing an LLM example elements
+        to infer the shape and value ranges).
+
+        Args:
+            n: Maximum number of elements to return.
+            random: If True (default), a uniform random sample (reservoir
+                sampling — one full pass, no count needed). If False, the first
+                ``n`` in iteration order (fast, stops early, no full scan).
+            seed: Optional int for a reproducible random sample.
+
+        Returns:
+            A list of elements (``(key, value)`` pairs for Dict/BTree, items
+            otherwise); fewer than ``n`` if the structure is smaller.
+        """
+        from loom.sampling import reservoir_sample
+
+        return reservoir_sample(self._sample_iter(), n, random=random, seed=seed)
+
+    def describe(self, n=3, seed=None):
+        """Return a compact, prompt-ready text summary of this structure.
+
+        Includes the type, name, size, typed schema and a few sample elements —
+        enough for an agent/LLM to grasp what the structure holds in one read.
+        """
+        schema_src = getattr(self, "item_schema", None)
+        schema = self._extract_schema(schema_src) if schema_src else {}
+        try:
+            total = len(self)
+        except TypeError:
+            total = None
+        head = f"{type(self).__name__} {self.name!r}"
+        if total is not None:
+            head += f" — {total} element(s)"
+        lines = [head]
+        if schema:
+            lines.append("schema:")
+            for field, dtype in schema.items():
+                lines.append(f"  {field}: {dtype}")
+        examples = self.sample(n, seed=seed)
+        if examples:
+            shown = f"{len(examples)} of {total}" if total is not None else str(len(examples))
+            lines.append(f"sample ({shown}):")
+            for el in examples:
+                lines.append(f"  {el!r}")
+        return "\n".join(lines)
+
     @classmethod
     def _get_ref_config_schema(cls):
         """Get schema for config fields in references.

@@ -1208,6 +1208,10 @@ class BTree(DataStructure):
         """Iterate over keys."""
         return self.keys()
 
+    def _sample_iter(self):
+        # sample()/describe() show (key, value) pairs for a BTree
+        return self.items()
+
     def min(self):
         """Return the minimum key, or None if empty."""
         if self.root_addr == 0:

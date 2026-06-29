@@ -17,8 +17,8 @@ Collection
 
 .. autoclass:: loom.Collection
    :members: insert, insert_many, update, delete, increment, get, find, range,
-             search, sample, get_primary, reindex, keys, values, items,
-             index_names
+             search, sample, describe, get_primary, reindex, keys, values,
+             items, index_names
 
 Index specs
 ~~~~~~~~~~~
@@ -33,16 +33,16 @@ Data structures
 ---------------
 
 .. autoclass:: loom.datastructures.Dict
-   :members: get, get_many, keys, values, items, set_batch, get_ref
+   :members: get, get_many, keys, values, items, set_batch, get_ref, sample, describe
 
 .. autoclass:: loom.datastructures.BTree
-   :members: range, prefix, keys, items, min, max, bulk_load, get
+   :members: range, prefix, keys, items, min, max, bulk_load, get, sample, describe
 
 .. autoclass:: loom.datastructures.List
-   :members: append, append_many, compact, get_ref
+   :members: append, append_many, compact, get_ref, sample, describe
 
 .. autoclass:: loom.datastructures.Set
-   :members: add, discard, remove
+   :members: add, discard, remove, sample, describe
 
 .. autoclass:: loom.datastructures.Queue
    :members: push, push_many, pop, peek

@@ -649,28 +649,45 @@ class Collection:
         Returns:
             A list of records (fewer than ``n`` if the collection is smaller).
         """
-        n = max(0, int(n))
-        if n == 0:
-            return []
-        if not random:
-            out = []
-            for rec in self.values():
-                out.append(rec)
-                if len(out) >= n:
-                    break
-            return out
-        import random as _random
+        from loom.sampling import reservoir_sample
 
-        rng = _random.Random(seed)
-        reservoir = []
-        for i, rec in enumerate(self.values()):
-            if i < n:
-                reservoir.append(rec)
-            else:
-                j = rng.randint(0, i)
-                if j < n:
-                    reservoir[j] = rec
-        return reservoir
+        return reservoir_sample(self.values(), n, random=random, seed=seed)
+
+    def describe(self, n=3, seed=None):
+        """Return a compact, prompt-ready text summary of this collection.
+
+        Includes the record count, primary key, typed schema, declared indexes
+        (and full-text indexes) and a few sample records — enough for an
+        agent/LLM to grasp what the collection holds in one read.
+        """
+        from loom.datastructures.base import DataStructure
+
+        schema = DataStructure._extract_schema(self.dataset)
+        total = len(self)
+        lines = [f"Collection {self.name!r} — {total} record(s), key={self._key_field!r}"]
+        if schema:
+            lines.append("schema:")
+            for field, dtype in schema.items():
+                lines.append(f"  {field}: {dtype}")
+        if self._indexes:
+            lines.append("indexes:")
+            for iname, ix in self._indexes.items():
+                spec = ix["spec"]
+                extra = ""
+                if spec.kind == "many" and getattr(spec, "sort", None):
+                    extra = f" (sort={spec.sort}{', desc' if spec.desc else ''})"
+                on = "" if iname == ix["field"] else f" on {ix['field']!r}"
+                lines.append(f"  {iname}: {spec.kind}{extra}{on}")
+        if self._search:
+            lines.append("full-text indexes:")
+            for sname, si in self._search.items():
+                lines.append(f"  {sname}: search(fields={si['fields']})")
+        recs = self.sample(n, seed=seed)
+        if recs:
+            lines.append(f"sample ({len(recs)} of {total}):")
+            for r in recs:
+                lines.append(f"  {dict(r)!r}")
+        return "\n".join(lines)
 
     @property
     def index_names(self):
