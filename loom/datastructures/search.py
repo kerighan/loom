@@ -30,6 +30,8 @@ optional dependency (lazy import; `pip install eldar`).
 import re
 from collections import Counter
 
+import numpy as np
+
 from .base import DataStructure
 from .dict import Dict
 from .list import List
@@ -99,6 +101,31 @@ def _iter_varint(buf: bytes):
             shift = val = 0
 
 
+def _decode_varints(buf: bytes):
+    """Decode every varint in ``buf`` at once (vectorised numpy).
+
+    LEB128 decode without a per-byte Python loop: locate terminator bytes
+    (high bit clear), shift each byte's 7 payload bits by its position within
+    its varint, and sum per group with add.reduceat.  ~10x faster than
+    _iter_varint on long posting lists.  Values must fit in 64 bits (they do:
+    doc-id gaps and capped term frequencies).
+    """
+    a = np.frombuffer(buf, dtype=np.uint8)
+    ends = np.flatnonzero(a < 0x80)          # terminator byte of each varint
+    if len(ends) == 0:
+        return np.empty(0, dtype=np.uint64)
+    a = a[: ends[-1] + 1]  # drop a trailing incomplete varint (legacy: unyielded)
+    starts = np.empty(len(ends), dtype=np.intp)
+    starts[0] = 0
+    starts[1:] = ends[:-1] + 1
+    # position of each byte inside its own varint (0-based)
+    pos = np.arange(len(a), dtype=np.uint64) - np.repeat(
+        starts.astype(np.uint64), ends - starts + 1
+    )
+    payload = (a & 0x7F).astype(np.uint64) << (pos * 7)
+    return np.add.reduceat(payload, starts)
+
+
 class SearchIndex(DataStructure):
     """Inverted index over a user Dataset, with boolean + BM25 search.
 
@@ -153,6 +180,7 @@ class SearchIndex(DataStructure):
         self._next_id = 0
         self._dirty = False
         self._postings = self._docmeta = self._deleted = self._meta = None
+        self._doclens = None  # np.int64 cache of _docmeta[...]["dl"] (bm25)
 
         super().__init__(name, db, _parent=_parent)
 
@@ -218,6 +246,7 @@ class SearchIndex(DataStructure):
         self._store_docs = m.get("store_documents", True)
         self._dataset = None
         self._postings = self._docmeta = self._deleted = self._meta = None
+        self._doclens = None  # np.int64 cache of _docmeta[...]["dl"] (bm25)
         self._loaded_next_id = False
 
     def _ensure_loaded(self):
@@ -399,19 +428,18 @@ class SearchIndex(DataStructure):
         if ns == 0:
             return []
         blob = self._db.blob_store.read(int(rec["off"]))
-        out = []
+        vals = _decode_varints(blob)
         if self._scored:
-            it = _iter_varint(blob)
-            last = 0
-            for gap in it:
-                last += gap
-                out.append((last, next(it)))
-        else:
-            last = 0
-            for gap in _iter_varint(blob):
-                last += gap
-                out.append(last)
-        return out
+            if len(vals) % 2:  # degenerate blob — legacy decode & its error
+                it = _iter_varint(blob)
+                out, last = [], 0
+                for gap in it:
+                    last += gap
+                    out.append((last, next(it)))
+                return out
+            ids = np.cumsum(vals[0::2])
+            return list(zip(ids.tolist(), vals[1::2].tolist()))
+        return np.cumsum(vals).tolist()
 
     def _term_ids(self, term):
         if term not in self._postings:
@@ -548,7 +576,34 @@ class SearchIndex(DataStructure):
         return out
 
     def _doc_len(self, doc_id):
-        return int(self._docmeta[doc_id]["dl"])
+        arr = self._doclens
+        if arr is None or doc_id >= len(arr):
+            arr = self._build_doclens()
+        return int(arr[doc_id])
+
+    def _build_doclens(self):
+        """(Re)build the in-memory doc-length array from _docmeta.
+
+        BM25 reads one length per candidate document; fetching each from the
+        persistent List costs ~10 µs while an array lookup is ~0.1 µs — on a
+        broad query this is most of the latency.  Doc lengths are immutable
+        (deletes are tombstones), so the cache only ever *extends*: a full
+        block-wise build the first time, then per-item reads for the tail
+        when new documents were flushed since (doc_id >= len(cache)).
+        """
+        n = len(self._docmeta)
+        old = self._doclens
+        if old is None or len(old) == 0:
+            arr = np.fromiter(
+                (rec["dl"] for rec in self._docmeta), dtype=np.int64, count=n
+            )
+        else:
+            tail = np.empty(n - len(old), dtype=np.int64)
+            for i in range(len(old), n):
+                tail[i - len(old)] = self._docmeta[i]["dl"]
+            arr = np.concatenate([old, tail])
+        self._doclens = arr
+        return arr
 
     def _rank(self, candidate_ids, tree, mode):
         import math
@@ -560,6 +615,10 @@ class SearchIndex(DataStructure):
         terms = self._positive_terms(tree)
         avgdl = int(self._meta["total_len"]["v"]) / N
         k1, b = self._k1, self._b
+
+        doclens = self._doclens
+        if mode == "bm25" and (doclens is None or len(doclens) < len(self._docmeta)):
+            doclens = self._build_doclens()
 
         scores = {i: 0.0 for i in candidates}
         for term in sorted(terms):
@@ -575,7 +634,7 @@ class SearchIndex(DataStructure):
                 if doc_id not in candidates:
                     continue
                 if mode == "bm25":
-                    dl = self._doc_len(doc_id)
+                    dl = int(doclens[doc_id])
                     denom = tf + k1 * (1.0 - b + b * (dl / avgdl if avgdl else 1.0))
                     scores[doc_id] += idf * (tf * (k1 + 1.0)) / denom
                 else:

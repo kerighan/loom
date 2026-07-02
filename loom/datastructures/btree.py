@@ -859,83 +859,77 @@ class BTree(DataStructure):
 
     # ========== Insert Operations ==========
 
-    def _insert(self, key, value_addr):
-        """Insert a key-value pair into the tree."""
+    def _search_path(self, key):
+        """Single root→leaf descent, recording the path.
+
+        Returns (path, leaf, index, found) where path is the list of
+        (internal_node, child_index) traversed from the root down to the
+        leaf's parent.  Same descent rules as _search (B+ tree: key equal to
+        a separator → go right); the recorded child indices are exactly the
+        positions where a split's median must be inserted on the way back up.
+        """
         if self.root_addr == 0:
-            # Create root node
+            return [], None, 0, False
+        path = []
+        node = self._read_node(self.root_addr)
+        while not node["is_leaf"]:
+            i = self._find_key_index(node, key)
+            if i < node["num_keys"] and node["keys"][i] == key:
+                i += 1
+            path.append((node, i))
+            node = self._read_node(node["children"][i])
+        i = self._find_key_index(node, key)
+        found = i < node["num_keys"] and node["keys"][i] == key
+        return path, node, i, found
+
+    def _insert_at(self, path, leaf, i, key, value_addr):
+        """Insert a (key, value_addr) at position ``i`` of the leaf located by
+        _search_path, propagating splits up the recorded path.
+
+        Replaces the former recursive root→leaf re-descent: __setitem__ has
+        already descended once to check for an existing key, so inserting from
+        that leaf halves the node reads per insert.  Write/allocation order is
+        identical to the recursive version (leaf first, then parents upward,
+        new root last).
+        """
+        if leaf is None:  # empty tree — create the root leaf
             self.root_addr = self._create_node(is_leaf=True)
             self.height = 1
+            leaf = self._read_node(self.root_addr)
+            i = 0
+        root_before = self.root_addr
 
-        # Insert into tree, potentially splitting nodes
-        result = self._insert_non_full(self.root_addr, key, value_addr)
+        leaf["keys"].insert(i, key)
+        leaf["children"].insert(i, value_addr)
+        leaf["num_keys"] += 1
+        self._write_node(leaf)
 
+        result = None
+        if leaf["num_keys"] >= self.ORDER:
+            result = self._split_node(leaf)
+        while result is not None and path:
+            median_key, new_child = result
+            parent, ci = path.pop()
+            parent["keys"].insert(ci, median_key)
+            parent["children"].insert(ci + 1, new_child)
+            parent["num_keys"] += 1
+            self._write_node(parent)
+            result = (
+                self._split_node(parent)
+                if parent["num_keys"] >= self.ORDER
+                else None
+            )
         if result is not None:
-            # Root was split, create new root
-            new_key, new_child = result
+            # The root itself split — grow the tree by one level.
+            median_key, new_child = result
             new_root_addr = self._create_node(is_leaf=False)
             new_root = self._read_node(new_root_addr)
-
-            new_root["keys"] = [new_key]
-            new_root["children"] = [self.root_addr, new_child]
+            new_root["keys"] = [median_key]
+            new_root["children"] = [root_before, new_child]
             new_root["num_keys"] = 1
-
             self._write_node(new_root)
             self.root_addr = new_root_addr
             self.height += 1
-
-    def _insert_non_full(self, node_addr, key, value_addr):
-        """Insert into a node, returning split info if node overflows.
-
-        B+ tree style: all data goes to leaf nodes.
-
-        Returns:
-            None if no split needed
-            (median_key, new_node_addr) if split occurred
-        """
-        node = self._read_node(node_addr)
-        i = self._find_key_index(node, key)
-
-        if node["is_leaf"]:
-            # Check if key already exists (update)
-            if i < node["num_keys"] and node["keys"][i] == key:
-                # Update existing - just change the value address
-                node["children"][i] = value_addr
-                self._write_node(node)
-                return None
-
-            # Insert into leaf
-            node["keys"].insert(i, key)
-            node["children"].insert(i, value_addr)
-            node["num_keys"] += 1
-            self._write_node(node)
-
-            # Check if split needed
-            if node["num_keys"] >= self.ORDER:
-                return self._split_node(node)
-            return None
-        else:
-            # Internal node: find correct child to descend
-            # In B+ tree, if key equals separator, go right
-            if i < node["num_keys"] and node["keys"][i] == key:
-                i += 1
-
-            # Recurse into child
-            result = self._insert_non_full(node["children"][i], key, value_addr)
-
-            if result is not None:
-                # Child was split, insert median key
-                median_key, new_child = result
-
-                node["keys"].insert(i, median_key)
-                node["children"].insert(i + 1, new_child)
-                node["num_keys"] += 1
-                self._write_node(node)
-
-                # Check if this node needs splitting
-                if node["num_keys"] >= self.ORDER:
-                    return self._split_node(node)
-
-            return None
 
     def _split_node(self, node):
         """Split a full node into two nodes.
@@ -1026,14 +1020,14 @@ class BTree(DataStructure):
 
             ref = value.to_ref()
 
-            node, idx, found = self._search(key)
+            path, node, idx, found = self._search_path(key)
             if found:
                 value_addr = node["children"][idx]
                 self._values_dataset[value_addr] = ref
             else:
                 value_addr = self._allocate_value_addr()
                 self._values_dataset[value_addr] = ref
-                self._insert(key, value_addr)
+                self._insert_at(path, node, idx, key, value_addr)
                 self.size += 1
 
             self._auto_save_check()
@@ -1046,8 +1040,8 @@ class BTree(DataStructure):
                 "Ref dataset mismatch: Ref must point to this BTree's values dataset"
             )
 
-        # Check if key exists (for update vs insert)
-        node, idx, found = self._search(key)
+        # Single descent: locates the key (update) or the insertion point
+        path, node, idx, found = self._search_path(key)
 
         if found:
             # Update existing - get current value address and update
@@ -1066,7 +1060,7 @@ class BTree(DataStructure):
                 value_addr = self._allocate_value_addr()
                 self._values_dataset[value_addr] = value
 
-            self._insert(key, value_addr)
+            self._insert_at(path, node, idx, key, value_addr)
             self.size += 1
 
         self._auto_save_check()
