@@ -1,5 +1,8 @@
 import json
 import re
+import struct
+import sys
+
 import numpy as np
 
 from loom.ref import Ref
@@ -231,6 +234,9 @@ class Dataset:
         # Pre-built zero record for fast bulk-init (one write instead of N)
         self._zero_record = self._serialize_zero()
 
+        # Precompiled struct-pack serialize plan (blob-free scalar schemas)
+        self._fast_plan = self._build_fast_plan()
+
     @staticmethod
     def _utf8_pack(value, n, strict=False, field=None):
         """Encode a str to at most n UTF-8 bytes.
@@ -278,12 +284,97 @@ class Dataset:
         size = n_records * self.record_size
         return self.db.allocate(size)
 
+    _INT_FMT = {
+        ("i", 1): "<b", ("i", 2): "<h", ("i", 4): "<i", ("i", 8): "<q",
+        ("u", 1): "<B", ("u", 2): "<H", ("u", 4): "<I", ("u", 8): "<Q",
+    }
+
+    def _build_fast_plan(self):
+        """Precompiled serialize plan: [(kind, field, offset, arg, strict)].
+
+        For schemas made only of inline scalar fields (utf8/int/uint/float/
+        bool/datetime — no blob/text/json/array/unicode), records can be
+        packed straight into a bytearray with struct, skipping the generic
+        per-field numpy path (~an order of magnitude cheaper for the small
+        internal datasets: BTree values, hash-table entries, doc mappings).
+        Returns None when the schema isn't eligible — generic path only.
+        """
+        if (
+            self._blob_fields or self._text_fields or self._json_fields
+            or self._array_fields or sys.byteorder != "little"
+        ):
+            return None
+        plan = []
+        for field in self.user_schema.names:
+            dtype, offset = self.schema.fields[field]
+            if field in self._utf8_fields:
+                entry = ("u", field, offset, self._utf8_fields[field],
+                         field in self._utf8_strict)
+            elif field in self._datetime_fields:
+                entry = ("d", field, offset, "<q", False)
+            elif dtype.kind in "iu":
+                fmt = self._INT_FMT.get((dtype.kind, dtype.itemsize))
+                if fmt is None:
+                    return None
+                entry = ("n", field, offset, fmt, False)
+            elif dtype.kind == "f" and dtype.itemsize in (4, 8):
+                entry = ("n", field, offset,
+                         "<f" if dtype.itemsize == 4 else "<d", False)
+            elif dtype.kind == "b":
+                entry = ("b", field, offset, None, False)
+            else:  # unicode 'U', raw 'S' outside utf8[], datetime64 … → generic
+                return None
+            plan.append(entry)
+        return plan
+
+    def _serialize_fast(self, record):
+        """struct-pack a record following the precompiled plan.
+
+        Bytes are identical to the generic numpy path.  Any coercion the plan
+        can't reproduce exactly (float into an int field, str into a numeric
+        field, strict-utf8 overflow, None …) raises, and the caller falls back
+        to the generic path — which then produces the numpy result or the
+        proper error.  Raising here has no side effects (no blobs involved).
+        """
+        buf = bytearray(self._zero_record)
+        pack_into = struct.pack_into
+        for kind, field, off, arg, strict in self._fast_plan:
+            if field not in record:
+                continue  # zero record already encodes the default
+            value = record[field]
+            if kind == "u":
+                if value is None:
+                    continue  # generic packs b"" — same bytes as the zeros
+                enc = (
+                    value.encode("utf-8") if isinstance(value, str)
+                    else bytes(value)
+                )
+                if len(enc) > arg:
+                    if strict:
+                        raise ValueError  # generic path raises the full message
+                    enc = enc[:arg].decode("utf-8", "ignore").encode("utf-8")
+                buf[off : off + len(enc)] = enc
+            elif kind == "n":
+                pack_into(arg, buf, off, value)
+            elif kind == "d":
+                pack_into("<q", buf, off, _dt_to_micros(value))
+            else:  # bool — numpy rejects e.g. strings, don't pack truthiness
+                if not isinstance(value, (bool, int, np.bool_, np.integer)):
+                    raise TypeError
+                buf[off] = 1 if value else 0
+        return bytes(buf)
+
     def _serialize(self, **record):
         """Convert record dict to bytes with prefix.
 
         For blob fields, expects (offset, n_slots) tuple.
         For text fields, expects a str — stored transparently via BlobStore.
         """
+        if self._fast_plan is not None:
+            try:
+                return self._serialize_fast(record)
+            except Exception:
+                pass  # generic path below reproduces the result or the error
         # Use zeros + field assignment to avoid numpy dtype __str__ overhead
         # that np.array(tuple, dtype=...) triggers on every call.
         arr = np.zeros(1, dtype=self.schema)

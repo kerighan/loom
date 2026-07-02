@@ -14,6 +14,7 @@ allowing flexible value sizes and nested structures.
 
 import struct
 import sys
+from bisect import bisect_left
 
 import numpy as np
 
@@ -853,18 +854,8 @@ class BTree(DataStructure):
         return node, i, found
 
     def _find_key_index(self, node, key):
-        """Find index where key should be in node (binary search)."""
-        keys = node["keys"]
-        lo, hi = 0, node["num_keys"]
-
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if keys[mid] < key:
-                lo = mid + 1
-            else:
-                hi = mid
-
-        return lo
+        """Find index where key should be in node (binary search, in C)."""
+        return bisect_left(node["keys"], key, 0, node["num_keys"])
 
     # ========== Insert Operations ==========
 
