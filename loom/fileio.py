@@ -41,6 +41,7 @@ class ByteFileDB:
         self._header_dirty = False
         self._write_count = 0  # tracks writes since last flush
         self._batch_mode = False
+        self._batch_depth = 0  # begin_batch/end_batch nesting level
         self._freelist = []
         self._freelist_dirty = False
         self._allocation_index_key = "_allocation_index"
@@ -317,6 +318,8 @@ class ByteFileDB:
         (e.g. before an expected hard shutdown).
         """
         if self.mapped_file and not self.read_only:
+            if self._header_dirty:
+                self._save_header()
             self.mapped_file.flush()
 
     def set_header_field(self, name, value):
@@ -338,14 +341,28 @@ class ByteFileDB:
             self._save_header()
 
     def begin_batch(self):
-        """Enter batch mode: defer header writes until end_batch()."""
+        """Enter batch mode: defer header writes until end_batch().
+
+        Re-entrant: nested begin/end pairs are counted and the header is
+        only persisted when the outermost batch exits."""
         self._ensure_writable()
+        self._batch_depth += 1
         self._batch_mode = True
 
-    def end_batch(self):
-        """Exit batch mode and flush any pending header writes."""
+    def end_batch(self, save=True):
+        """Exit batch mode and flush any pending header writes.
+
+        save=False leaves a dirty header in memory instead of persisting it —
+        the next unbatched set_header_field(), flush_header() or close() will
+        write it.  Callers use this to amortise the header pickle over many
+        small batches (crash window = auto_save_interval ops, the documented
+        durability model) instead of paying it per operation."""
+        if self._batch_depth > 0:
+            self._batch_depth -= 1
+        if self._batch_depth > 0:
+            return  # still inside an outer batch — keep deferring
         self._batch_mode = False
-        if self._header_dirty:
+        if save and self._header_dirty:
             self._save_header()
 
     def flush_header(self):

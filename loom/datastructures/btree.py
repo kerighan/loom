@@ -12,6 +12,11 @@ This implementation stores addresses (like Dict) rather than inline objects,
 allowing flexible value sizes and nested structures.
 """
 
+import struct
+import sys
+
+import numpy as np
+
 from .base import DataStructure, write_op
 from loom.datastructures.template import DataStructureTemplate
 from loom.ref import Ref
@@ -638,18 +643,66 @@ class BTree(DataStructure):
 
     def _create_node(self, is_leaf=True):
         """Create a new node and return its address."""
-        # Allocate space for one node
         addr = self._node_dataset.allocate_block(1)
-
-        # Initialize empty node
-        node_data = {"is_leaf": is_leaf, "num_keys": 0}
-        for i in range(self.ORDER - 1):
-            node_data[f"key_{i}"] = ""
-        for i in range(self.ORDER):
-            node_data[f"child_{i}"] = 0
-
-        self._node_dataset[addr] = node_data
+        node = {
+            "addr": addr,
+            "is_leaf": is_leaf,
+            "num_keys": 0,
+            "keys": [],
+            "children": [],
+        }
+        self._write_node(node)
         return addr
+
+    def _node_layout(self):
+        """Precomputed byte offsets of the node record fields, or None.
+
+        Node records have a fixed, blob-free schema (is_leaf, num_keys,
+        key_0..key_{ORDER-2}, child_0..child_{ORDER-1}), so nodes can be
+        (de)serialized by direct byte packing instead of the generic per-field
+        Dataset path — same bytes on disk, an order of magnitude cheaper.
+        Returns None (→ generic path) if the schema doesn't match this shape,
+        e.g. a file created by a future version with a different node layout.
+        """
+        layout = getattr(self, "_node_layout_cache", False)
+        if layout is not False:
+            return layout
+        layout = None
+        try:
+            ds = self._node_dataset
+            fields = ds.schema.fields
+            key_off = fields["key_0"][1]
+            key_w = fields["key_0"][0].itemsize
+            child_off = fields["child_0"][1]
+            ok = (
+                sys.byteorder == "little"
+                and fields["key_0"][0].kind == "S"
+                and fields["num_keys"][0] == np.dtype("uint16")
+                and fields["child_0"][0] == np.dtype("uint64")
+                and fields["is_leaf"][0].itemsize == 1
+                and all(
+                    fields[f"key_{i}"][1] == key_off + i * key_w
+                    for i in range(1, self.ORDER - 1)
+                )
+                and all(
+                    fields[f"child_{i}"][1] == child_off + i * 8
+                    for i in range(1, self.ORDER)
+                )
+            )
+            if ok:
+                layout = (
+                    ds._zero_record,
+                    ds._valid_prefix,
+                    fields["is_leaf"][1],
+                    fields["num_keys"][1],
+                    key_off,
+                    key_w,
+                    child_off,
+                )
+        except Exception:  # unexpected schema — use the generic path
+            layout = None
+        self._node_layout_cache = layout
+        return layout
 
     def _read_node(self, addr):
         """Read a node from disk (with caching)."""
@@ -662,27 +715,49 @@ class BTree(DataStructure):
             if cached is not None:
                 return cached
 
-        # Read from disk
-        node_data = self._node_dataset[addr]
-
-        # Parse into structured format
-        node = {
-            "addr": addr,
-            "is_leaf": bool(node_data["is_leaf"]),
-            "num_keys": int(node_data["num_keys"]),
-            "keys": [],
-            "children": [],
-        }
-
-        for i in range(node["num_keys"]):
-            key = str(node_data[f"key_{i}"]).rstrip("\x00")
-            node["keys"].append(key)
-
-        # For leaf nodes, children are value addresses
-        # For internal nodes, children are node addresses
-        num_children = node["num_keys"] + 1 if not node["is_leaf"] else node["num_keys"]
-        for i in range(num_children):
-            node["children"].append(int(node_data[f"child_{i}"]))
+        layout = self._node_layout()
+        if layout is not None:
+            zero, prefix, leaf_off, nk_off, key_off, key_w, child_off = layout
+            ds = self._node_dataset
+            raw = ds.db.read(addr, ds.record_size)
+            if raw[0:1] != prefix:
+                ds.read(addr)  # raises DeletedRecord/WrongDataset with context
+            is_leaf = bool(raw[leaf_off])
+            num_keys = struct.unpack_from("<H", raw, nk_off)[0]
+            keys = [
+                raw[key_off + i * key_w : key_off + (i + 1) * key_w]
+                .rstrip(b"\x00")
+                .decode("utf-8")
+                for i in range(num_keys)
+            ]
+            num_children = num_keys if is_leaf else num_keys + 1
+            node = {
+                "addr": addr,
+                "is_leaf": is_leaf,
+                "num_keys": num_keys,
+                "keys": keys,
+                "children": list(
+                    struct.unpack_from(f"<{num_children}Q", raw, child_off)
+                ),
+            }
+        else:
+            node_data = self._node_dataset[addr]
+            node = {
+                "addr": addr,
+                "is_leaf": bool(node_data["is_leaf"]),
+                "num_keys": int(node_data["num_keys"]),
+                "keys": [],
+                "children": [],
+            }
+            for i in range(node["num_keys"]):
+                node["keys"].append(str(node_data[f"key_{i}"]).rstrip("\x00"))
+            # Leaf children are value addresses; internal children are node
+            # addresses (one more than keys).
+            num_children = (
+                node["num_keys"] + 1 if not node["is_leaf"] else node["num_keys"]
+            )
+            for i in range(num_children):
+                node["children"].append(int(node_data[f"child_{i}"]))
 
         # Cache it
         if self._node_cache:
@@ -694,21 +769,39 @@ class BTree(DataStructure):
         """Write a node to disk."""
         addr = node["addr"]
 
-        node_data = {
-            "is_leaf": node["is_leaf"],
-            "num_keys": node["num_keys"],
-        }
-
-        # Only set the used slots.  _serialize() starts from a fully zeroed
-        # record, so unused key slots become "" and unused child slots 0
-        # without us touching them — this skips ORDER-(used) redundant numpy
-        # string assignments per write (the dominant insert cost).
-        for i, key in enumerate(node["keys"]):
-            node_data[f"key_{i}"] = key
-        for i, child in enumerate(node["children"]):
-            node_data[f"child_{i}"] = child
-
-        self._node_dataset[addr] = node_data
+        layout = self._node_layout()
+        if layout is not None:
+            zero, _prefix, leaf_off, nk_off, key_off, key_w, child_off = layout
+            buf = bytearray(zero)  # prefix set, key/child slots zeroed
+            buf[leaf_off] = 1 if node["is_leaf"] else 0
+            struct.pack_into("<H", buf, nk_off, node["num_keys"])
+            # Clamp to the schema's slot count: a node transiently overflows
+            # to ORDER keys right before a split, and the generic path drops
+            # the extra key_/child_ fields (absent from the schema) silently.
+            # Key packing matches Dataset._utf8_pack (inlined: keys are hot):
+            # utf-8 encode, truncate on a codepoint boundary.
+            for i, key in enumerate(node["keys"][: self.ORDER - 1]):
+                enc = key.encode("utf-8")
+                if len(enc) > key_w:
+                    enc = enc[:key_w].decode("utf-8", "ignore").encode("utf-8")
+                off = key_off + i * key_w
+                buf[off : off + len(enc)] = enc
+            children = node["children"][: self.ORDER]
+            struct.pack_into(f"<{len(children)}Q", buf, child_off, *children)
+            self._node_dataset.db.write(addr, bytes(buf))
+        else:
+            node_data = {
+                "is_leaf": node["is_leaf"],
+                "num_keys": node["num_keys"],
+            }
+            # Only set the used slots.  _serialize() starts from a fully zeroed
+            # record, so unused key slots become "" and unused child slots 0
+            # without us touching them.
+            for i, key in enumerate(node["keys"]):
+                node_data[f"key_{i}"] = key
+            for i, child in enumerate(node["children"]):
+                node_data[f"child_{i}"] = child
+            self._node_dataset[addr] = node_data
 
         # Update cache
         if self._node_cache:

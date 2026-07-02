@@ -38,6 +38,7 @@ from __future__ import annotations
 import numbers
 import struct
 from datetime import date, datetime
+from functools import lru_cache
 
 import mmh3
 
@@ -56,9 +57,21 @@ _INT_OFFSET = 1 << 63  # map signed int64 → unsigned for zero-padded ordering
 _UINT_MAX = (1 << 64) - 1
 
 
+class _DescTable(dict):
+    """str.translate table memoising the codepoint complement (C-speed loop)."""
+
+    def __missing__(self, cp):
+        repl = chr(0x10FFFF - cp)
+        self[cp] = repl
+        return repl
+
+
+_DESC_TABLE = _DescTable()
+
+
 def _desc_str(s):
     """Reverse-lexicographic order for a string: complement each codepoint."""
-    return "".join(chr(0x10FFFF - ord(c)) for c in s)
+    return s.translate(_DESC_TABLE)
 
 
 def _float_key(value, desc=False):
@@ -167,6 +180,21 @@ def encode_value(value, desc=False):
     return _desc_str(s) if desc else s
 
 
+@lru_cache(maxsize=4096)
+def _encode_value_cached(value, desc):
+    return encode_value(value, desc)
+
+
+def _encode_sort(value, desc):
+    """encode_value with a small LRU — several Many indexes typically sort on
+    the same field (e.g. five indexes × created_at), so within one record's
+    index pass the same (value, desc) encodes once instead of N times."""
+    try:
+        return _encode_value_cached(value, desc)
+    except TypeError:  # unhashable sort value — encode directly
+        return encode_value(value, desc)
+
+
 class Collection:
     def __init__(self, db, name, dataset, primary_field, primary, indexes,
                  key_size, search=None):
@@ -215,7 +243,7 @@ class Collection:
         if spec.kind == "many":
             parts = [self._group_key(ix, val)]
             if spec.sort is not None:
-                parts.append(encode_value(record.get(spec.sort), desc=spec.desc))
+                parts.append(_encode_sort(record.get(spec.sort), spec.desc))
             parts.append(pk)
             return _SEP.join(parts)
         raise ValueError(f"unsupported index kind {spec.kind!r}")
@@ -262,7 +290,7 @@ class Collection:
         record = as_record(record)
         pk = self._pk_of(record)
         with self._db.write_lock():
-            with self._db.batch():
+            with self._db.batch(defer_save=True):
                 old = self._primary.get(pk)
                 if old is not None:        # upsert: drop the old index/search entries
                     self._remove_from_indexes(old, pk)
@@ -360,7 +388,7 @@ class Collection:
             raise ValueError("cannot change the primary key via update()")
         new = {**old, **changes}
         with self._db.write_lock():
-            with self._db.batch():
+            with self._db.batch(defer_save=True):
                 for ix in self._indexes.values():
                     if not any(f in changes for f in ix["sources"]):
                         continue
@@ -404,7 +432,7 @@ class Collection:
         if record is None:
             raise KeyError(pk)
         with self._db.write_lock():
-            with self._db.batch():
+            with self._db.batch(defer_save=True):
                 self._remove_from_indexes(record, pk)
                 self._remove_from_search(pk)
                 del self._primary[pk]

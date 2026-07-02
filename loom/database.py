@@ -129,6 +129,9 @@ class DB:
         self.flag = flag
         self.read_only = flag == "r"
         self.auto_save_interval = auto_save_interval
+        # Counts batch(defer_save=True) exits since the last header save, so
+        # deferred batches still persist the header every auto_save_interval.
+        self._deferred_batches = 0
 
         # Thread-safety: RLock allows re-entrant locking from the same thread
         # (e.g. save() called inside a write operation).  Uncontested cost ~50 ns.
@@ -426,12 +429,21 @@ class DB:
             raise ReadOnlyError()
 
     @contextmanager
-    def batch(self):
+    def batch(self, defer_save=False):
         """Batch mode: defer all header flushes until the block exits.
 
         Use this for bulk inserts to avoid per-operation header writes.
         Data is still written to mmap immediately, only the header
         (allocation index, metadata) flush is deferred.
+
+        Re-entrant: nesting batch() blocks is safe — the header is persisted
+        when the outermost block exits.
+
+        defer_save=True (internal, used by per-record Collection ops): don't
+        persist the header at block exit either; instead persist it every
+        ``auto_save_interval`` deferred blocks.  This keeps the documented
+        durability window (metadata every N ops) while amortising the header
+        pickle, which would otherwise dominate small single-record batches.
 
         Example::
 
@@ -446,7 +458,16 @@ class DB:
         try:
             yield
         finally:
-            self._db.end_batch()
+            if defer_save and self.auto_save_interval > 1:
+                self._deferred_batches += 1
+                if self._deferred_batches >= self.auto_save_interval:
+                    self._deferred_batches = 0
+                    self._db.end_batch()  # persist now (cadence reached)
+                else:
+                    self._db.end_batch(save=False)
+            else:
+                self._deferred_batches = 0
+                self._db.end_batch()
 
     def apply_writes(self, writes):
         if not self._is_open:

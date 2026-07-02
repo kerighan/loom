@@ -45,6 +45,34 @@ def _require_eldar():
         ) from e
 
 
+# ── accent folding ────────────────────────────────────────────────────────────
+
+
+class _UnidecodeTable(dict):
+    """str.translate table that memoises unidecode per codepoint.
+
+    unidecode transliterates strictly character by character (a table lookup
+    per codepoint, no context), so caching each codepoint's replacement and
+    applying it with str.translate produces byte-identical output while doing
+    the per-character work in C instead of a Python loop."""
+
+    def __missing__(self, codepoint):
+        from unidecode import unidecode
+
+        repl = unidecode(chr(codepoint))
+        self[codepoint] = repl
+        return repl
+
+
+_UNIDECODE_TABLE = _UnidecodeTable()
+
+
+def _fold_accents(text):
+    if text.isascii():
+        return text
+    return text.translate(_UNIDECODE_TABLE)
+
+
 # ── varint (LEB128, unsigned) ─────────────────────────────────────────────────
 
 
@@ -240,13 +268,13 @@ class SearchIndex(DataStructure):
     # ── tokenisation (kept consistent with eldar's normalisation) ─────────────
 
     def _normalise(self, text):
-        from unidecode import unidecode
-
         if self.ignore_case:
             text = text.lower()
         if self.ignore_accent:
-            text = unidecode(text)
+            text = _fold_accents(text)
         return text
+
+    _PUNCT_TABLE = None  # class-level cache: str.maketrans is not free
 
     def _tokens(self, text):
         from eldar.regex import WORD_REGEX
@@ -254,8 +282,9 @@ class SearchIndex(DataStructure):
 
         toks = re.findall(WORD_REGEX, self._normalise(text), re.UNICODE)
         if self.ignore_punctuation:
-            table = str.maketrans("", "", PUNCTUATION)
-            toks = [t.translate(table) for t in toks]
+            if SearchIndex._PUNCT_TABLE is None:
+                SearchIndex._PUNCT_TABLE = str.maketrans("", "", PUNCTUATION)
+            toks = [t.translate(SearchIndex._PUNCT_TABLE) for t in toks]
         return [t for t in toks if t]
 
     def _doc_text(self, record):
