@@ -80,6 +80,48 @@ class TestMany:
         assert posts.find("username", "carol") == []
 
 
+class TestCount:
+    def test_count_per_group(self, db):
+        posts = seed(make_posts(db))
+        assert posts.count("username", "alice") == 3
+        assert posts.count("username", "bob") == 2
+        assert posts.count("username", "carol") == 0
+
+    def test_count_matches_find(self, db):
+        posts = seed(make_posts(db))
+        for user in ("alice", "bob", "carol"):
+            assert posts.count("username", user) == len(posts.find("username", user))
+
+    def test_count_with_sort_bounds(self, db):
+        posts = seed(make_posts(db))
+        # alice: created_at 100, 200, 300 (desc index — bounds are on values)
+        assert posts.count("username", "alice", start=150) == 2
+        assert posts.count("username", "alice", end=250) == 2
+        assert posts.count("username", "alice", start=150, end=250) == 1
+        assert posts.count("username", "alice", start=500) == 0
+
+    def test_count_tracks_mutations(self, db):
+        posts = seed(make_posts(db))
+        posts.delete("p1")
+        assert posts.count("username", "alice") == 2
+        posts.update("p4", username="alice")
+        assert posts.count("username", "alice") == 3
+        assert posts.count("username", "bob") == 1
+
+    def test_count_requires_many_index(self, db):
+        posts = seed(make_posts(db))
+        with pytest.raises(ValueError):
+            posts.count("engagement", 50)
+
+    def test_count_bounds_require_sort(self, db):
+        col = db.collection("plain", {"id": "utf8[16]", "tag": "utf8[16]"},
+                            indexes={"id": "primary", "tag": "many"})
+        col.insert({"id": "x1", "tag": "a"})
+        assert col.count("tag", "a") == 1
+        with pytest.raises(ValueError):
+            col.count("tag", "a", start=1)
+
+
 class TestRange:
     def test_engagement_threshold(self, db):
         posts = seed(make_posts(db))

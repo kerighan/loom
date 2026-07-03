@@ -534,6 +534,52 @@ class Collection:
             return default
         return self.get_primary(entry["pk"], default)
 
+    def _many_bounds(self, index_name, op, value, start, end):
+        """Resolve a Many-index group + optional sort-field window into the
+        composite-key interval [low_key, high_key) shared by find()/count()."""
+        ix = self._indexes[index_name]
+        spec = ix["spec"]
+        if spec.kind != "many":
+            raise ValueError(f"{op}() needs a 'many' index for {index_name!r}")
+        value = self._coerce_field_value(ix["field"], value)
+        group = self._group_key(ix, value)
+
+        if start is None and end is None:
+            return ix, group + _SEP, group + "\x01"
+
+        if spec.sort is None:
+            raise ValueError(
+                f"start/end need a Many(sort=...) index; {index_name!r} has no sort"
+            )
+        es = (encode_value(self._coerce_field_value(spec.sort, start), desc=spec.desc)
+              if start is not None else None)
+        ee = (encode_value(self._coerce_field_value(spec.sort, end), desc=spec.desc)
+              if end is not None else None)
+        if es is not None and ee is not None:
+            klo, khi = min(es, ee), max(es, ee)   # enc is monotone → value interval
+        elif spec.desc:
+            klo, khi = ee, es   # value>=start ↔ enc<=es ; value<=end ↔ enc>=ee
+        else:
+            klo, khi = es, ee
+        low_key = group + _SEP + (klo if klo is not None else "")
+        high_key = (group + _SEP + khi + "\x01") if khi is not None else group + "\x01"
+        return ix, low_key, high_key
+
+    def count(self, index_name, value, start=None, end=None):
+        """Number of records in group ``value`` of a 'many' index — a
+        key-only scan that never reads index values or primary records.
+
+        ``start``/``end`` bound the index's sort field exactly like find(),
+        so a Many(sort="created_at") index also counts time windows:
+
+            col.count("narrative", "ukraine", start=date(2026, 6, 1))
+
+        O(log n + matches) with only the key walk paid per match."""
+        ix, low_key, high_key = self._many_bounds(index_name, "count",
+                                                  value, start, end)
+        it = ix["struct"].range_keys(low_key, high_key, inclusive=(True, False))
+        return sum(1 for _ in it)
+
     def find(self, index_name, value, start=None, end=None, limit=None):
         """One-to-many lookup → records for group ``value`` (ordered by the
         index's sort field).
@@ -546,34 +592,9 @@ class Collection:
         runs as a single seek + bounded scan (O(log n + matches)), so it stays
         fast no matter how much history the group holds.  Bounds are inclusive
         and may be int / float / datetime / str (matching the sort field)."""
-        ix = self._indexes[index_name]
-        spec = ix["spec"]
-        if spec.kind != "many":
-            raise ValueError(f"find() needs a 'many' index for {index_name!r}")
-        value = self._coerce_field_value(ix["field"], value)
-        group = self._group_key(ix, value)
-        struct = ix["struct"]
-
-        if start is None and end is None:
-            it = struct.prefix(group + _SEP)
-        else:
-            if spec.sort is None:
-                raise ValueError(
-                    f"start/end need a Many(sort=...) index; {index_name!r} has no sort"
-                )
-            es = (encode_value(self._coerce_field_value(spec.sort, start), desc=spec.desc)
-                  if start is not None else None)
-            ee = (encode_value(self._coerce_field_value(spec.sort, end), desc=spec.desc)
-                  if end is not None else None)
-            if es is not None and ee is not None:
-                klo, khi = min(es, ee), max(es, ee)   # enc is monotone → value interval
-            elif spec.desc:
-                klo, khi = ee, es   # value>=start ↔ enc<=es ; value<=end ↔ enc>=ee
-            else:
-                klo, khi = es, ee
-            low_key = group + _SEP + (klo if klo is not None else "")
-            high_key = (group + _SEP + khi + "\x01") if khi is not None else group + "\x01"
-            it = struct.range(low_key, high_key, inclusive=(True, False))
+        ix, low_key, high_key = self._many_bounds(index_name, "find",
+                                                  value, start, end)
+        it = ix["struct"].range(low_key, high_key, inclusive=(True, False))
 
         out = []
         for _key, entry in it:

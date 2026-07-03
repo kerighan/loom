@@ -1383,6 +1383,40 @@ class BTree(DataStructure):
             else:
                 yield self._dkey(key), value_data
 
+    def range_keys(self, start=None, end=None, inclusive=(True, True)):
+        """Iterate over keys only in a key range — values are never read.
+
+        Same bounds semantics as range().  This is the cheap path for
+        counting index entries: no value materialization, no nested-structure
+        wrapping, just the in-order key walk (O(log n + k)).
+
+        Yields:
+            keys in sorted order
+        """
+        if self.root_addr == 0:
+            return
+
+        if self._int_keys:
+            start = _int_key(start) if start is not None else None
+            end = _int_key(end) if end is not None else None
+
+        start_inc, end_inc = inclusive
+
+        if start is not None:
+            entries = self._inorder_from(self.root_addr, start, start_inc)
+        else:
+            entries = self._inorder_entries(self.root_addr)
+
+        for key, _value_addr in entries:
+            if end is not None:
+                if end_inc:
+                    if key > end:
+                        break
+                else:
+                    if key >= end:
+                        break
+            yield self._dkey(key)
+
     def prefix(self, prefix_str):
         """Iterate over (key, value) pairs with keys starting with prefix.
 
