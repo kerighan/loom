@@ -1066,6 +1066,19 @@ class Dict(DataStructure):
             raise TypeError("d[key, field] field access is not supported on nested dicts")
         self._values_dataset.write_field(self._resolve_value_addr(key), field, value)
 
+    def get_fields(self, key, fields, default=None):
+        """Read a subset of the record's fields at `key` — one row read,
+        only the requested fields materialized (see Dataset.read_fields).
+
+        Returns `default` if the key is absent."""
+        if self._is_nested:
+            raise TypeError("get_fields is not supported on nested dicts")
+        try:
+            addr = self._resolve_value_addr(key)
+        except KeyError:
+            return default
+        return self._values_dataset.read_fields(addr, fields)
+
     def get_ref(self, key):
         """Return a Ref handle to the record stored at `key`.
 

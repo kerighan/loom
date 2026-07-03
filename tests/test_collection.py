@@ -80,6 +80,44 @@ class TestMany:
         assert posts.find("username", "carol") == []
 
 
+class TestProjection:
+    def test_find_fields_projects(self, db):
+        posts = seed(make_posts(db))
+        hits = posts.find("username", "alice", fields=["id", "engagement"])
+        assert [h["id"] for h in hits] == ["p2", "p3", "p1"]
+        assert all(set(h) == {"id", "engagement"} for h in hits)
+        assert hits[0]["engagement"] == 50
+
+    def test_find_fields_with_bounds_and_limit(self, db):
+        posts = seed(make_posts(db))
+        hits = posts.find("username", "alice", start=150, limit=1, fields=["id"])
+        assert [dict(h) for h in hits] == [{"id": "p2"}]
+
+    def test_range_fields_projects(self, db):
+        posts = seed(make_posts(db))
+        hits = posts.range("engagement", 100, None, fields=["id", "text"])
+        assert [h["id"] for h in hits] == ["p3", "p4"]
+        assert hits[0]["text"] == "viral post"   # text field resolves in projection
+        assert "username" not in hits[0]
+
+    def test_projection_field_types(self, db):
+        posts = seed(make_posts(db))
+        h = posts.find("username", "bob", fields=["created_at", "username"])[0]
+        assert h["created_at"] == 400 and isinstance(h["created_at"], int)
+        assert h["username"] == "bob"
+
+    def test_projected_record_setitem_still_updates(self, db):
+        posts = seed(make_posts(db))
+        h = posts.find("username", "alice", fields=["id"])[0]   # p2
+        h["engagement"] = 7777
+        assert posts["p2"]["engagement"] == 7777
+
+    def test_unknown_field_raises(self, db):
+        posts = seed(make_posts(db))
+        with pytest.raises(ValueError):
+            posts.find("username", "alice", fields=["nope"])
+
+
 class TestCount:
     def test_count_per_group(self, db):
         posts = seed(make_posts(db))

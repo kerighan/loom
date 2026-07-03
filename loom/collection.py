@@ -580,7 +580,8 @@ class Collection:
         it = ix["struct"].range_keys(low_key, high_key, inclusive=(True, False))
         return sum(1 for _ in it)
 
-    def find(self, index_name, value, start=None, end=None, limit=None):
+    def find(self, index_name, value, start=None, end=None, limit=None,
+             fields=None):
         """One-to-many lookup → records for group ``value`` (ordered by the
         index's sort field).
 
@@ -591,12 +592,28 @@ class Collection:
 
         runs as a single seek + bounded scan (O(log n + matches)), so it stays
         fast no matter how much history the group holds.  Bounds are inclusive
-        and may be int / float / datetime / str (matching the sort field)."""
+        and may be int / float / datetime / str (matching the sort field).
+
+        ``fields=["name", ...]`` projects each hit onto just those fields:
+        one row read per record, and unrequested text/json/blob fields never
+        touch the blob store — much cheaper than materializing full records
+        when the schema carries heavy text."""
         ix, low_key, high_key = self._many_bounds(index_name, "find",
                                                   value, start, end)
         it = ix["struct"].range(low_key, high_key, inclusive=(True, False))
+        return self._collect(it, limit, fields)
 
+    def _collect(self, it, limit, fields):
+        """Materialize (full or projected) records for an index-entry scan."""
         out = []
+        if fields is not None:
+            for _key, entry in it:
+                rec = self._primary.get_fields(str(entry["pk"]), fields)
+                if rec is not None:
+                    out.append(self._wrap(entry["pk"], rec))
+                    if limit is not None and len(out) >= limit:
+                        break
+            return out
         for _key, entry in it:
             rec = self._primary.get(str(entry["pk"]))
             if rec is not None:
@@ -605,13 +622,16 @@ class Collection:
                     break
         return out
 
-    def range(self, index_name, low=None, high=None, limit=None, desc=False):
+    def range(self, index_name, low=None, high=None, limit=None, desc=False,
+              fields=None):
         """Range scan on a 'range' index → records with low <= value <= high
         (either bound may be None for an open end).
 
         desc=True returns highest-value-first — e.g. the most recent items of a
         timestamp index, or a relevance feed, with a cheap `limit` and no need
-        for a grouping field:  inbox.range("created_at", limit=50, desc=True)."""
+        for a grouping field:  inbox.range("created_at", limit=50, desc=True).
+
+        ``fields=[...]`` projects hits onto just those fields (see find())."""
         ix = self._indexes[index_name]
         if ix["spec"].kind != "range":
             raise ValueError(f"range() needs a 'range' index for {index_name!r}")
@@ -619,15 +639,8 @@ class Collection:
         high = self._coerce_field_value(ix["field"], high)
         start = None if low is None else encode_value(low)
         end = None if high is None else encode_value(high) + "\x01"
-        out = []
-        for _key, entry in ix["struct"].range(start, end, inclusive=(True, False),
-                                              reverse=desc):
-            rec = self._primary.get(str(entry["pk"]))
-            if rec is not None:
-                out.append(self._wrap(entry["pk"], rec))
-                if limit is not None and len(out) >= limit:
-                    break
-        return out
+        it = ix["struct"].range(start, end, inclusive=(True, False), reverse=desc)
+        return self._collect(it, limit, fields)
 
     def search(self, index_name, query, where=None, mode=None, limit=None,
                with_scores=False):

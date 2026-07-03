@@ -714,6 +714,56 @@ class Dataset:
             return _micros_to_dt(int(value))
         return _to_native(value)
 
+    def read_fields(self, address, fields):
+        """Read a subset of a record's fields in one row read.
+
+        One db.read of the fixed-size row, then only the requested fields
+        are materialized: unrequested text/json/blob fields never touch the
+        blob store and unrequested scalars are never converted — that's
+        where the cost of a full read() lives.
+
+        Args:
+            address: Record address
+            fields: Iterable of field names to materialize
+
+        Returns:
+            Dict with just those fields
+        """
+        for field in fields:
+            if field not in self.user_schema.names:
+                raise ValueError(f"Field '{field}' not in schema")
+
+        data = self.db.read(address, self.record_size)
+        prefix = data[0:1]
+        if prefix == self._deleted_prefix:
+            raise DeletedRecordError(address)
+        if prefix != self._valid_prefix:
+            prefix_val = int(np.frombuffer(prefix, dtype="int8")[0])
+            raise WrongDatasetError(address, self.identifier, prefix_val)
+
+        arr = np.frombuffer(data, dtype=self.schema)[0]
+        result = {}
+        for field in fields:
+            value = arr[field]
+            if field in self._text_fields:
+                off, ns = int(value["offset"]), int(value["n_slots"])
+                result[field] = "" if (off == 0 and ns == 0) else self.blob_store.read(off).decode("utf-8")
+            elif field in self._json_fields:
+                off, ns = int(value["offset"]), int(value["n_slots"])
+                result[field] = None if (off == 0 and ns == 0) else json.loads(self.blob_store.read(off).decode("utf-8"))
+            elif field in self._blob_fields:
+                off, ns = int(value["offset"]), int(value["n_slots"])
+                result[field] = None if (off == 0 and ns == 0) else self.blob_store.read(off)
+            elif field in self._utf8_fields:
+                result[field] = bytes(value).rstrip(b"\x00").decode("utf-8")
+            elif field in self._datetime_fields:
+                result[field] = _micros_to_dt(int(value))
+            elif field in self._array_fields:
+                result[field] = np.array(value)
+            else:
+                result[field] = _to_native(value)
+        return result
+
     def exists(self, address):
         """Check if a valid record exists at address.
 
