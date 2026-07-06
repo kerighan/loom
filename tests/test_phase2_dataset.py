@@ -107,6 +107,29 @@ class TestReadWrite:
             if os.path.exists(filename):
                 os.remove(filename)
 
+    def test_unknown_field_raises(self):
+        """A record whose keys don't match the schema must raise, not write
+        a record of defaults (silently dropping the caller's payload)."""
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            filename = tmp.name
+
+        try:
+            db = ByteFileDB(filename)
+            db.open()
+
+            users = Dataset("users", db, 1, id="uint64", name="U50")
+            addr = users.allocate_block(1)
+            with pytest.raises(ValueError, match="unknown field"):
+                users.write(addr, id=1, nmae="typo")
+            # Missing fields still default — partial records are legitimate.
+            users.write(addr, id=2)
+            assert users.read(addr)["name"] == ""
+
+            db.close()
+        finally:
+            if os.path.exists(filename):
+                os.remove(filename)
+
     def test_multiple_records(self):
         """Test writing and reading multiple records."""
         with tempfile.NamedTemporaryFile(delete=False) as tmp:

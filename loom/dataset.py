@@ -265,6 +265,9 @@ class Dataset:
         self._valid_prefix = np.int8(identifier).tobytes()
         self._deleted_prefix = np.int8(-identifier).tobytes()
 
+        # For the unknown-field check in _serialize (frozenset → C-level <=)
+        self._field_set = frozenset(self.user_schema.names)
+
         # Pre-built zero record for fast bulk-init (one write instead of N)
         self._zero_record = self._serialize_zero()
 
@@ -403,7 +406,20 @@ class Dataset:
 
         For blob fields, expects (offset, n_slots) tuple.
         For text fields, expects a str — stored transparently via BlobStore.
+
+        Unknown fields raise: silently dropping them means writing a record
+        of defaults when the caller's dict doesn't match the schema at all
+        (e.g. storing a payload directly instead of {"data": payload}) —
+        data loss that only shows up on read-back.  Missing fields still
+        default (partial records are legitimate).
         """
+        if not record.keys() <= self._field_set:
+            unknown = sorted(set(record) - self._field_set)
+            public = [f for f in self.user_schema.names if not f.startswith("_")]
+            raise ValueError(
+                f"unknown field(s) {unknown} for this schema — "
+                f"expected a subset of {public}"
+            )
         if self._fast_plan is not None:
             try:
                 return self._serialize_fast(record)
