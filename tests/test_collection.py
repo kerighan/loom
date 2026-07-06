@@ -80,6 +80,37 @@ class TestMany:
         assert posts.find("username", "carol") == []
 
 
+class TestSchemaShorthands:
+    """`str` / "str" used to fall through to np.dtype → '<U0', a zero-width
+    field that silently stored every value as "" (the primary lookup still
+    worked — the Dict hashes the caller's key — so the loss only showed on
+    read-back)."""
+
+    def test_str_shorthands_store_full_value(self, db):
+        for name, dt in (("s1", str), ("s2", "str"), ("s3", "string")):
+            col = db.collection(name, {"url": dt, "val": "int64"},
+                                indexes={"url": "primary"})
+            col.insert({"url": "https://x.fr/abc", "val": 1})
+            assert col["https://x.fr/abc"]["url"] == "https://x.fr/abc"
+
+    def test_python_type_shorthands(self, db):
+        from datetime import datetime
+        col = db.collection("py", {"url": str, "n": int, "d": dict, "ts": datetime},
+                            indexes={"url": "primary"})
+        ts = datetime(2026, 7, 6, 12, 0)
+        col.insert({"url": "u1", "n": 2, "d": {"a": 1}, "ts": ts})
+        rec = col["u1"]
+        assert rec["n"] == 2 and rec["d"] == {"a": 1} and rec["ts"] == ts
+
+    def test_sizeless_utf8_rejected(self, db):
+        with pytest.raises(ValueError, match="utf8"):
+            db.collection("bad1", {"x": "utf8", "v": "int64"}, indexes={"x": "primary"})
+
+    def test_zero_width_dtype_rejected(self, db):
+        with pytest.raises(ValueError, match="zero width"):
+            db.collection("bad2", {"x": "U", "v": "int64"}, indexes={"x": "primary"})
+
+
 class TestProjection:
     def test_find_fields_projects(self, db):
         posts = seed(make_posts(db))

@@ -35,6 +35,32 @@ def parse_dtype(dtype_str):
     return np.dtype(dtype_str)
 
 
+def _normalize_dtype(field, dtype):
+    """Normalize Python-type and ambiguous shorthands to loom dtype strings.
+
+    Without this, `str` / "str" fell through to np.dtype(...) which yields
+    '<U0' — a ZERO-width unicode field that silently stores every value as
+    "" (lookups on a hashed/store_key structure still work, so the loss
+    only shows when the record is read back).  Same trap for `bytes` (S0).
+    """
+    import datetime as _dt
+
+    if dtype is str or (isinstance(dtype, str) and dtype in ("str", "string")):
+        return "text"
+    if dtype is bytes:
+        return "blob"
+    if dtype is dict:
+        return "json"
+    if dtype is _dt.datetime or dtype is _dt.date:
+        return "datetime"
+    if isinstance(dtype, str) and dtype == "utf8":
+        raise ValueError(
+            f"field {field!r}: 'utf8' needs a byte size — use 'utf8[N]' "
+            f"(fixed-width, stored inline) or 'text' (unbounded, blob store)"
+        )
+    return dtype
+
+
 def dtype_to_str(dtype):
     """Serialize a numpy dtype back to a string, preserving array shapes.
 
@@ -196,6 +222,7 @@ class Dataset:
         # Convert dtype strings, handling "blob", "text", "utf8[N]", "datetime", "float32[N]"
         processed_schema = []
         for field, dtype in schema.items():
+            dtype = _normalize_dtype(field, dtype)
             if dtype == "blob":
                 self._blob_fields.add(field)
                 processed_schema.append((field, BLOB_DTYPE))
@@ -218,6 +245,13 @@ class Dataset:
                 processed_schema.append((field, np.dtype(f"S{n}")))
             else:
                 np_dtype = parse_dtype(dtype)
+                if np_dtype.itemsize == 0:
+                    # e.g. "U", "S", np.str_ — a zero-width field would
+                    # silently store every value as ""/b"".
+                    raise ValueError(
+                        f"field {field!r}: dtype {dtype!r} has zero width — "
+                        f"use 'text' (unbounded) or 'utf8[N]' (fixed-width)"
+                    )
                 if np_dtype.shape:
                     self._array_fields[field] = np_dtype.shape
                 processed_schema.append((field, np_dtype))
