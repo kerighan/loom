@@ -40,6 +40,7 @@ quickstart
 tutorials/social_posts
 tutorials/full_text_search
 tutorials/knowledge_graph
+tutorials/triple_store
 tutorials/semantic_search
 tutorials/task_scheduling
 tutorials/timeseries
