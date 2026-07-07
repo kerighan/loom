@@ -42,6 +42,7 @@ tutorials/full_text_search
 tutorials/knowledge_graph
 tutorials/triple_store
 tutorials/semantic_search
+tutorials/vector_collection
 tutorials/task_scheduling
 tutorials/timeseries
 ```

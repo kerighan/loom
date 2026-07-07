@@ -444,6 +444,7 @@ kept in sync on every insert / update / delete under one lock. The record lives
 | `"range"` | B+Tree | numeric / ordered range scans (`>=`, between) |
 | `Many(sort=, desc=, field=)` | B+Tree | one-to-many groups, returned in sort order. It's a **compound** key, so `find()` can bound the sort field → *equality AND range* in one seek |
 | `Search(fields=, scoring=)` | SearchIndex | full-text (boolean or BM25) |
+| `Vector(field=, metric=)` | — (vectors live in the records) | exact similarity, pre-filtered through the other indexes (`nearest()`) |
 
 ```python
 from pydantic import BaseModel, Field
@@ -471,6 +472,10 @@ posts["p1"]                                    # by primary key
 posts.find("username", "alice", limit=20)      # alice's 20 most-recent posts
 posts.range("engagement", 1000, None)          # engagement >= 1000, ascending
 posts.range("created_at", limit=50, desc=True) # 50 most recent — no grouping needed
+posts.count("username", "alice")               # group size — key-only scan,
+posts.count("username", "alice", start=T)      # never reads a record
+posts.find("username", "alice",
+           fields=["id", "engagement"])        # projection: row read only, no blobs
 posts.search("body", "inverted OR index")      # full-text → records
 posts.search("body", "inverted",               # full-text AND structured filter
              where={"username": "alice", "created_at": (date(2026, 1, 1), None)})
@@ -525,6 +530,38 @@ posts.delete("p1")                             # removed from every index
   posts.find("cat_time", "politics", start=date(2026, 1, 1), end=date(2026, 6, 1))  # a window
   posts.find("category", "politics", limit=20)                          # top-20 by engagement
   ```
+- **Counting & projection.** `count(index, value, start=, end=)` sizes a group
+  (or a window of its sort field) with a **key-only** scan — no index values,
+  no records, ~18× faster than `len(find(...))`. `find(..., fields=[...])` /
+  `range(..., fields=[...])` materialize only the requested fields: one row
+  read per hit, and unrequested `text`/`json` fields never touch the blob
+  store.
+- **Vector similarity — pre-filtered, exact.** `Vector(metric="cosine"|"l2"|"dot")`
+  on an inline `Vec(N)` field costs *nothing on write* (no backing structure —
+  the vector lives in the record). `nearest()` narrows candidates through the
+  collection's regular indexes first (same `where` spec as `search()`), then
+  scores only the survivors' vectors exactly — no ANN recall to worry about,
+  and the filter applies *before* scoring, so a selective filter makes the
+  query faster, not emptier:
+
+  ```python
+  from loom import Vector, Vec
+
+  docs = db.collection("docs", Doc, indexes={
+      "id":    "primary",
+      "topic": Many(sort="created_at", desc=True),
+      "emb":   Vector(metric="cosine"),          # Doc.emb: Vec(384)
+  })
+  docs.nearest("emb", qvec, k=10)                              # whole collection
+  docs.nearest("emb", qvec, k=10, with_scores=True,            # group + window →
+               where={"topic": "politics",                     # one index seek,
+                      "created_at": (date(2026, 6, 1), None)}) # then exact top-k
+  ```
+
+  100k docs (dim 384): full scan 1.7 s, topic group (2.5k candidates) 79 ms,
+  group + month window (830 candidates) 28 ms. If an unfiltered corpus
+  outgrows the flat scan, the standalone `FlatIndex`/`IVFIndex` are the ANN
+  path.
 - **Persistence.** The index declaration is saved with the collection, so
   `db.collection("posts")` (no model) reopens it and restores every index
   automatically.
