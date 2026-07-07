@@ -17,8 +17,8 @@ Collection
 
 .. autoclass:: loom.Collection
    :members: insert, insert_many, update, delete, increment, get, find, range,
-             search, sample, describe, get_primary, reindex, keys, values,
-             items, index_names
+             count, nearest, search, sample, describe, get_primary, reindex,
+             keys, values, items, index_names
 
 Index specs
 ~~~~~~~~~~~
@@ -28,6 +28,7 @@ Index specs
 .. autoclass:: loom.Range
 .. autoclass:: loom.Many
 .. autoclass:: loom.Search
+.. autoclass:: loom.Vector
 
 Data structures
 ---------------

@@ -1,7 +1,7 @@
 """Loom - A persistent database that feels like Python."""
 
 from loom.database import DB
-from loom.collection import Collection, Primary, Unique, Range, Many, Search
+from loom.collection import Collection, Primary, Unique, Range, Many, Search, Vector
 from loom.datastructures.search import SearchIndex
 from loom.datastructures.priority_queue import PriorityQueue, PriorityQueueEmpty
 from loom.client import (
@@ -44,6 +44,7 @@ __all__ = [
     "Range",
     "Many",
     "Search",
+    "Vector",
     "Dataset",
     "List",
     "BloomFilter",

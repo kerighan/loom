@@ -1483,6 +1483,7 @@ class DB:
                 cfg["primary_field"], self._datastructures[cfg["primary"]],
                 _build_index_objs(cfg), cfg["key_size"],
                 search=_build_search_objs(cfg),
+                vector=cfg.get("vector", {}),
             )
 
         # ── Create ──────────────────────────────────────────────────────
@@ -1612,7 +1613,7 @@ class DB:
     def _collection_index_specs(self, cfg, col):
         """Rebuild the `indexes=` declaration from a collection's stored config
         (used by migrate / vacuum to recreate it identically)."""
-        from loom.collection import Many, Range, Unique, Search
+        from loom.collection import Many, Range, Unique, Search, Vector
         indexes = {cfg["primary_field"]: "primary"}
         for idx_name, ic in cfg["indexes"].items():
             field = ic.get("field", idx_name)
@@ -1628,6 +1629,9 @@ class DB:
             si = col._search[field]["index"]
             indexes[field] = Search(fields=sc["fields"], scoring=si._scoring,
                                     bm25_k1=si._k1, bm25_b=si._b)
+        for idx_name, vc in cfg.get("vector", {}).items():
+            fld = None if vc["field"] == idx_name else vc["field"]
+            indexes[idx_name] = Vector(field=fld, metric=vc["metric"])
         return indexes
 
     def vacuum(self):
@@ -1864,7 +1868,7 @@ class DB:
         need_ik = eff_pk + 4
         hashed_index = {}
         for idx_name, spec in specs.items():
-            if spec.kind in ("primary", "search"):
+            if spec.kind in ("primary", "search", "vector"):
                 continue
             fld = getattr(spec, "field", None) or idx_name
             vw = self._field_enc_width(dataset, fld)
@@ -1894,7 +1898,7 @@ class DB:
         idx_objs = {}
         cfg_indexes = {}
         for idx_name, spec in specs.items():
-            if spec.kind in ("primary", "search"):
+            if spec.kind in ("primary", "search", "vector"):
                 continue
             # the index NAME labels the structures (unique); the FIELD is what
             # gets indexed (defaults to the name, but can be shared across
@@ -1950,6 +1954,27 @@ class DB:
             cfg_search[field] = {"fields": fields, "search": si.name,
                                  "pk2docid": p2d.name, "docid2pk": docid2pk.name}
 
+        # Vector (flat-similarity) indexes: pure config — the vectors live
+        # inline in the records (Vec fields), so there is no backing structure
+        # and nothing to maintain on write.
+        cfg_vector = {}
+        for idx_name, spec in specs.items():
+            if spec.kind != "vector":
+                continue
+            fld = getattr(spec, "field", None) or idx_name
+            shape = dataset._array_fields.get(fld)
+            if shape is None or len(shape) != 1:
+                raise ValueError(
+                    f"collection {name!r}: vector index {idx_name!r} needs a "
+                    f"1-D vector field (Vec(N) / 'float32[N]'), got {fld!r}"
+                )
+            if spec.metric not in ("cosine", "l2", "dot"):
+                raise ValueError(
+                    f"collection {name!r}: vector index {idx_name!r}: unknown "
+                    f"metric {spec.metric!r} (expected cosine, l2 or dot)"
+                )
+            cfg_vector[idx_name] = {"field": fld, "metric": spec.metric}
+
         self._db.set_header_field(cfg_key, {
             "dataset": dataset.name,
             "primary": primary.name,
@@ -1958,8 +1983,9 @@ class DB:
             "index_key_size": index_key_size,
             "indexes": cfg_indexes,
             "search": cfg_search,
+            "vector": cfg_vector,
         })
         return Collection(
             self, name, dataset, primary_field, primary, idx_objs, key_size,
-            search=search_objs,
+            search=search_objs, vector=cfg_vector,
         )

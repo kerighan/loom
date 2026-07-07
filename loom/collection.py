@@ -41,6 +41,7 @@ from datetime import date, datetime
 from functools import lru_cache
 
 import mmh3
+import numpy as np
 
 from loom.dataset import as_record
 
@@ -133,8 +134,25 @@ class Search:
         self.bm25_b = bm25_b
 
 
+class Vector:
+    """Exact (flat) vector similarity over a ``Vec(N)`` field.
+
+    Not an ANN structure: the vectors live inline in the records, nothing is
+    maintained on write.  ``nearest()`` narrows candidates through the
+    collection's *other* indexes first (``where=``), then scores the
+    survivors' vectors exactly — a pre-filtered flat search, which beats ANN
+    whenever the filter is selective (a date window, a group, ...).
+    """
+
+    kind = "vector"
+
+    def __init__(self, field=None, metric="cosine"):
+        self.field = field            # None → the index's name is the field
+        self.metric = metric          # "cosine" | "l2" | "dot"
+
+
 _STRING_KINDS = {"primary": Primary, "unique": Unique, "range": Range,
-                 "many": Many, "search": Search}
+                 "many": Many, "search": Search, "vector": Vector}
 
 
 def _as_spec(spec):
@@ -197,11 +215,13 @@ def _encode_sort(value, desc):
 
 class Collection:
     def __init__(self, db, name, dataset, primary_field, primary, indexes,
-                 key_size, search=None):
+                 key_size, search=None, vector=None):
         """
         indexes: {idx_name: {"name", "spec", "field", "struct", "sources"}}
         search:  {idx_name: {"fields": [...], "index": SearchIndex,
                              "pk2docid": Dict, "docid2pk": List}}  full-text
+        vector:  {idx_name: {"field": ..., "metric": ...}}  flat similarity
+                 (no backing structure — the vectors live in the records)
         """
         self._db = db
         self.name = name
@@ -211,6 +231,7 @@ class Collection:
         self._indexes = indexes
         self._key_size = key_size
         self._search = search or {}
+        self._vector = vector or {}
         self._indexed_fields = set()
         for ix in indexes.values():
             self._indexed_fields.update(ix["sources"])
@@ -579,6 +600,140 @@ class Collection:
                                                   value, start, end)
         it = ix["struct"].range_keys(low_key, high_key, inclusive=(True, False))
         return sum(1 for _ in it)
+
+    def _vector_candidates(self, where):
+        """Resolve `where` into (candidate pk iterator, residual predicate).
+
+        Picks the most selective indexed entry of `where` to drive the scan —
+        preferring a many/unique equality (and folding a bound on the many's
+        sort field into the same seek), then a range index — and returns the
+        untouched entries as the residual, applied per-record later.  With no
+        usable index (or a callable where), every pk is a candidate."""
+        if where is None or callable(where):
+            return iter(self._primary.keys()), where
+        residual = dict(where)
+        best = None
+        for idx_name, ix in self._indexes.items():
+            spec = ix["spec"]
+            if ix["field"] not in residual:
+                continue
+            is_range = (isinstance(residual[ix["field"]], tuple)
+                        and len(residual[ix["field"]]) == 2)
+            if spec.kind in ("unique", "many") and not is_range:
+                sort_bounded = (spec.kind == "many" and spec.sort is not None
+                                and isinstance(residual.get(spec.sort), tuple))
+                rank = 3 if sort_bounded else 2
+            elif spec.kind == "range" and is_range:
+                rank = 1
+            else:
+                continue
+            if best is None or rank > best[0]:
+                best = (rank, idx_name)
+        if best is None:
+            return iter(self._primary.keys()), (residual or None)
+
+        ix = self._indexes[best[1]]
+        spec = ix["spec"]
+        if spec.kind == "unique":
+            value = residual.pop(ix["field"])
+            value = self._coerce_field_value(ix["field"], value)
+            entry = ix["struct"].get(self._group_key(ix, value))
+            pks = [str(entry["pk"])] if entry is not None else []
+            return iter(pks), (residual or None)
+        if spec.kind == "many":
+            value = residual.pop(ix["field"])
+            start = end = None
+            if spec.sort is not None and isinstance(residual.get(spec.sort), tuple):
+                start, end = residual.pop(spec.sort)
+            _, low_key, high_key = self._many_bounds(best[1], "nearest",
+                                                     value, start, end)
+            it = ix["struct"].range(low_key, high_key, inclusive=(True, False))
+            return (str(e["pk"]) for _k, e in it), (residual or None)
+        # range index
+        lo, hi = residual.pop(ix["field"])
+        lo = self._coerce_field_value(ix["field"], lo)
+        hi = self._coerce_field_value(ix["field"], hi)
+        start = None if lo is None else encode_value(lo)
+        end = None if hi is None else encode_value(hi) + "\x01"
+        it = ix["struct"].range(start, end, inclusive=(True, False))
+        return (str(e["pk"]) for _k, e in it), (residual or None)
+
+    def nearest(self, index_name, query, k=10, where=None, fields=None,
+                with_scores=False):
+        """Exact vector similarity → the k records closest to ``query``.
+
+        A pre-filtered flat search, not ANN: ``where`` narrows candidates
+        through the collection's regular indexes first (same spec as
+        ``search(where=...)`` — ``{field: value}`` equality, ``{field:
+        (lo, hi)}`` range, or a callable), then only the survivors' vectors
+        are read (a projected row read each — never the full record) and
+        scored exactly with the index's metric.  Full records are
+        materialized for the k winners only.
+
+        Example::
+
+            col.nearest("emb", qvec, k=10)                # whole collection
+            col.nearest("emb", qvec, k=10,
+                        where={"topic": "politics",
+                               "created_at": (date(2026, 1, 1), None)})
+
+        cosine / dot rank descending (higher = closer); l2 ranks ascending
+        and ``with_scores`` returns the actual distance."""
+        vx = self._vector[index_name]
+        vec_field, metric = vx["field"], vx["metric"]
+        q = np.asarray(query, dtype=np.float32).ravel()
+
+        pk_iter, residual = self._vector_candidates(where)
+        pred = self._make_predicate(residual)
+        if callable(residual):
+            read_cols = None                      # predicate needs full records
+        else:
+            read_cols = [vec_field] + [f for f in (residual or {})]
+
+        cand_pks, rows = [], []
+        for pk in pk_iter:
+            rec = (self._primary.get(pk) if read_cols is None
+                   else self._primary.get_fields(pk, read_cols))
+            if rec is None:
+                continue
+            if pred is not None and not pred(rec):
+                continue
+            cand_pks.append(pk)
+            rows.append(rec[vec_field])
+        if not cand_pks:
+            return []
+
+        M = np.stack(rows).astype(np.float32, copy=False)
+        if metric == "cosine":
+            qn = float(np.linalg.norm(q)) or 1.0
+            norms = np.linalg.norm(M, axis=1)
+            norms[norms == 0] = 1.0
+            scores = (M @ q) / (norms * qn)
+            ascending = False
+        elif metric == "dot":
+            scores = M @ q
+            ascending = False
+        else:                                     # l2 → distance, lower wins
+            d = M - q
+            scores = np.sqrt(np.einsum("ij,ij->i", d, d))
+            ascending = True
+
+        kk = min(k, len(cand_pks))
+        key = scores if ascending else -scores
+        top = np.argpartition(key, kk - 1)[:kk]
+        top = top[np.argsort(key[top])]
+
+        out = []
+        for i in top:
+            pk = cand_pks[int(i)]
+            rec = (self._primary.get_fields(pk, fields) if fields is not None
+                   else self._primary.get(pk))
+            if rec is None:
+                continue
+            wrapped = self._wrap(pk, rec)
+            out.append((wrapped, float(scores[int(i)])) if with_scores
+                       else wrapped)
+        return out
 
     def find(self, index_name, value, start=None, end=None, limit=None,
              fields=None):
