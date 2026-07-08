@@ -1543,11 +1543,15 @@ class DB:
             self._rollback_collection(ds_before, struct_before, cfg_key)
             raise
 
-    def drop_collection(self, name):
+    def drop_collection(self, name, _poison_handles=True):
         """Delete a collection and unregister all its internal structures.
 
         Disk space is reclaimed lazily by ``db.vacuum()`` (the arenas are
-        unlinked from the registry, not yet freed)."""
+        unlinked from the registry, not yet freed).  Any caller-held handle
+        to the dropped collection is poisoned: further use raises
+        CollectionDroppedError instead of undefined stale-structure
+        behaviour.  (migrate_collection passes _poison_handles=False — it
+        recreates the collection and re-binds the handles instead.)"""
         if not self._is_open:
             raise DatabaseNotOpenError()
         self._ensure_writable()
@@ -1578,6 +1582,12 @@ class DB:
             self._shared_cache.clear()
         self._save_datastructures_registry()
         self._save_registry()
+        if _poison_handles:
+            from loom.collection import _DroppedCollection
+            for col in list(self._live_collections):
+                if col.name == name and not isinstance(col, _DroppedCollection):
+                    col.__class__ = _DroppedCollection
+                    self._live_collections.discard(col)
 
     def migrate_collection(self, name, new_model, transforms=None, indexes=None,
                            key_size=64, index_key_size=192):
@@ -1635,7 +1645,7 @@ class DB:
                 # else: omitted → dataset writes the field default
             migrated.append(new_rec)
 
-        self.drop_collection(name)
+        self.drop_collection(name, _poison_handles=False)
         col = self.collection(name, new_model, indexes=indexes,
                               key_size=key_size, index_key_size=index_key_size)
         if migrated:

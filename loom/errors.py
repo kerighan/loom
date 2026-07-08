@@ -62,6 +62,24 @@ class DuplicateNameError(DatabaseError):
         self.kind = kind
 
 
+class CollectionDroppedError(DatabaseError):
+    """This Collection handle refers to a collection that was dropped.
+
+    Raised on ANY use of a handle after ``db.drop_collection(name)`` — a
+    clear failure instead of the undefined behaviour of stale structures.
+    (Handles held across ``vacuum()``/``migrate_collection`` are re-bound
+    in place and keep working; a *dropped* collection has nothing to
+    re-bind to.)
+    """
+
+    def __init__(self, name: str):
+        super().__init__(
+            f"collection '{name}' was dropped — this handle is no longer "
+            f"usable (re-create the collection and fetch a new handle)"
+        )
+        self.name = name
+
+
 class StructureNotFoundError(DatabaseError, KeyError):
     """No dataset or data structure with the requested name.
 

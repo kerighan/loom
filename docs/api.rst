@@ -17,8 +17,8 @@ Collection
 
 .. autoclass:: loom.Collection
    :members: insert, insert_many, update, delete, increment, get, find, range,
-             count, groups, nearest, search, sample, describe, get_primary,
-             reindex, keys, values, items, index_names
+             count, groups, latest, first, nearest, search, sample, describe,
+             get_primary, reindex, keys, values, items, index_names
 
 Index specs
 ~~~~~~~~~~~

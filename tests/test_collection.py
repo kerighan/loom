@@ -149,6 +149,52 @@ class TestProjection:
             posts.find("username", "alice", fields=["nope"])
 
 
+class TestLatestFirst:
+    def test_latest_and_first(self, db):
+        posts = seed(make_posts(db))
+        assert posts.latest("engagement")["id"] == "p4"     # 1200
+        assert posts.first("engagement")["id"] == "p1"      # 5
+        assert posts.latest("engagement", fields=["id"]) == {"id": "p4"}
+
+    def test_empty_collection_returns_none(self, db):
+        posts = make_posts(db)
+        assert posts.latest("engagement") is None
+        assert posts.first("engagement") is None
+
+    def test_requires_range_index(self, db):
+        posts = seed(make_posts(db))
+        with pytest.raises(ValueError):
+            posts.latest("username")
+
+
+class TestDropPoison:
+    def test_dropped_handle_raises_clearly(self, db):
+        from loom import CollectionDroppedError
+        posts = seed(make_posts(db))
+        db.drop_collection("posts")
+        for use in (lambda: posts["p1"], lambda: len(posts),
+                    lambda: posts.find("username", "alice"),
+                    lambda: posts.insert({"id": "x"}),
+                    lambda: "p1" in posts,
+                    lambda: list(posts)):
+            with pytest.raises(CollectionDroppedError, match="'posts' was dropped"):
+                use()
+
+    def test_recreated_collection_needs_fresh_handle(self, db):
+        from loom import CollectionDroppedError
+        posts = seed(make_posts(db))
+        db.drop_collection("posts")
+        fresh = seed(make_posts(db))            # same name, new collection
+        with pytest.raises(CollectionDroppedError):
+            posts["p1"]                          # old handle stays poisoned
+        assert fresh["p1"]["username"] == "alice"
+
+    def test_migrate_does_not_poison(self, db):
+        posts = seed(make_posts(db))
+        db.migrate_collection("posts", SCHEMA)
+        assert posts["p1"]["username"] == "alice"   # re-bound, not poisoned
+
+
 class TestCounted:
     def make(self, db):
         col = db.collection("posts", {"id": "utf8[16]", "grp": "utf8[16]",

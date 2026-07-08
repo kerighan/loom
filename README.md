@@ -472,6 +472,8 @@ posts["p1"]                                    # by primary key
 posts.find("username", "alice", limit=20)      # alice's 20 most-recent posts
 posts.range("engagement", 1000, None)          # engagement >= 1000, ascending
 posts.range("created_at", limit=50, desc=True) # 50 most recent — no grouping needed
+posts.latest("created_at")                     # the single most recent record (or None)
+posts.first("created_at")                      # the oldest
 posts.count("username", "alice")               # group size — key-only scan,
 posts.count("username", "alice", start=T)      # never reads a record
 posts.find("username", "alice",

@@ -42,11 +42,6 @@ would close this — significant plumbing, evaluate against real incident rate
 
 ### 5. Quality-of-life, small
 
-- `col.latest(index)` / `col.first(index)` → the record directly (sugar over
-  `range(..., limit=1, desc=True)`).
-- Poison Collection handles after `drop_collection()` — a clear "collection
-  was dropped" error instead of undefined stale-handle behaviour
-  (vacuum/migrate handles are already re-bound in place).
 - Windows: `msvcrt.locking` fallback for `multiprocess_safe=True` (fcntl is
   Linux/Mac only) — only if a Windows deployment ever materialises.
 
@@ -111,3 +106,6 @@ would close this — significant plumbing, evaluate against real incident rate
 - **2026-07-08 — Counted group indexes**: `Many(counted=True)` maintains a
   companion group→count Dict; `count()` O(1), `groups()` lists all groups by
   volume with zero record reads. Opt-in; windowed counts keep the key scan.
+- **2026-07-08 — QoL**: `col.latest(index)` / `col.first(index)` (the record
+  directly, or None); dropped-collection handles are poisoned — any use
+  raises `CollectionDroppedError` instead of undefined stale behaviour.

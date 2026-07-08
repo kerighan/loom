@@ -44,6 +44,7 @@ import mmh3
 import numpy as np
 
 from loom.dataset import as_record
+from loom.errors import CollectionDroppedError
 
 
 def _hash_value(value):
@@ -881,6 +882,20 @@ class Collection:
         it = ix["struct"].range(start, end, inclusive=(True, False), reverse=desc)
         return self._collect(it, limit, fields)
 
+    def latest(self, index_name, fields=None):
+        """The record with the **highest** value of a 'range' index — e.g.
+        the most recent report of a ``created_at`` index — or None if the
+        collection is empty.  Sugar over ``range(..., limit=1, desc=True)``
+        that returns the record directly instead of a one-element list."""
+        hits = self.range(index_name, limit=1, desc=True, fields=fields)
+        return hits[0] if hits else None
+
+    def first(self, index_name, fields=None):
+        """The record with the **lowest** value of a 'range' index (the
+        oldest, the cheapest, ...) — or None if the collection is empty."""
+        hits = self.range(index_name, limit=1, desc=False, fields=fields)
+        return hits[0] if hits else None
+
     def search(self, index_name, query, where=None, mode=None, limit=None,
                with_scores=False):
         """Full-text search on a 'search' index → matching records.
@@ -1036,6 +1051,43 @@ class Collection:
         kinds = {n: ix["spec"].kind for n, ix in self._indexes.items()}
         return (f"Collection('{self.name}', key='{self._key_field}', "
                 f"indexes={kinds}, n={len(self)})")
+
+
+class _DroppedCollection:
+    """Poison class for Collection handles whose collection was dropped.
+
+    ``drop_collection`` swaps the handle's ``__class__`` to this: every
+    method lookup (and the container dunders, which bypass __getattr__)
+    raises CollectionDroppedError instead of the undefined behaviour of
+    stale structures.  The instance __dict__ keeps ``name`` for the message.
+    """
+
+    def _raise(self):
+        raise CollectionDroppedError(self.__dict__.get("name", "?"))
+
+    def __getattr__(self, attr):
+        self._raise()
+
+    def __getitem__(self, key):
+        self._raise()
+
+    def __setitem__(self, key, value):
+        self._raise()
+
+    def __delitem__(self, key):
+        self._raise()
+
+    def __contains__(self, key):
+        self._raise()
+
+    def __len__(self):
+        self._raise()
+
+    def __iter__(self):
+        self._raise()
+
+    def __repr__(self):
+        return f"<dropped Collection {self.__dict__.get('name', '?')!r}>"
 
 
 class Record(dict):
