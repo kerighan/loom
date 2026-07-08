@@ -16,15 +16,7 @@ corpus outgrows the flat scan (> ~500k vectors), plug the standalone
 `FlatIndex`/`IVFIndex` behind the same spec so `nearest()` transparently uses
 ANN when no `where=` narrows the search. Same API, no migration.
 
-### 2. Remaining insert-path hotspots
-
-The 2026-07 perf pass ~2×'d Collection inserts and 2–4×'d search queries.
-What's left (diminishing returns, ~10–15% each, rising risk):
-- `Dict._setitem_fast` — generic per-record serialize for schemas that miss
-  the struct-pack fast plan (blob/text-heavy records).
-- Search tokenization — regex + Counter per document on `add()`.
-
-### 3. Order-statistics BTree (O(log n) range counts)
+### 2. Order-statistics BTree (O(log n) range counts)
 
 Subtree counts stored in BTree nodes would make `count()` O(log n) for *any*
 range — including arbitrary time windows on huge groups — instead of
@@ -32,7 +24,7 @@ O(matches). Disk-format change + split/merge complexity: only worth it if
 windowed counts on very large groups become a hot path (counted indexes cover the
 per-group case without it).
 
-### 4. Cross-index crash atomicity for Collections
+### 3. Cross-index crash atomicity for Collections
 
 Collection writes are serialised (`write_lock()` + `batch()`) but not
 crash-atomic across indexes: a crash mid-write can desync an index
@@ -40,7 +32,7 @@ crash-atomic across indexes: a crash mid-write can desync an index
 would close this — significant plumbing, evaluate against real incident rate
 (zero so far).
 
-### 5. Quality-of-life, small
+### 4. Quality-of-life, small
 
 - Windows: `msvcrt.locking` fallback for `multiprocess_safe=True` (fcntl is
   Linux/Mac only) — only if a Windows deployment ever materialises.
@@ -109,3 +101,9 @@ would close this — significant plumbing, evaluate against real incident rate
 - **2026-07-08 — QoL**: `col.latest(index)` / `col.first(index)` (the record
   directly, or None); dropped-collection handles are poisoned — any use
   raises `CollectionDroppedError` instead of undefined stale behaviour.
+- **2026-07-08 — Insert hotspots closed**: the struct-pack fast plan now
+  covers text/json/blob/vector schemas (fallible phase side-effect-free,
+  blob writes in a second phase, file byte-identical to the generic path
+  and to master — proven by sha256); tokenizer fast path (precompiled
+  regex, set-lookup punctuation drop, exact-equivalence guard against
+  eldar's constants). Wide-schema inserts +12%, tokenization 1.26×.

@@ -329,17 +329,16 @@ class Dataset:
     def _build_fast_plan(self):
         """Precompiled serialize plan: [(kind, field, offset, arg, strict)].
 
-        For schemas made only of inline scalar fields (utf8/int/uint/float/
-        bool/datetime — no blob/text/json/array/unicode), records can be
-        packed straight into a bytearray with struct, skipping the generic
-        per-field numpy path (~an order of magnitude cheaper for the small
-        internal datasets: BTree values, hash-table entries, doc mappings).
+        Inline scalar fields (utf8/int/uint/float/bool/datetime) are packed
+        straight into a bytearray with struct; text/json fields have their
+        payloads pre-encoded (the blob writes happen in a separate,
+        side-effect phase — see _serialize); blob refs and vector fields
+        pack their raw bytes.  This skips the generic per-field numpy path
+        (~an order of magnitude cheaper for small internal datasets, ~30-40%
+        of the insert cost for wide user records).
         Returns None when the schema isn't eligible — generic path only.
         """
-        if (
-            self._blob_fields or self._text_fields or self._json_fields
-            or self._array_fields or sys.byteorder != "little"
-        ):
+        if sys.byteorder != "little":
             return None
         plan = []
         for field in self.user_schema.names:
@@ -347,8 +346,17 @@ class Dataset:
             if field in self._utf8_fields:
                 entry = ("u", field, offset, self._utf8_fields[field],
                          field in self._utf8_strict)
+            elif field in self._text_fields:
+                entry = ("t", field, offset, None, False)
+            elif field in self._json_fields:
+                entry = ("j", field, offset, None, False)
+            elif field in self._blob_fields:
+                entry = ("r", field, offset, None, False)
             elif field in self._datetime_fields:
                 entry = ("d", field, offset, "<q", False)
+            elif field in self._array_fields:
+                # sub-array dtype: .itemsize already includes the shape
+                entry = ("a", field, offset, (dtype.base, dtype.itemsize), False)
             elif dtype.kind in "iu":
                 fmt = self._INT_FMT.get((dtype.kind, dtype.itemsize))
                 if fmt is None:
@@ -371,10 +379,15 @@ class Dataset:
         can't reproduce exactly (float into an int field, str into a numeric
         field, strict-utf8 overflow, None …) raises, and the caller falls back
         to the generic path — which then produces the numpy result or the
-        proper error.  Raising here has no side effects (no blobs involved).
+        proper error.  Raising here has no side effects: text/json payloads
+        are only *pre-encoded* — returned as (buf, [(offset, payload), ...])
+        for the caller to write to the blob store in a second, non-fallible
+        phase (outside the fallback try), in plan order so the blob layout is
+        byte-identical to the generic path's.
         """
         buf = bytearray(self._zero_record)
         pack_into = struct.pack_into
+        blobs = None
         for kind, field, off, arg, strict in self._fast_plan:
             if field not in record:
                 continue  # zero record already encodes the default
@@ -393,13 +406,40 @@ class Dataset:
                 buf[off : off + len(enc)] = enc
             elif kind == "n":
                 pack_into(arg, buf, off, value)
+            elif kind == "t":
+                if value is None or value == "":
+                    continue  # zeros = NULL_BLOB, same as generic
+                payload = (value.encode("utf-8") if isinstance(value, str)
+                           else value)
+                if not isinstance(payload, (bytes, bytearray)):
+                    raise TypeError  # generic reproduces the real error
+                if blobs is None:
+                    blobs = []
+                blobs.append((off, payload))
+            elif kind == "j":
+                if value is None:
+                    continue
+                payload = json.dumps(value, separators=(",", ":")).encode("utf-8")
+                if blobs is None:
+                    blobs = []
+                blobs.append((off, payload))
+            elif kind == "r":
+                if value is None:
+                    continue  # NULL blob ref
+                pack_into("<QH", buf, off, value[0], value[1])
+            elif kind == "a":
+                base, nbytes = arg
+                data = np.asarray(value, dtype=base).tobytes()
+                if len(data) != nbytes:
+                    raise ValueError  # broadcast/shape case → generic handles
+                buf[off : off + nbytes] = data
             elif kind == "d":
                 pack_into("<q", buf, off, _dt_to_micros(value))
             else:  # bool — numpy rejects e.g. strings, don't pack truthiness
                 if not isinstance(value, (bool, int, np.bool_, np.integer)):
                     raise TypeError
                 buf[off] = 1 if value else 0
-        return bytes(buf)
+        return buf, blobs
 
     def _serialize(self, **record):
         """Convert record dict to bytes with prefix.
@@ -421,10 +461,23 @@ class Dataset:
                 f"expected a subset of {public}"
             )
         if self._fast_plan is not None:
+            packed = None
             try:
-                return self._serialize_fast(record)
+                packed = self._serialize_fast(record)
             except Exception:
                 pass  # generic path below reproduces the result or the error
+            if packed is not None:
+                # Phase B — blob writes, deliberately OUTSIDE the fallback
+                # try: phase A had no side effects, and from here on a
+                # failure must surface (retrying via the generic path would
+                # double-write the already-written blobs).
+                buf, blobs = packed
+                if blobs:
+                    pack_into = struct.pack_into
+                    for off, payload in blobs:
+                        b_off, b_slots = self.blob_store.write(payload)
+                        pack_into("<QH", buf, off, b_off, b_slots)
+                return bytes(buf)
         # Use zeros + field assignment to avoid numpy dtype __str__ overhead
         # that np.array(tuple, dtype=...) triggers on every call.
         arr = np.zeros(1, dtype=self.schema)

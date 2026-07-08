@@ -75,6 +75,28 @@ def _fold_accents(text):
     return text.translate(_UNIDECODE_TABLE)
 
 
+# Tokenizer kit, built lazily at first use (keeps eldar off the import path):
+# precompiled WORD_REGEX + PUNCTUATION set/table + the fast-path invariant
+# check ('_' is the only word char in PUNCTUATION — see SearchIndex._tokens).
+_TOKEN_KIT = None
+
+
+def _token_kit():
+    global _TOKEN_KIT
+    if _TOKEN_KIT is None:
+        from eldar.regex import WORD_REGEX
+        from eldar.index import PUNCTUATION
+
+        word_chars = [c for c in PUNCTUATION if re.match(r"\w", c, re.UNICODE)]
+        _TOKEN_KIT = (
+            re.compile(WORD_REGEX, re.UNICODE),
+            frozenset(PUNCTUATION),
+            str.maketrans("", "", PUNCTUATION),
+            word_chars == ["_"],
+        )
+    return _TOKEN_KIT
+
+
 # ── varint (LEB128, unsigned) ─────────────────────────────────────────────────
 
 
@@ -303,18 +325,32 @@ class SearchIndex(DataStructure):
             text = _fold_accents(text)
         return text
 
-    _PUNCT_TABLE = None  # class-level cache: str.maketrans is not free
-
     def _tokens(self, text):
-        from eldar.regex import WORD_REGEX
-        from eldar.index import PUNCTUATION
-
-        toks = re.findall(WORD_REGEX, self._normalise(text), re.UNICODE)
-        if self.ignore_punctuation:
-            if SearchIndex._PUNCT_TABLE is None:
-                SearchIndex._PUNCT_TABLE = str.maketrans("", "", PUNCTUATION)
-            toks = [t.translate(SearchIndex._PUNCT_TABLE) for t in toks]
-        return [t for t in toks if t]
+        """Tokenize exactly like eldar: WORD_REGEX findall, then (with
+        ignore_punctuation) strip PUNCTUATION chars from every token and drop
+        the empties.  The hot path below avoids the per-token translate()
+        call: single punctuation tokens are dropped by a set lookup, and '_'
+        is the only PUNCTUATION char that can appear INSIDE a \\w+ token, so
+        translate() is only needed for tokens that contain it — verified
+        against eldar's constant at first use (_punct_fast_ok), with the
+        literal legacy loop as fallback if that invariant ever breaks."""
+        word_re, punct_set, punct_table, fast_ok = _token_kit()
+        toks = word_re.findall(self._normalise(text))
+        if not self.ignore_punctuation:
+            return [t for t in toks if t]
+        if not fast_ok:   # eldar changed PUNCTUATION — exact legacy behaviour
+            toks = [t.translate(punct_table) for t in toks]
+            return [t for t in toks if t]
+        out = []
+        for t in toks:
+            if t in punct_set:          # single punctuation token → dropped
+                continue
+            if "_" in t:                # only word char PUNCTUATION can strip
+                t = t.translate(punct_table)
+                if not t:
+                    continue
+            out.append(t)
+        return out
 
     def _doc_text(self, record):
         return " ".join(str(record.get(f, "")) for f in self._text_fields)
