@@ -1462,7 +1462,8 @@ class DB:
             if k == "range":
                 return Range()
             if k == "many":
-                return Many(sort=ic.get("sort"), desc=ic.get("desc", False))
+                return Many(sort=ic.get("sort"), desc=ic.get("desc", False),
+                            counted=ic.get("counted", False))
             return Primary()
 
         def _build_index_objs(cfg):
@@ -1478,6 +1479,8 @@ class DB:
                     "struct": self._datastructures[ic["struct"]],
                     "sources": sources,
                     "hashed": ic.get("hashed", False),
+                    "counter": (self._datastructures[ic["counter"]]
+                                if ic.get("counted") else None),
                 }
             return objs
 
@@ -1654,7 +1657,8 @@ class DB:
                 indexes[idx_name] = Range(field=fld)
             else:
                 indexes[idx_name] = Many(sort=ic.get("sort"),
-                                         desc=ic.get("desc", False), field=fld)
+                                         desc=ic.get("desc", False), field=fld,
+                                         counted=ic.get("counted", False))
         for field, sc in cfg.get("search", {}).items():
             si = col._search[field]["index"]
             indexes[field] = Search(fields=sc["fields"], scoring=si._scoring,
@@ -1962,6 +1966,19 @@ class DB:
                 struct = self.create_btree(
                     f"{name}__bt_{idx_name}", ix_ds, key_size=index_key_size
                 )
+            counter = None
+            if spec.kind == "many" and getattr(spec, "counted", False):
+                if field in dataset._datetime_fields:
+                    raise ValueError(
+                        f"collection {name!r}: counted index {idx_name!r} needs "
+                        f"a json-serializable group field, not datetime {field!r}"
+                    )
+                cnt_ds = self.create_dataset(f"{name}__cnt_{idx_name}",
+                                             value="json", n="int64")
+                counter = self.create_dict(
+                    f"{name}__cnt_{idx_name}__d", cnt_ds,
+                    key_size=index_key_size, max_key_len=index_key_size,
+                )
             sources = [field]
             if spec.kind == "many" and spec.sort is not None:
                 sources.append(spec.sort)
@@ -1969,6 +1986,7 @@ class DB:
                 "name": idx_name, "spec": spec, "field": field,
                 "struct": struct, "sources": sources,
                 "hashed": hashed_index[idx_name],
+                "counter": counter,
             }
             cfg_indexes[idx_name] = {
                 "kind": spec.kind, "field": field,
@@ -1976,6 +1994,8 @@ class DB:
                 "desc": getattr(spec, "desc", False),
                 "struct": struct.name,
                 "hashed": hashed_index[idx_name],
+                "counted": counter is not None,
+                "counter": counter.name if counter is not None else None,
             }
 
         # Full-text (search) indexes: a doc-store-less SearchIndex (postings +

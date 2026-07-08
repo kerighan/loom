@@ -8,26 +8,7 @@ shared backlog.
 
 ## Open
 
-### 1. Counted group indexes — `Many(counted=True)` + `col.groups()`
-
-`count(index, value)` (done) is a key-only scan: O(matches). For dashboards
-that repeatedly ask "how many per group" or "all groups ordered by volume"
-(e.g. narratives by post count), maintain a companion Dict `group → count`
-updated on insert/update/delete:
-
-```python
-posts = db.collection("posts", Post, indexes={
-    "id":        "primary",
-    "narrative": Many(sort="created_at", desc=True, counted=True),
-})
-posts.count("narrative", "ukraine")                     # O(1)
-posts.groups("narrative", order_by="count", desc=True)  # all groups + sizes, no data load
-```
-
-Opt-in (each counted index costs one Dict read-modify-write per insert,
-~10–20 µs). Activating `counted` on an existing index needs a backfill scan.
-
-### 2. ANN behind the `Vector` spec
+### 1. ANN behind the `Vector` spec
 
 `Vector()` + `nearest()` (done) is exact, pre-filtered flat search — the
 right tool while candidates are bounded by a filter. If an **unfiltered**
@@ -35,7 +16,7 @@ corpus outgrows the flat scan (> ~500k vectors), plug the standalone
 `FlatIndex`/`IVFIndex` behind the same spec so `nearest()` transparently uses
 ANN when no `where=` narrows the search. Same API, no migration.
 
-### 3. Remaining insert-path hotspots
+### 2. Remaining insert-path hotspots
 
 The 2026-07 perf pass ~2×'d Collection inserts and 2–4×'d search queries.
 What's left (diminishing returns, ~10–15% each, rising risk):
@@ -43,15 +24,15 @@ What's left (diminishing returns, ~10–15% each, rising risk):
   the struct-pack fast plan (blob/text-heavy records).
 - Search tokenization — regex + Counter per document on `add()`.
 
-### 4. Order-statistics BTree (O(log n) range counts)
+### 3. Order-statistics BTree (O(log n) range counts)
 
 Subtree counts stored in BTree nodes would make `count()` O(log n) for *any*
 range — including arbitrary time windows on huge groups — instead of
 O(matches). Disk-format change + split/merge complexity: only worth it if
-windowed counts on very large groups become a hot path (item 1 covers the
+windowed counts on very large groups become a hot path (counted indexes cover the
 per-group case without it).
 
-### 5. Cross-index crash atomicity for Collections
+### 4. Cross-index crash atomicity for Collections
 
 Collection writes are serialised (`write_lock()` + `batch()`) but not
 crash-atomic across indexes: a crash mid-write can desync an index
@@ -59,7 +40,7 @@ crash-atomic across indexes: a crash mid-write can desync an index
 would close this — significant plumbing, evaluate against real incident rate
 (zero so far).
 
-### 6. Quality-of-life, small
+### 5. Quality-of-life, small
 
 - `col.latest(index)` / `col.first(index)` → the record directly (sugar over
   `range(..., limit=1, desc=True)`).
@@ -123,3 +104,10 @@ would close this — significant plumbing, evaluate against real incident rate
   store + filtered-vector-search tutorials; README refresh.
 - **2026-07-08 — Handle re-binding**: caller-held Collection handles survive
   `vacuum()`/`migrate_collection` (weak registry, in-place re-bind).
+- **2026-07-08 — Fuzz harness** (`tests/test_fuzz_collection.py`): thousands
+  of random ops vs an in-memory model across every index kind, vacuum/
+  migrate/reopen interleaved; first soak caught and fixed the dataset-
+  identifier leak that let ~15 migrations brick a file.
+- **2026-07-08 — Counted group indexes**: `Many(counted=True)` maintains a
+  companion group→count Dict; `count()` O(1), `groups()` lists all groups by
+  volume with zero record reads. Opt-in; windowed counts keep the key scan.

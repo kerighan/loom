@@ -42,7 +42,7 @@ SCHEMA = {
 
 INDEXES = {
     "id":    "primary",
-    "grp":   Many(sort="score", desc=True),
+    "grp":   Many(sort="score", desc=True, counted=True),
     "score": "range",
     "email": "unique",
     "body":  Search(fields=["body"], scoring="bm25"),
@@ -151,10 +151,21 @@ def _check_nearest(col, model, rng, where_grp=None):
         assert score == pytest.approx(bscore, abs=1e-4)             # is k-best
 
 
+def _check_groups(col, model):
+    from collections import Counter
+    expected = Counter(r["grp"] for r in model.values())
+    got = dict(col.groups("grp"))
+    assert got == dict(expected), f"groups: {got} != {dict(expected)}"
+    ranked = col.groups("grp", order_by="count", desc=True)
+    counts = [n for _g, n in ranked]
+    assert counts == sorted(counts, reverse=True)
+
+
 def _full_check(db, col, model, rng):
     assert len(col) == len(model)
     for pk, want in model.items():
         _assert_record(col.get_primary(pk), want, pk)
+    _check_groups(col, model)
     for g in range(8):
         _check_find_count(col, model, np.random.default_rng(g))
     _check_range(col, model, rng)

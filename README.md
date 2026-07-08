@@ -536,6 +536,24 @@ posts.delete("p1")                             # removed from every index
   `range(..., fields=[...])` materialize only the requested fields: one row
   read per hit, and unrequested `text`/`json` fields never touch the blob
   store.
+- **Maintained group counters.** `Many(..., counted=True)` keeps a companion
+  `group → count` Dict in sync on every write: `count()` becomes **O(1)**
+  (~7 µs) and `groups()` lists every group with its size without touching a
+  single record — "all narratives ordered by post volume" is one call:
+
+  ```python
+  posts = db.collection("posts", Post, indexes={
+      "id":        "primary",
+      "narrative": Many(sort="created_at", desc=True, counted=True),
+  })
+  posts.count("narrative", "ukraine")          # O(1)
+  posts.groups("narrative")                    # [(value, count), ...] biggest first
+  posts.groups("narrative", order_by="value", desc=False, limit=50)
+  ```
+
+  Opt-in: the counter costs one extra field write per insert (~10–20% on a
+  minimal 3-field schema, a few % on a realistic wide one). Windowed counts
+  (`start=`/`end=`) still use the key-only scan.
 - **Vector similarity — pre-filtered, exact.** `Vector(metric="cosine"|"l2"|"dot")`
   on an inline `Vec(N)` field costs *nothing on write* (no backing structure —
   the vector lives in the record). `nearest()` narrows candidates through the

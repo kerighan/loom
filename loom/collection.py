@@ -116,12 +116,16 @@ class Range:
 class Many:
     kind = "many"
 
-    def __init__(self, sort=None, desc=False, field=None):
+    def __init__(self, sort=None, desc=False, field=None, counted=False):
         self.sort = sort
         self.desc = desc
         # field defaults to the index name — set it to index the SAME field
         # under several indexes (e.g. category by engagement AND by date).
         self.field = field
+        # counted=True maintains a companion group→count Dict on every write
+        # (~one field write per insert): count() becomes O(1) and groups()
+        # lists every group with its size without touching the data.
+        self.counted = counted
 
 
 class Search:
@@ -271,6 +275,29 @@ class Collection:
 
     # ── writes ────────────────────────────────────────────────────────────
 
+    def _count_add_key(self, ix, group_key, value, delta):
+        """Adjust a counted index's group counter by delta (create at first
+        member, drop at zero).  The count update is an in-place field write —
+        the stored group value (json) is only written once per group."""
+        cnt = ix["counter"]
+        cur = cnt.get_fields(group_key, ["n"])
+        if cur is None:
+            if delta > 0:
+                if isinstance(value, np.generic):
+                    value = value.item()
+                cnt[group_key] = {"value": value, "n": delta}
+            return
+        n = int(cur["n"]) + delta
+        if n <= 0:
+            del cnt[group_key]
+        else:
+            cnt[group_key, "n"] = n
+
+    def _count_add(self, ix, value, delta):
+        if ix.get("counter") is None or value is None:
+            return
+        self._count_add_key(ix, self._group_key(ix, value), value, delta)
+
     def _add_to_indexes(self, record, pk):
         for ix in self._indexes.values():
             key = self._index_key(ix, record, pk)
@@ -284,12 +311,16 @@ class Collection:
                         f"{record.get(ix['field'])!r}"
                     )
             ix["struct"][key] = {"pk": pk}
+            if ix.get("counter") is not None:
+                self._count_add(ix, record.get(ix["field"]), +1)
 
     def _remove_from_indexes(self, record, pk):
         for ix in self._indexes.values():
             key = self._index_key(ix, record, pk)
             if key is not None and key in ix["struct"]:
                 del ix["struct"][key]
+                if ix.get("counter") is not None:
+                    self._count_add(ix, record.get(ix["field"]), -1)
 
     def _add_to_search(self, record, pk):
         for si in self._search.values():
@@ -398,6 +429,18 @@ class Collection:
                         else:
                             for key, val in entries:
                                 struct[key] = val
+                    if ix.get("counter") is not None:
+                        # one counter write per group, not per record
+                        deltas, values = {}, {}
+                        for record in records:
+                            v = record.get(ix["field"])
+                            if v is None:
+                                continue
+                            gk = self._group_key(ix, v)
+                            deltas[gk] = deltas.get(gk, 0) + 1
+                            values[gk] = v
+                        for gk, d in deltas.items():
+                            self._count_add_key(ix, gk, values[gk], d)
         return pks
 
     def update(self, pk, **changes):
@@ -427,6 +470,11 @@ class Collection:
                                     f"duplicate value for unique index {ix['name']!r}"
                                 )
                         ix["struct"][new_key] = {"pk": pk}
+                    if ix.get("counter") is not None:
+                        ov, nv = old.get(ix["field"]), new.get(ix["field"])
+                        if ov != nv:      # sort-only change keeps the group
+                            self._count_add(ix, ov, -1)
+                            self._count_add(ix, nv, +1)
                 # Re-index full-text fields that changed (delete old doc, add new).
                 if self._search and any(f in changes for f in self._search_fields):
                     for si in self._search.values():
@@ -478,6 +526,12 @@ class Collection:
         """Rebuild every secondary index from the primary store (O(n))."""
         with self._db.write_lock():
             with self._db.batch():
+                # counters rebuild from scratch (adds below re-count each record)
+                for ix in self._indexes.values():
+                    cnt = ix.get("counter")
+                    if cnt is not None:
+                        for gk in list(cnt.keys()):
+                            del cnt[gk]
                 for pk, record in self._primary.items():
                     self._add_to_indexes(record, str(pk))
 
@@ -587,19 +641,49 @@ class Collection:
         return ix, low_key, high_key
 
     def count(self, index_name, value, start=None, end=None):
-        """Number of records in group ``value`` of a 'many' index — a
-        key-only scan that never reads index values or primary records.
+        """Number of records in group ``value`` of a 'many' index.
 
-        ``start``/``end`` bound the index's sort field exactly like find(),
-        so a Many(sort="created_at") index also counts time windows:
+        On a ``Many(counted=True)`` index the unwindowed count is **O(1)**
+        (read from the maintained group counter).  Otherwise — or when
+        ``start``/``end`` bound the sort field — it is a key-only scan that
+        never reads index values or primary records:
 
             col.count("narrative", "ukraine", start=date(2026, 6, 1))
 
         O(log n + matches) with only the key walk paid per match."""
+        if start is None and end is None:
+            ix = self._indexes[index_name]
+            if ix["spec"].kind == "many" and ix.get("counter") is not None:
+                value = self._coerce_field_value(ix["field"], value)
+                rec = ix["counter"].get_fields(self._group_key(ix, value), ["n"])
+                return int(rec["n"]) if rec is not None else 0
         ix, low_key, high_key = self._many_bounds(index_name, "count",
                                                   value, start, end)
         it = ix["struct"].range_keys(low_key, high_key, inclusive=(True, False))
         return sum(1 for _ in it)
+
+    def groups(self, index_name, order_by="count", desc=True, limit=None):
+        """All groups of a ``Many(counted=True)`` index with their sizes —
+        ``[(value, count), ...]`` — read from the maintained counters, without
+        touching a single record.
+
+            col.groups("narrative")                       # biggest first
+            col.groups("narrative", order_by="value", desc=False)
+
+        ``order_by`` is "count" or "value"."""
+        ix = self._indexes[index_name]
+        if ix["spec"].kind != "many" or ix.get("counter") is None:
+            raise ValueError(
+                f"groups() needs a Many(counted=True) index for {index_name!r}"
+            )
+        out = [(rec["value"], int(rec["n"])) for _k, rec in ix["counter"].items()]
+        if order_by == "count":
+            out.sort(key=lambda t: (t[1], str(t[0])), reverse=desc)
+        elif order_by == "value":
+            out.sort(key=lambda t: t[0], reverse=desc)
+        else:
+            raise ValueError("order_by must be 'count' or 'value'")
+        return out[:limit] if limit is not None else out
 
     def _vector_candidates(self, where):
         """Resolve `where` into (candidate pk iterator, residual predicate).

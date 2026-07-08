@@ -149,6 +149,61 @@ class TestProjection:
             posts.find("username", "alice", fields=["nope"])
 
 
+class TestCounted:
+    def make(self, db):
+        col = db.collection("posts", {"id": "utf8[16]", "grp": "utf8[16]",
+                                      "ts": "int64"},
+                            indexes={"id": "primary",
+                                     "grp": Many(sort="ts", desc=True,
+                                                 counted=True)})
+        col.insert_many([{"id": f"p{i}", "grp": ("a" if i % 3 else "b"),
+                          "ts": i} for i in range(12)])
+        return col
+
+    def test_count_is_maintained(self, db):
+        col = self.make(db)
+        assert col.count("grp", "a") == 8
+        assert col.count("grp", "b") == 4
+        assert col.count("grp", "ghost") == 0
+        col.delete("p1")                               # a: 8→7
+        col.insert({"id": "p0", "grp": "a", "ts": 99})  # upsert b→a: a 8, b 3
+        col.update("p2", grp="b")                       # a→b: a 7, b 4
+        col.update("p4", ts=1000)                       # sort-only: no change
+        assert col.count("grp", "a") == 7
+        assert col.count("grp", "b") == 4
+        assert col.count("grp", "a") == len(col.find("grp", "a"))   # vs ground truth
+        assert col.count("grp", "b") == len(col.find("grp", "b"))
+        # windowed counts still work (fallback to the key scan)
+        assert col.count("grp", "a", start=6) == len(col.find("grp", "a", start=6))
+
+    def test_groups(self, db):
+        col = self.make(db)
+        assert col.groups("grp") == [("a", 8), ("b", 4)]
+        assert col.groups("grp", order_by="value", desc=False) == [("a", 8), ("b", 4)]
+        assert col.groups("grp", limit=1) == [("a", 8)]
+        for r in col.find("grp", "b"):
+            col.delete(r["id"])
+        assert col.groups("grp") == [("a", 8)]         # empty group dropped
+
+    def test_groups_requires_counted(self, db):
+        posts = seed(make_posts(db))
+        with pytest.raises(ValueError, match="counted"):
+            posts.groups("username")
+
+    def test_counted_survives_reopen_vacuum_migrate(self, db):
+        col = self.make(db)
+        db.vacuum()
+        assert col.count("grp", "a") == 8              # re-bound handle, rebuilt counters
+        db.migrate_collection("posts", {"id": "utf8[16]", "grp": "utf8[16]",
+                                        "ts": "int64"})
+        assert col.groups("grp") == [("a", 8), ("b", 4)]
+
+    def test_reindex_rebuilds_counters(self, db):
+        col = self.make(db)
+        col.reindex()
+        assert col.groups("grp") == [("a", 8), ("b", 4)]
+
+
 class TestCount:
     def test_count_per_group(self, db):
         posts = seed(make_posts(db))
