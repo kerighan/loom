@@ -74,6 +74,7 @@ class DB:
     REGISTRY_KEY = "_dataset_registry"
     DATASTRUCTURES_REGISTRY_KEY = "_datastructures_registry"
     NEXT_ID_KEY = "_next_identifier"
+    FREE_IDS_KEY = "_free_dataset_ids"
     BLOB_COMPRESSION_KEY = "_blob_compression"
 
     def __init__(
@@ -384,8 +385,21 @@ class DB:
         self._db.set_header_field(self.DATASTRUCTURES_REGISTRY_KEY, ds_registry)
 
     def _get_next_identifier(self):
-        """Get next available identifier and increment."""
+        """Get the next available dataset identifier (int8 record prefix).
+
+        Identifiers freed by drop_collection are recycled from a persisted
+        pool before the monotonic counter advances — without this, every
+        migrate_collection (drop + recreate ≈ 8 datasets) leaked ~8 of the
+        127 identifiers and a few migrations permanently bricked the file.
+        Reuse is safe: a dropped collection's arenas are orphaned (never in
+        the freelist), so a new dataset with a recycled prefix can't be
+        pointed into them."""
         self._ensure_writable()
+        pool = self._db.get_header_field(self.FREE_IDS_KEY, None) or []
+        if pool:
+            ident = pool[0]
+            self._db.set_header_field(self.FREE_IDS_KEY, pool[1:])
+            return ident
         next_id = self._db.get_header_field(self.NEXT_ID_KEY, 1)
         if next_id > 127:
             raise ValueError("Maximum number of datasets (127) reached")
@@ -1544,6 +1558,15 @@ class DB:
             hd.pop(f"_ds_{n}_metadata", None)
         for n in [n for n in list(self._datasets) if pat in n]:
             self._datasets.pop(n, None)
+        # Return the dropped datasets' identifiers to the recycle pool (from
+        # the persisted registry — the source of truth even if instances were
+        # never materialized this session).  See _get_next_identifier.
+        reg = self._db.get_header_field(self.REGISTRY_KEY, None) or {}
+        freed = [int(v["identifier"]) for n, v in reg.items() if pat in n]
+        if freed:
+            pool = self._db.get_header_field(self.FREE_IDS_KEY, None) or []
+            self._db.set_header_field(self.FREE_IDS_KEY,
+                                      sorted(set(pool) | set(freed)))
         self._db.delete_header_field(cfg_key)
         # Drop cached addresses: a recreated structure of the same name would
         # otherwise read this collection's stale value addresses (the shared

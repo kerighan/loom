@@ -127,3 +127,18 @@ def test_migrate_rebinds_live_collection_handles(db):
     old_handle.insert({"uid": "u9", "name": "Eve", "cat": "a",
                        "bio": "ml", "score": 5})
     assert db.collection("users")["u9"]["score"] == 5
+
+
+def test_migrate_recycles_dataset_identifiers(db):
+    """Identifiers (int8 record prefixes, 127 max) freed by drop_collection
+    must be recycled: without the pool, ~15 migrations of one collection
+    exhausted them and permanently bricked the file for new structures."""
+    _seed(db)
+    for _ in range(40):                     # would exhaust 127 ids many times over
+        db.migrate_collection("users", {"uid": "utf8[8]", "name": "utf8[32]",
+                                        "cat": "utf8[8]", "bio": "text"})
+    col = db.collection("users")
+    assert col["u1"]["name"] == "Alice Martin"
+    # and a brand-new structure can still be created afterwards
+    ds = db.create_dataset("fresh_ds", val="int64")
+    db.create_dict("fresh", ds)
