@@ -1,204 +1,125 @@
 # loom — Roadmap
 
-Items grouped by theme, roughly ordered by impact/feasibility.
-Not a commitment to timeline — just a shared backlog.
+Open items first, roughly ordered by impact/feasibility. Done items are kept
+as a dated one-line log at the bottom. Not a commitment to timeline — just a
+shared backlog.
 
 ---
 
-## 1. Multi-indexation / Collection — ✅ DONE (2026-06-06)
+## Open
 
-Implemented as `db.collection(name, model, key, indexes=...)` → `loom/collection.py`.
-A record store with attached indexes: the record lives once in a primary Dict
-(keyed by `key`); each attached index maps a field **or a lambda** → the primary
-key (reference indexes, no duplication) and is kept in sync on insert/update/
-delete under `write_lock()` + `batch()`. Field-name indexes persist and
-auto-restore on reopen (`db.collection(name)`); lambda indexes re-supply each
-session. `get(index, key)`, `get_pk`, `update` (re-indexes), `delete`, `reindex`,
-`insert_many`. Tested in `tests/test_collection.py`.
+### 1. Counted group indexes — `Many(counted=True)` + `col.groups()`
 
-Note vs. the original design below: secondary lookups resolve **through the
-primary key**, not via raw record addresses (the record lives inside the primary
-Dict, so the primary key is the stable handle). Atomicity is lock+batch
-best-effort, not a full cross-index WAL (the Dict/BTree write path doesn't expose
-plan-then-apply). `reindex()` repairs a desynced index.
-
-<details><summary>Original design sketch</summary>
-
-**Problem:** looking up records by a non-primary field requires maintaining
-a second Dict manually and keeping it in sync by hand.
-
-**Design:** a `Collection` coordinator wraps an existing `Dataset` and N
-`Dict`/`BTree` indexes, keeping them atomically in sync via WAL transaction.
-No new primitives — `create_dict` and `create_btree` stay exactly as-is.
+`count(index, value)` (done) is a key-only scan: O(matches). For dashboards
+that repeatedly ask "how many per group" or "all groups ordered by volume"
+(e.g. narratives by post count), maintain a companion Dict `group → count`
+updated on insert/update/delete:
 
 ```python
-users_ds = db.create_dataset("users", User)
-by_name  = db.create_dict("by_name",  users_ds)
-by_email = db.create_dict("by_email", users_ds)
-
-users = db.collection(
-    dataset=users_ds,
-    primary  =(by_name,  lambda r: r["username"]),
-    secondary=[(by_email, lambda r: r["email"])],
-)
-
-users.insert({"username": "alice", "email": "a@x.com"})
-users.delete("alice")                        # removes from all indexes
-users["alice"]                               # primary lookup
-users.get("by_email", "a@x.com")            # secondary lookup
-```
-
-The `Collection` is not persisted — it is reconstructed at session open with
-the same lambdas.  The underlying Dicts persist independently.
-
-**Atomicity:** insert/delete batches all index writes in one WAL transaction.
-
-</details>
-
----
-
-## 2. Vector / Embedding support — ✅ DONE
-
-**Problem:** no vector dtype; storing embeddings requires raw bytes (`blob`)
-with manual encode/decode.  No approximate nearest-neighbour search.
-
-**2a. `vec_float32(dim)` dtype — exact storage**
-
-Add a Pydantic-compatible dtype for fixed-length float arrays:
-
-```python
-from loom.schema import Vec
-
-class Passage(BaseModel):
-    text:      str
-    embedding: Vec(1536)      # → stores 1536×float32 = 6144 bytes in BlobStore
-
-passages = db.create_dataset("passages", Passage)
-```
-
-Read/write returns a `numpy.ndarray` of shape `(dim,)`.
-
-**2b. VectorIndex — approximate nearest-neighbour (ANN)**
-
-A new top-level structure wrapping an HNSW graph stored in loom blocks:
-
-```python
-idx = db.create_vector_index("embeddings", dim=1536, metric="cosine")
-idx.add("doc_42", embedding_vector)          # insert by ID
-results = idx.search(query_vector, k=10)     # [(id, score), ...]
-```
-
-Internal storage: HNSW layers as Datasets + adjacency stored in the
-ByteFileDB file.  No external dependencies (pure numpy implementation).
-
-**Use case:** 50K–500K text embeddings with fast approximate lookup.
-For exact lookup by text → pre-compute a short ID (SHA-256[:16]) and use
-a regular Dict; store the embedding as `Vec(dim)` in the record.
-
----
-
-## 3. Multi-writer with file locking — ✅ DONE (threading.RLock + fcntl.flock SWMR, `multiprocess_safe=True`)
-
-**Problem:** only one process can write; multiple pipelines or workers
-writing to the same store require external coordination.
-
-**Design:** advisory file lock via `fcntl.flock` (Linux/Mac) +
-`msvcrt.locking` (Windows), with a `.lock` companion file.
-
-```python
-# Auto-lock mode: each mutation acquires LOCK_EX, readers get LOCK_SH
-db = DB("app.db", locking=True)
-
-# Or explicit: batch several writes under one lock acquisition
-with db.write_lock():
-    db["key1"] = val1
-    db["key2"] = val2
-```
-
-**Guarantees:**
-- Safe for multiple processes writing sequentially (pipelines, batch jobs).
-- NOT a substitute for a server under high-concurrency web load.
-- Lock is released automatically by the OS on process death (no cleanup needed).
-
-**Non-goals:** row-level locking, high-concurrency OLTP, MVCC.
-
----
-
-## 4. Schema migration — ✅ DONE (db.migrate_collection / db.drop_collection)
-
-**Problem:** adding/removing/renaming fields in a Pydantic model does not
-migrate existing records.
-
-**Design:** a `db.migrate(dataset_name, new_model, transforms={...})` helper
-that reads old records, applies field transforms, and rewrites them.
-
-```python
-# Old model had `name: str`, new one has `first_name` + `last_name`
-db.migrate("users", UserV2, transforms={
-    "first_name": lambda old: old["name"].split()[0],
-    "last_name":  lambda old: old["name"].split()[-1],
+posts = db.collection("posts", Post, indexes={
+    "id":        "primary",
+    "narrative": Many(sort="created_at", desc=True, counted=True),
 })
+posts.count("narrative", "ukraine")                     # O(1)
+posts.groups("narrative", order_by="count", desc=True)  # all groups + sizes, no data load
 ```
 
-Internally: creates a new dataset, rewrites all records, swaps the registry
-entry.  Old data kept as backup until `db.drop_backup("users")`.
+Opt-in (each counted index costs one Dict read-modify-write per insert,
+~10–20 µs). Activating `counted` on an existing index needs a backfill scan.
+
+### 2. ANN behind the `Vector` spec
+
+`Vector()` + `nearest()` (done) is exact, pre-filtered flat search — the
+right tool while candidates are bounded by a filter. If an **unfiltered**
+corpus outgrows the flat scan (> ~500k vectors), plug the standalone
+`FlatIndex`/`IVFIndex` behind the same spec so `nearest()` transparently uses
+ANN when no `where=` narrows the search. Same API, no migration.
+
+### 3. Remaining insert-path hotspots
+
+The 2026-07 perf pass ~2×'d Collection inserts and 2–4×'d search queries.
+What's left (diminishing returns, ~10–15% each, rising risk):
+- `Dict._setitem_fast` — generic per-record serialize for schemas that miss
+  the struct-pack fast plan (blob/text-heavy records).
+- Search tokenization — regex + Counter per document on `add()`.
+
+### 4. Order-statistics BTree (O(log n) range counts)
+
+Subtree counts stored in BTree nodes would make `count()` O(log n) for *any*
+range — including arbitrary time windows on huge groups — instead of
+O(matches). Disk-format change + split/merge complexity: only worth it if
+windowed counts on very large groups become a hot path (item 1 covers the
+per-group case without it).
+
+### 5. Cross-index crash atomicity for Collections
+
+Collection writes are serialised (`write_lock()` + `batch()`) but not
+crash-atomic across indexes: a crash mid-write can desync an index
+(`reindex()` repairs). A plan-then-apply WAL on the Dict/BTree write path
+would close this — significant plumbing, evaluate against real incident rate
+(zero so far).
+
+### 6. Quality-of-life, small
+
+- `col.latest(index)` / `col.first(index)` → the record directly (sugar over
+  `range(..., limit=1, desc=True)`).
+- Poison Collection handles after `drop_collection()` — a clear "collection
+  was dropped" error instead of undefined stale-handle behaviour
+  (vacuum/migrate handles are already re-bound in place).
+- Windows: `msvcrt.locking` fallback for `multiprocess_safe=True` (fcntl is
+  Linux/Mac only) — only if a Windows deployment ever materialises.
 
 ---
 
-## 5. Global vacuum / compaction — ✅ DONE (db.vacuum(), collections)
+## Decided against / no longer relevant
 
-**Problem:** fragmentation accumulates over time in long-lived databases
-(soft-deleted records, Dict hash tables with many deleted slots, BTree
-nodes after heavy deletion).
-
-**Design:** `db.vacuum()` — rebuild all structures without dead space,
-similar to SQLite's VACUUM.
-
-```python
-before = db.file_size()
-db.vacuum()
-after = db.file_size()
-print(f"reclaimed {(before - after) / 1e6:.1f} MB")
-```
-
-Implementation: for each structure, reads live data and rewrites to a new
-file, then atomically swaps.  O(n) but safe.
+- **PyPI / public packaging** — the project stays private by choice. Docs
+  exist (Sphinx under `docs/`, built by the pre-commit hook); no public CI.
+- **HNSW vector index** — superseded: exact `FlatIndex` + trained
+  `IVFIndex` (optional PQ) cover the standalone ANN need; Collections got
+  pre-filtered exact `nearest()` instead, which fits the real query shapes
+  (filter first, then similarity) better than ANN post-filtering.
 
 ---
 
-## 6. Read-only mode — ✅ DONE (`DB(path, ...)` read-only flag)
+## Done
 
-**Problem:** opening a DB for reading requires `r+b` (read-write).  No way
-to enforce that a session cannot write.
-
-**Design:**
-
-```python
-db = DB("app.db", mode="r")  # opens with mmap.ACCESS_READ
-# any write attempt raises ReadOnlyError
-```
-
-Unlocks safer multi-reader patterns and is a prerequisite for clean
-multi-writer semantics (readers hold LOCK_SH in locking mode).
-
----
-
-## 7. Packaging / distribution
-
-- Publish to PyPI as `loom-db`
-- Semantic versioning (MAJOR.MINOR.PATCH)
-- CI/CD: GitHub Actions running tests on Linux, macOS, Windows
-- Auto-generated API docs (MkDocs or Sphinx)
-- `setup.py` / `pyproject.toml` with proper optional deps
-  (`pydantic`, `brotli`, `mmh3` as extras)
-
----
-
-## 8. Quality-of-life / small items — ✅ mostly DONE
-
-- ✅ `db.stats()` — file size, fragmentation ratio, per-structure entry counts
-- ✅ `db.verify()` — walk all structures and check for corruption
-- ✅ Integer keys on BTree (`create_btree(int_keys=True)`)
-- ✅ `dict.get_many(keys)` — bulk lookup with one mmap pass
-- ✅ `db.collection()` persisted metadata (declarative typed indexes)
-- ✅ Self-describing `header_size` (auto-detected on reopen)
+- **2026-06-06 — Collection v1** (`db.collection`): record store + attached
+  reference indexes, synced under lock+batch.
+- **2026-06-20 — Collection redesign**: declarative typed indexes
+  (`Primary`/`Unique`/`Range`/`Many(sort=, desc=, field=)`/`Search`),
+  order-preserving key encoding, Record write-through wrapper, BTree
+  `bulk_load`, seek-based `range()/prefix()`, fast `_deserialize`.
+- **2026-06-20 — Vec(N) dtype + vector indexes**: inline float32 arrays;
+  `FlatIndex` (exact) and `IVFIndex` (trained, optional PQ compression).
+- **2026-06-20/23 — Full-text in Collections**: doc-store-less SearchIndex
+  (`Search(fields=, scoring=)`), `search(where=...)` structured filter.
+- **2026-06-22 — Compound equality+range**: `find(index, value, start=, end=)`
+  in one seek; upsert semantics for `insert`/`insert_many`.
+- **2026-06-23 — migrate/drop/vacuum**: `db.migrate_collection`,
+  `db.drop_collection`, `db.vacuum()` (atomic file swap); `json` dtype;
+  automatic key sizing (long pks never truncated); hashed indexes on
+  unbounded fields.
+- **2026-06 — Multi-process SWMR**: `threading.RLock` + `fcntl.flock`
+  (`multiprocess_safe=True`), read-only open mode.
+- **2026-06-23 — Sphinx docs** (furo + myst): API autodoc + use-case
+  tutorials, docs-build pre-commit hook.
+- **2026-06 — QoL**: `db.stats()`, `db.verify()`, BTree int keys,
+  `get_many`, `sample()/describe()` introspection, self-describing
+  `header_size`, PriorityQueue + native datetime fields.
+- **2026-07-02 — Insert/read perf pass**: single-descent BTree upsert
+  (file-identical to master, proven by sha256), header-cadence flush,
+  struct-pack serialize plan, C-level bisect; Collection inserts ~2×.
+- **2026-07-02 — Search query perf**: vectorised varint decode + doc-length
+  cache; BM25 queries 2–4× faster, byte-identical results.
+- **2026-07-03 — `count()`**: key-only group/window counting (~18× vs
+  `len(find())`); **`fields=` projection** on `find()`/`range()` (skips
+  unrequested blobs).
+- **2026-07-06 — Silent-data-loss fixes**: `str`/`"str"` dict-schema dtype
+  normalisation (was numpy `<U0` → every value stored as `""`);
+  `_serialize` rejects unknown fields (was: record of defaults).
+- **2026-07-07 — `Vector` index on Collections**: pre-filtered exact
+  similarity, `nearest(where=...)` planned through existing indexes; triple
+  store + filtered-vector-search tutorials; README refresh.
+- **2026-07-08 — Handle re-binding**: caller-held Collection handles survive
+  `vacuum()`/`migrate_collection` (weak registry, in-place re-bind).
