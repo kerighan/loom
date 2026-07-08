@@ -97,3 +97,33 @@ def test_vacuum_refuses_standalone_structures(db):
     db.create_dict("d", ds)   # standalone (non-collection) structure
     with pytest.raises(NotImplementedError):
         db.vacuum()
+
+
+def test_vacuum_rebinds_live_collection_handles(db):
+    """Handles handed out before vacuum() must survive the file swap: their
+    structures cached addresses of the pre-swap layout (using one raised
+    KeyError on live keys; a write would land at stale addresses)."""
+    col = _seed(db)
+    col.delete("u2")                      # dead space so vacuum compacts
+    db.vacuum()
+    # reads through the pre-vacuum handle
+    assert col["u1"]["name"] == "Alice Martin"
+    assert [r["uid"] for r in col.find("cat", "a")] == ["u1"]
+    assert col.search("body", "python")[0]["uid"] == "u1"
+    # writes through it are seen by a fresh handle (and vice versa)
+    col.insert({"uid": "u3", "name": "Carol", "cat": "a", "bio": "go dev"})
+    fresh = db.collection("users")
+    assert "u3" in fresh
+    fresh.insert({"uid": "u4", "name": "Dave", "cat": "b", "bio": "rust dev"})
+    assert "u4" in col
+
+
+def test_migrate_rebinds_live_collection_handles(db):
+    old_handle = _seed(db)
+    db.migrate_collection("users", {"uid": "utf8[8]", "name": "utf8[32]",
+                                    "cat": "utf8[8]", "bio": "text",
+                                    "score": "int64"})
+    assert old_handle["u1"]["score"] == 0          # follows the new schema
+    old_handle.insert({"uid": "u9", "name": "Eve", "cat": "a",
+                       "bio": "ml", "score": 5})
+    assert db.collection("users")["u9"]["score"] == 5

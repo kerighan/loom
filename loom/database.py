@@ -163,6 +163,10 @@ class DB:
         )
         self._datasets = {}  # name -> Dataset instance
         self._datastructures = {}  # name -> DataStructure instance
+        # Collection wrappers handed out to callers — weakly referenced so
+        # vacuum()/migrate can re-bind them in place after a file swap
+        # (their structures cache addresses of the pre-swap layout).
+        self._live_collections = weakref.WeakSet()
         self._is_open = False
         self._loading_registry = False  # Flag to prevent saving during load
         self._blob_compression = blob_compression
@@ -1478,13 +1482,15 @@ class DB:
             # ── Reopen ──────────────────────────────────────────────────
             if not cfg:
                 raise StructureNotFoundError(name)
-            return Collection(
+            col = Collection(
                 self, name, self.get_dataset(cfg["dataset"]),
                 cfg["primary_field"], self._datastructures[cfg["primary"]],
                 _build_index_objs(cfg), cfg["key_size"],
                 search=_build_search_objs(cfg),
                 vector=cfg.get("vector", {}),
             )
+            self._live_collections.add(col)
+            return col
 
         # ── Create ──────────────────────────────────────────────────────
         self._ensure_writable()
@@ -1608,6 +1614,7 @@ class DB:
                               key_size=key_size, index_key_size=index_key_size)
         if migrated:
             col.insert_many(migrated)
+        self._rebind_live_collections(name)
         return col
 
     def _collection_index_specs(self, cfg, col):
@@ -1715,6 +1722,24 @@ class DB:
         if self._shared_cache is not None:
             self._shared_cache.clear()
         self.open()
+        self._rebind_live_collections()
+
+    def _rebind_live_collections(self, name=None):
+        """Point previously handed-out Collection wrappers at the current
+        structures.  After a file swap (vacuum) or a drop+recreate (migrate),
+        the old wrappers' structures cache addresses of a layout that no
+        longer exists — using one raises KeyError on live keys, and a write
+        through one would land at stale addresses.  Re-binding in place keeps
+        every caller-held handle valid."""
+        for col in list(self._live_collections):
+            if name is not None and col.name != name:
+                continue
+            cfg = self._db.get_header_field(f"__collection__::{col.name}")
+            if not cfg:
+                continue          # collection was dropped — leave the handle be
+            fresh = self.collection(col.name)
+            if fresh is not col:
+                col.__dict__.update(fresh.__dict__)
 
     def _collection_names(self):
         return sorted(
@@ -1985,7 +2010,9 @@ class DB:
             "search": cfg_search,
             "vector": cfg_vector,
         })
-        return Collection(
+        col = Collection(
             self, name, dataset, primary_field, primary, idx_objs, key_size,
             search=search_objs, vector=cfg_vector,
         )
+        self._live_collections.add(col)
+        return col
