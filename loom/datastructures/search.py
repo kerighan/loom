@@ -75,18 +75,25 @@ def _fold_accents(text):
     return text.translate(_UNIDECODE_TABLE)
 
 
-# Tokenizer kit, built lazily at first use (keeps eldar off the import path):
-# precompiled WORD_REGEX + PUNCTUATION set/table + the fast-path invariant
-# check ('_' is the only word char in PUNCTUATION — see SearchIndex._tokens).
+# ── vendored tokenizer constants (from eldar 0.0.8) ──────────────────────────
+# These two constants define loom's ON-DISK postings format: which tokens a
+# document yields decides which terms exist in every already-built index.
+# They are deliberately vendored, NOT imported from eldar — the installed
+# eldar version (or a p4a/pip resolution surprise) must never be able to
+# silently change how loom tokenizes.  eldar itself is only needed at query
+# time, for parse_query (resolved through _eldar_parse_query below).
+WORD_REGEX = r'([\w]+|[,?;.:\/!()\[\]\'"’\\><+-=])'
+PUNCTUATION = """'!#$%&\'()+,-./:;<=>?@[\\]^_`{|}~'"""
+
+# Tokenizer kit: precompiled WORD_REGEX + PUNCTUATION set/table + the
+# fast-path invariant check ('_' is the only word char in PUNCTUATION — see
+# SearchIndex._tokens).  Built once from the vendored constants.
 _TOKEN_KIT = None
 
 
 def _token_kit():
     global _TOKEN_KIT
     if _TOKEN_KIT is None:
-        from eldar.regex import WORD_REGEX
-        from eldar.index import PUNCTUATION
-
         word_chars = [c for c in PUNCTUATION if re.match(r"\w", c, re.UNICODE)]
         _TOKEN_KIT = (
             re.compile(WORD_REGEX, re.UNICODE),
@@ -95,6 +102,67 @@ def _token_kit():
             word_chars == ["_"],
         )
     return _TOKEN_KIT
+
+
+class _Item:
+    """Posting leaf handed to eldar's query tree: IndexEntry.search reads
+    .id (and .position for multiword queries).  Vendored — eldar.entry.Item
+    is a plain dataclass and importing it would tie loom to eldar's module
+    layout for no benefit (loom never stores positions anyway)."""
+
+    __slots__ = ("id", "position")
+
+    def __init__(self, id, position=0):
+        self.id = id
+        self.position = position
+
+    def __hash__(self):
+        return hash((self.id, self.position))
+
+    def __eq__(self, other):
+        return (self.id, self.position) == (other.id, other.position)
+
+
+# parse_query is the one symbol loom really needs from eldar.  Resolve it
+# through the known layouts (0.0.8 first), and PROBE the result: eldar has
+# grown a second, document-level parse_query flavour whose trees have no
+# .search(index) — picking that one would fail at query time, not import time.
+_PARSE_QUERY = None
+
+
+def _eldar_parse_query():
+    global _PARSE_QUERY
+    if _PARSE_QUERY is None:
+        _require_eldar()
+        import importlib
+
+        tried = []
+        for modname in ("eldar.index", "eldar.query", "eldar"):
+            try:
+                mod = importlib.import_module(modname)
+            except ImportError:
+                tried.append(f"{modname} (absent)")
+                continue
+            pq = getattr(mod, "parse_query", None)
+            if pq is None:
+                tried.append(f"{modname} (no parse_query)")
+                continue
+            try:
+                probe = pq("loomprobe AND loomprobe2",
+                           ignore_case=True, ignore_accent=True)
+            except TypeError:
+                probe = pq("loomprobe AND loomprobe2")
+            if hasattr(probe, "search"):
+                _PARSE_QUERY = pq
+                break
+            tried.append(f"{modname} (tree has no .search — wrong flavour)")
+        if _PARSE_QUERY is None:
+            raise ImportError(
+                "loom could not find an index-level parse_query in the "
+                f"installed eldar (tried: {', '.join(tried)}). Your eldar "
+                "version has an incompatible layout — pin eldar==0.0.8."
+            )
+    return _PARSE_QUERY
 
 
 # ── varint (LEB128, unsigned) ─────────────────────────────────────────────────
@@ -489,10 +557,8 @@ class SearchIndex(DataStructure):
         return {i: tf for i, tf in self._decode_postings(self._postings[term])}
 
     def get(self, query_term):
-        """Postings for a term as a set of eldar Items — the leaf callback for
+        """Postings for a term as a set of Items — the leaf callback for
         eldar's query tree.  Handles `*` wildcards by scanning the dictionary."""
-        from eldar.entry import Item
-
         if self.ignore_punctuation:
             query_term = self._strip_punct(query_term)
         result = set()
@@ -501,10 +567,10 @@ class SearchIndex(DataStructure):
             for term in self._postings.keys():
                 if rgx.match(term):
                     for i in self._term_ids(term):
-                        result.add(Item(i, 0))
+                        result.add(_Item(i, 0))
             return result
         for i in self._term_ids(query_term):
-            result.add(Item(i, 0))
+            result.add(_Item(i, 0))
         return result
 
     # ── read API ────────────────────────────────────────────────────────────
@@ -516,8 +582,7 @@ class SearchIndex(DataStructure):
         "boolean" (unranked, doc-id order) or "bm25"/"tfidf" (ranked, best
         first; needs scoring="bm25").  Defaults to the index's scoring.
         """
-        _require_eldar()
-        from eldar.index import parse_query
+        parse_query = _eldar_parse_query()
 
         self._ensure_loaded()
         self.flush()
@@ -588,27 +653,35 @@ class SearchIndex(DataStructure):
 
     def _strip_punct(self, term):
         if self.ignore_punctuation:
-            from eldar.index import PUNCTUATION
-
-            return term.translate(str.maketrans("", "", PUNCTUATION))
+            return term.translate(_token_kit()[2])
         return term
 
     def _positive_terms(self, node, negated=False, out=None):
-        from eldar.indexops import AND, OR, ANDNOT
-        from eldar.entry import IndexEntry
+        """Collect the non-negated leaf terms of an eldar query tree.
 
+        Walked STRUCTURALLY (a leaf has .query_term, a binary node has
+        .left/.right, negation flips on nodes whose class name contains
+        NOT) rather than by isinstance on eldar's classes: an eldar
+        relayout would make isinstance checks fail *silently* — every BM25
+        score would drop to 0 with no error.  Duck-typing keeps ranking
+        working against any eldar whose trees have this shape."""
         if out is None:
             out = set()
-        if isinstance(node, ANDNOT):
-            self._positive_terms(node.left, negated, out)
-            self._positive_terms(node.right, not negated, out)
-        elif isinstance(node, (AND, OR)):
-            self._positive_terms(node.left, negated, out)
-            self._positive_terms(node.right, negated, out)
-        elif isinstance(node, IndexEntry):
-            qt = node.query_term
+        qt = getattr(node, "query_term", None)
+        if qt is not None:                      # leaf (IndexEntry-shaped)
             if not negated and isinstance(qt, str) and "*" not in qt:
                 out.add(self._strip_punct(qt))
+            return out
+        left = getattr(node, "left", None)
+        right = getattr(node, "right", None)
+        if left is None or right is None:       # unknown node shape → skip
+            return out
+        if "NOT" in type(node).__name__:        # ANDNOT: right side negated
+            self._positive_terms(left, negated, out)
+            self._positive_terms(right, not negated, out)
+        else:                                   # AND / OR
+            self._positive_terms(left, negated, out)
+            self._positive_terms(right, negated, out)
         return out
 
     def _doc_len(self, doc_id):
