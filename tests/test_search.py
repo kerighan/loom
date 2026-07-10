@@ -1,12 +1,15 @@
-"""SearchIndex — persistent inverted index over a user Dataset (via eldar).
+"""SearchIndex — persistent inverted index over a user Dataset.
 
 The index is built on a documents Dataset; add(record) inserts the record and
-indexes its text fields, keeping only the record's address.
+indexes its text fields, keeping only the record's address.  Query parsing +
+set-algebra come from loom's vendored copy of eldar's machinery — eldar is a
+TEST-ONLY dependency here.
 
-The fuzz test uses an in-memory `eldar.Index` built on the same texts as the
-oracle: loom delegates parsing + set-algebra to eldar and stores the same
-postings, so `SearchIndex.search(q)` must return exactly the same doc-ids as
-`eldar.Index.search(q)` for any boolean query — including after a reopen.
+The fuzz tests use an in-memory `eldar.Index` built on the same texts as the
+oracle (skipped if eldar isn't installed): loom stores the same postings and
+vendors the same algebra, so `SearchIndex.search(q)` must return exactly the
+same doc-ids as `eldar.Index.search(q)` for any boolean query — including
+after a reopen.
 """
 
 import os
@@ -16,8 +19,6 @@ import tempfile
 import pytest
 
 from loom.database import DB
-
-eldar = pytest.importorskip("eldar")
 
 
 @pytest.fixture
@@ -194,6 +195,7 @@ def _rand_query(rng, depth=0):
 
 @pytest.mark.parametrize("seed", [0, 1, 2, 7, 42])
 def test_fuzz_matches_eldar_oracle(seed):
+    eldar = pytest.importorskip("eldar")   # oracle only — loom itself needs no eldar
     rng = random.Random(seed)
     texts = [_rand_doc(rng) for _ in range(60)]
     oracle = eldar.Index()
@@ -253,6 +255,7 @@ def _bm25_oracle(texts, query_terms, candidates, k1=1.5, b=0.75):
 
 @pytest.mark.parametrize("seed", [0, 3, 11, 99])
 def test_fuzz_bm25_matches_brute_force(seed):
+    eldar = pytest.importorskip("eldar")   # candidate-set oracle only
     rng = random.Random(seed)
     texts = [" ".join(rng.choice(VOCAB) for _ in range(rng.randint(1, 8)))
              for _ in range(80)]

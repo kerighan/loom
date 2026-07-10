@@ -69,9 +69,8 @@ def test_tokens_match_legacy_semantics():
     across every ignore_* combination, on punctuation/underscore/accent
     edge cases ('_' strips inside tokens; '\"' and '’' are NOT punctuation
     for eldar and survive as tokens)."""
-    from loom.datastructures.search import SearchIndex, _fold_accents
-    from eldar.regex import WORD_REGEX
-    from eldar.index import PUNCTUATION
+    from loom.datastructures.search import (SearchIndex, _fold_accents,
+                                            WORD_REGEX, PUNCTUATION)
 
     table = str.maketrans("", "", PUNCTUATION)
 

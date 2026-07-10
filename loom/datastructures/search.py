@@ -22,9 +22,12 @@ automatically before any read / on close): a bulk build inserts the records in
 one contiguous block and writes each term's blob once.
 
 Boolean queries (AND / OR / AND NOT, parens, `*` wildcards) are parsed and
-evaluated by **eldar** (https://github.com/kerighan/eldar); BM25/TF-IDF ranking
-scores the boolean candidate set by the query's positive terms.  eldar is an
-optional dependency (lazy import; `pip install eldar`).
+evaluated by the vendored copy of **eldar**'s index-level query machinery
+(`loom.datastructures._boolquery`, from https://github.com/kerighan/eldar —
+same author); BM25/TF-IDF ranking scores the boolean candidate set by the
+query's positive terms.  No runtime dependency: search behaves identically
+on every deployment (the test suite cross-checks the vendored copy against
+the eldar package whenever it is installed).
 """
 
 import re
@@ -35,16 +38,6 @@ import numpy as np
 from .base import DataStructure
 from .dict import Dict
 from .list import List
-
-
-def _require_eldar():
-    try:
-        import eldar  # noqa: F401
-    except ImportError as e:  # pragma: no cover
-        raise ImportError(
-            "SearchIndex needs the 'eldar' package for boolean query parsing. "
-            "Install it with: pip install eldar"
-        ) from e
 
 
 # ── accent folding ────────────────────────────────────────────────────────────
@@ -80,8 +73,8 @@ def _fold_accents(text):
 # document yields decides which terms exist in every already-built index.
 # They are deliberately vendored, NOT imported from eldar — the installed
 # eldar version (or a p4a/pip resolution surprise) must never be able to
-# silently change how loom tokenizes.  eldar itself is only needed at query
-# time, for parse_query (resolved through _eldar_parse_query below).
+# silently change how loom tokenizes.  The query parser + tree are vendored
+# too (loom.datastructures._boolquery) — search has no runtime dependency.
 WORD_REGEX = r'([\w]+|[,?;.:\/!()\[\]\'"’\\><+-=])'
 PUNCTUATION = """'!#$%&\'()+,-./:;<=>?@[\\]^_`{|}~'"""
 
@@ -123,46 +116,6 @@ class _Item:
         return (self.id, self.position) == (other.id, other.position)
 
 
-# parse_query is the one symbol loom really needs from eldar.  Resolve it
-# through the known layouts (0.0.8 first), and PROBE the result: eldar has
-# grown a second, document-level parse_query flavour whose trees have no
-# .search(index) — picking that one would fail at query time, not import time.
-_PARSE_QUERY = None
-
-
-def _eldar_parse_query():
-    global _PARSE_QUERY
-    if _PARSE_QUERY is None:
-        _require_eldar()
-        import importlib
-
-        tried = []
-        for modname in ("eldar.index", "eldar.query", "eldar"):
-            try:
-                mod = importlib.import_module(modname)
-            except ImportError:
-                tried.append(f"{modname} (absent)")
-                continue
-            pq = getattr(mod, "parse_query", None)
-            if pq is None:
-                tried.append(f"{modname} (no parse_query)")
-                continue
-            try:
-                probe = pq("loomprobe AND loomprobe2",
-                           ignore_case=True, ignore_accent=True)
-            except TypeError:
-                probe = pq("loomprobe AND loomprobe2")
-            if hasattr(probe, "search"):
-                _PARSE_QUERY = pq
-                break
-            tried.append(f"{modname} (tree has no .search — wrong flavour)")
-        if _PARSE_QUERY is None:
-            raise ImportError(
-                "loom could not find an index-level parse_query in the "
-                f"installed eldar (tried: {', '.join(tried)}). Your eldar "
-                "version has an incompatible layout — pin eldar==0.0.8."
-            )
-    return _PARSE_QUERY
 
 
 # ── varint (LEB128, unsigned) ─────────────────────────────────────────────────
@@ -582,7 +535,7 @@ class SearchIndex(DataStructure):
         "boolean" (unranked, doc-id order) or "bm25"/"tfidf" (ranked, best
         first; needs scoring="bm25").  Defaults to the index's scoring.
         """
-        parse_query = _eldar_parse_query()
+        from loom.datastructures._boolquery import parse_query
 
         self._ensure_loaded()
         self.flush()

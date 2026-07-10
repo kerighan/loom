@@ -1144,7 +1144,8 @@ class DB:
         other structures.  add(record) inserts the record into that dataset and
         indexes its text fields, keeping only the record's address — documents
         are never duplicated.  Boolean queries (AND / OR / AND NOT, parens, `*`)
-        are parsed by eldar (`pip install eldar`); loom stores the postings.
+        are parsed by loom's vendored copy of eldar's query machinery — no
+        extra dependency; loom stores the postings.
 
         Args:
             name: Unique name for this index.

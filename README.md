@@ -602,8 +602,9 @@ posts.delete("p1")                             # removed from every index
 A persistent inverted index for boolean and ranked (BM25) full-text search.
 Documents live in one of your datasets; the index stores only the postings and
 keeps each document's address — text is never duplicated. Boolean queries
-(`AND` / `OR` / `AND NOT`, parentheses, `*` wildcards) are parsed by
-[`eldar`](https://pypi.org/project/eldar/) (`pip install eldar`).
+(`AND` / `OR` / `AND NOT`, parentheses, `*` wildcards) are parsed by loom's
+vendored copy of [`eldar`](https://github.com/kerighan/eldar)'s query
+machinery — no extra dependency, identical behaviour on every deployment.
 
 ```python
 docs = db.create_dataset("docs", title="utf8[120]", body="text")
