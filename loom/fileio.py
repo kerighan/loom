@@ -35,6 +35,7 @@ class ByteFileDB:
             self.ensure_file_size(max(self.initial_size, self.header_size))
         self.mapped_file = None
         self.file_handle = None
+        self._map_size = 0
 
         # Header metadata dictionary (in-memory cache)
         self._header_data = {}
@@ -77,6 +78,7 @@ class ByteFileDB:
             self.file_handle = open(self.filename, "r+b")
             self.mapped_file = mmap.mmap(self.file_handle.fileno(), 0)
             self.recover_from_log()
+        self._map_size = len(self.mapped_file)
         # Adopt the header_size the file was actually created with (stored in
         # slot A, readable at a fixed offset) so reopening with a different /
         # default header_size can't silently mis-read the header.
@@ -98,6 +100,7 @@ class ByteFileDB:
                 self.mapped_file.flush()
             self.mapped_file.close()
             self.mapped_file = None
+            self._map_size = 0
         if self.file_handle:
             self.file_handle.close()
             self.file_handle = None
@@ -123,7 +126,40 @@ class ByteFileDB:
 
     def read(self, address, size):
         assert self.mapped_file, "DB is not open. Call open() first."
-        return self.mapped_file[address : address + size]
+        end = address + size
+        if end > self._map_size:
+            self._refresh_map(end)
+        return self.mapped_file[address:end]
+
+    def _refresh_map(self, min_end):
+        """Remap when a read lands beyond the current mmap.
+
+        mmap pages are shared through the page cache, so a long-lived
+        (typically read-only) handle sees another handle's *in-place*
+        updates immediately — including fresh pointers into regions
+        appended AFTER this handle mapped the file.  Its mmap length is
+        frozen at open time though, and slicing past it silently returns
+        truncated bytes (surfacing as struct.error / garbage far from the
+        cause).  If the file has grown, remap to the new size and carry
+        on; if the requested range is still past EOF, the reference is
+        dangling — fail loudly.
+        """
+        actual = os.path.getsize(self.filename)
+        if actual > self._map_size:
+            self.mapped_file.close()
+            if self.read_only:
+                self.mapped_file = mmap.mmap(
+                    self.file_handle.fileno(), 0, access=mmap.ACCESS_READ
+                )
+            else:
+                self.mapped_file = mmap.mmap(self.file_handle.fileno(), 0)
+            self._map_size = len(self.mapped_file)
+        if min_end > self._map_size:
+            raise ValueError(
+                f"read past end of file ({min_end} > {self._map_size} bytes): "
+                f"dangling reference — the record points at data that was "
+                f"never written (or the file was truncated)"
+            )
 
     def log_write(self, log_handle, address, data):
         log_handle.write((address).to_bytes(8, "big"))
