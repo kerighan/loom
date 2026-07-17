@@ -12,6 +12,18 @@ from loom.errors import (
     WrongDatasetError,
 )
 
+# ── Datetime ↔ int64 (epoch microseconds) ──────────────────────────────────
+# "datetime" fields are stored inline as int64 microseconds since 1970-01-01,
+# encoded/decoded transparently.  8 bytes, naturally ordered (range/sort work),
+# no BlobStore hop.  Naive datetimes are treated as UTC; aware ones are
+# converted to UTC; on read you get a naive (UTC) datetime back.
+from datetime import (
+    date as _date,
+    datetime as _datetime,
+    timedelta as _timedelta,
+    timezone as _timezone,
+)
+
 # ── Array dtype helpers ────────────────────────────────────────────────────
 
 _ARRAY_DTYPE_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9_]*)\[(\d+(?:,\d+)*)\]$")
@@ -29,8 +41,8 @@ def parse_dtype(dtype_str):
     """
     m = _ARRAY_DTYPE_RE.match(str(dtype_str))
     if m:
-        base   = m.group(1)
-        shape  = tuple(int(d) for d in m.group(2).split(","))
+        base = m.group(1)
+        shape = tuple(int(d) for d in m.group(2).split(","))
         return np.dtype((base, shape))
     return np.dtype(dtype_str)
 
@@ -72,10 +84,10 @@ def dtype_to_str(dtype):
         np.dtype(('float32', (8, 8)))         → 'float32[8,8]'
     """
     if dtype.shape:
-        base_str = dtype.base.str          # e.g. '<f4'
+        base_str = dtype.base.str  # e.g. '<f4'
         # Use the named form if available, else fall back to .str
         try:
-            base_str = str(dtype.base)     # e.g. 'float32'
+            base_str = str(dtype.base)  # e.g. 'float32'
         except Exception:
             pass
         shape_str = ",".join(str(d) for d in dtype.shape)
@@ -91,6 +103,7 @@ def dtype_to_str(dtype):
     except TypeError:
         pass
     return dtype.str
+
 
 # Blob reference dtype: (offset: uint64, n_slots: uint16)
 # Total 10 bytes per blob field
@@ -117,21 +130,14 @@ def as_record(value):
     else is passed through untouched."""
     if value is None or isinstance(value, dict):
         return value
-    dump = getattr(value, "model_dump", None)   # pydantic v2
+    dump = getattr(value, "model_dump", None)  # pydantic v2
     if callable(dump):
         return dump()
-    legacy = getattr(value, "dict", None)        # pydantic v1
+    legacy = getattr(value, "dict", None)  # pydantic v1
     if callable(legacy) and type(value).__module__.startswith("pydantic"):
         return legacy()
     return value
 
-
-# ── Datetime ↔ int64 (epoch microseconds) ──────────────────────────────────
-# "datetime" fields are stored inline as int64 microseconds since 1970-01-01,
-# encoded/decoded transparently.  8 bytes, naturally ordered (range/sort work),
-# no BlobStore hop.  Naive datetimes are treated as UTC; aware ones are
-# converted to UTC; on read you get a naive (UTC) datetime back.
-from datetime import date as _date, datetime as _datetime, timedelta as _timedelta, timezone as _timezone
 
 _EPOCH = _datetime(1970, 1, 1)
 
@@ -147,13 +153,15 @@ def _dt_to_micros(value):
     elif isinstance(value, _date):
         dt = _datetime(value.year, value.month, value.day)
     elif isinstance(value, (int, np.integer)):
-        return int(value)            # already microseconds — pass through
+        return int(value)  # already microseconds — pass through
     elif isinstance(value, str):
         dt = _datetime.fromisoformat(value)
         if dt.tzinfo is not None:
             dt = dt.astimezone(_timezone.utc).replace(tzinfo=None)
     else:
-        raise TypeError(f"datetime field expects datetime/date/int/ISO str, got {type(value)!r}")
+        raise TypeError(
+            f"datetime field expects datetime/date/int/ISO str, got {type(value)!r}"
+        )
     delta = dt - _EPOCH
     return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
 
@@ -202,9 +210,11 @@ class Dataset:
         self.blob_store = blob_store
 
         # Track special variable-length fields
-        self._blob_fields = set()   # raw bytes via BlobStore
-        self._text_fields = set()   # UTF-8 strings via BlobStore (transparent)
-        self._json_fields = set()   # arbitrary JSON values via BlobStore (json.dumps/loads)
+        self._blob_fields = set()  # raw bytes via BlobStore
+        self._text_fields = set()  # UTF-8 strings via BlobStore (transparent)
+        self._json_fields = (
+            set()
+        )  # arbitrary JSON values via BlobStore (json.dumps/loads)
         # Fixed-width UTF-8 string fields: field_name → byte budget N.
         # Stored inline as numpy S{N} (raw bytes), encoded/decoded transparently
         # — ~4× smaller than U{N} (UCS-4, 4 bytes/char) for ASCII, with no
@@ -217,7 +227,7 @@ class Dataset:
         self._datetime_fields = set()
 
         # Track array (vector) fields for proper serialization
-        self._array_fields = {}   # field_name → shape tuple
+        self._array_fields = {}  # field_name → shape tuple
 
         # Convert dtype strings, handling "blob", "text", "utf8[N]", "datetime", "float32[N]"
         processed_schema = []
@@ -235,7 +245,11 @@ class Dataset:
             elif dtype == "datetime":
                 self._datetime_fields.add(field)
                 processed_schema.append((field, np.dtype("int64")))
-            elif isinstance(dtype, str) and dtype.startswith("utf8[") and dtype.endswith("]"):
+            elif (
+                isinstance(dtype, str)
+                and dtype.startswith("utf8[")
+                and dtype.endswith("]")
+            ):
                 inner = dtype[5:-1]
                 strict = inner.endswith("!")
                 n = int(inner[:-1] if strict else inner)
@@ -299,7 +313,11 @@ class Dataset:
         values = [self.identifier]
         for field in self.user_schema.names:
             dtype = self.user_schema.fields[field][0]
-            if field in self._text_fields or field in self._blob_fields or field in self._json_fields:
+            if (
+                field in self._text_fields
+                or field in self._blob_fields
+                or field in self._json_fields
+            ):
                 values.append((0, 0))
             elif field in self._utf8_fields:
                 values.append(b"")
@@ -322,8 +340,14 @@ class Dataset:
         return self.db.allocate(size)
 
     _INT_FMT = {
-        ("i", 1): "<b", ("i", 2): "<h", ("i", 4): "<i", ("i", 8): "<q",
-        ("u", 1): "<B", ("u", 2): "<H", ("u", 4): "<I", ("u", 8): "<Q",
+        ("i", 1): "<b",
+        ("i", 2): "<h",
+        ("i", 4): "<i",
+        ("i", 8): "<q",
+        ("u", 1): "<B",
+        ("u", 2): "<H",
+        ("u", 4): "<I",
+        ("u", 8): "<Q",
     }
 
     def _build_fast_plan(self):
@@ -344,8 +368,13 @@ class Dataset:
         for field in self.user_schema.names:
             dtype, offset = self.schema.fields[field]
             if field in self._utf8_fields:
-                entry = ("u", field, offset, self._utf8_fields[field],
-                         field in self._utf8_strict)
+                entry = (
+                    "u",
+                    field,
+                    offset,
+                    self._utf8_fields[field],
+                    field in self._utf8_strict,
+                )
             elif field in self._text_fields:
                 entry = ("t", field, offset, None, False)
             elif field in self._json_fields:
@@ -363,8 +392,13 @@ class Dataset:
                     return None
                 entry = ("n", field, offset, fmt, False)
             elif dtype.kind == "f" and dtype.itemsize in (4, 8):
-                entry = ("n", field, offset,
-                         "<f" if dtype.itemsize == 4 else "<d", False)
+                entry = (
+                    "n",
+                    field,
+                    offset,
+                    "<f" if dtype.itemsize == 4 else "<d",
+                    False,
+                )
             elif dtype.kind == "b":
                 entry = ("b", field, offset, None, False)
             else:  # unicode 'U', raw 'S' outside utf8[], datetime64 … → generic
@@ -395,10 +429,7 @@ class Dataset:
             if kind == "u":
                 if value is None:
                     continue  # generic packs b"" — same bytes as the zeros
-                enc = (
-                    value.encode("utf-8") if isinstance(value, str)
-                    else bytes(value)
-                )
+                enc = value.encode("utf-8") if isinstance(value, str) else bytes(value)
                 if len(enc) > arg:
                     if strict:
                         raise ValueError  # generic path raises the full message
@@ -409,8 +440,7 @@ class Dataset:
             elif kind == "t":
                 if value is None or value == "":
                     continue  # zeros = NULL_BLOB, same as generic
-                payload = (value.encode("utf-8") if isinstance(value, str)
-                           else value)
+                payload = value.encode("utf-8") if isinstance(value, str) else value
                 if not isinstance(payload, (bytes, bytearray)):
                     raise TypeError  # generic reproduces the real error
                 if blobs is None:
@@ -490,7 +520,9 @@ class Dataset:
                     if value is None or value == "":
                         pass  # already zero = NULL_BLOB
                     else:
-                        encoded = value.encode("utf-8") if isinstance(value, str) else value
+                        encoded = (
+                            value.encode("utf-8") if isinstance(value, str) else value
+                        )
                         offset, n_slots = self.blob_store.write(encoded)
                         arr[field]["offset"] = offset
                         arr[field]["n_slots"] = n_slots
@@ -509,14 +541,18 @@ class Dataset:
                         arr[field]["n_slots"] = value[1]
                 elif field in self._utf8_fields:
                     arr[field] = self._utf8_pack(
-                        value, self._utf8_fields[field],
-                        field in self._utf8_strict, field,
+                        value,
+                        self._utf8_fields[field],
+                        field in self._utf8_strict,
+                        field,
                     )
                 elif field in self._datetime_fields:
                     arr[field] = _dt_to_micros(value)
                 elif field in self._array_fields:
                     # numpy array field — assign directly
-                    arr[field] = np.asarray(value, dtype=self.user_schema.fields[field][0].base)
+                    arr[field] = np.asarray(
+                        value, dtype=self.user_schema.fields[field][0].base
+                    )
                 else:
                     arr[field] = value
             # else: field absent — np.zeros already encodes the correct
@@ -543,13 +579,25 @@ class Dataset:
             del result["_prefix"]
             for field in self._utf8_fields:
                 v = result[field]
-                result[field] = v.rstrip(b"\x00").decode("utf-8") if isinstance(v, bytes) else str(v)
+                result[field] = (
+                    v.rstrip(b"\x00").decode("utf-8")
+                    if isinstance(v, bytes)
+                    else str(v)
+                )
             for field in self._text_fields:
                 off, ns = result[field]
-                result[field] = "" if (off == 0 and ns == 0) else self.blob_store.read(int(off)).decode("utf-8")
+                result[field] = (
+                    ""
+                    if (off == 0 and ns == 0)
+                    else self.blob_store.read(int(off)).decode("utf-8")
+                )
             for field in self._json_fields:
                 off, ns = result[field]
-                result[field] = None if (off == 0 and ns == 0) else json.loads(self.blob_store.read(int(off)).decode("utf-8"))
+                result[field] = (
+                    None
+                    if (off == 0 and ns == 0)
+                    else json.loads(self.blob_store.read(int(off)).decode("utf-8"))
+                )
             for field in self._blob_fields:
                 off, ns = result[field]
                 result[field] = None if (off == 0 and ns == 0) else (int(off), int(ns))
@@ -563,13 +611,23 @@ class Dataset:
             value = arr[field]
             if field in self._text_fields:
                 offset, n_slots = int(value["offset"]), int(value["n_slots"])
-                result[field] = "" if (offset == 0 and n_slots == 0) else self.blob_store.read(offset).decode("utf-8")
+                result[field] = (
+                    ""
+                    if (offset == 0 and n_slots == 0)
+                    else self.blob_store.read(offset).decode("utf-8")
+                )
             elif field in self._json_fields:
                 offset, n_slots = int(value["offset"]), int(value["n_slots"])
-                result[field] = None if (offset == 0 and n_slots == 0) else json.loads(self.blob_store.read(offset).decode("utf-8"))
+                result[field] = (
+                    None
+                    if (offset == 0 and n_slots == 0)
+                    else json.loads(self.blob_store.read(offset).decode("utf-8"))
+                )
             elif field in self._blob_fields:
                 offset, n_slots = int(value["offset"]), int(value["n_slots"])
-                result[field] = None if (offset == 0 and n_slots == 0) else (offset, n_slots)
+                result[field] = (
+                    None if (offset == 0 and n_slots == 0) else (offset, n_slots)
+                )
             elif field in self._utf8_fields:
                 result[field] = bytes(value).rstrip(b"\x00").decode("utf-8")
             elif field in self._datetime_fields:
@@ -662,17 +720,31 @@ class Dataset:
                         value = rec[field]
                         offset = int(value["offset"])
                         n_slots = int(value["n_slots"])
-                        d[field] = "" if (offset == 0 and n_slots == 0) else self.blob_store.read(offset).decode("utf-8")
+                        d[field] = (
+                            ""
+                            if (offset == 0 and n_slots == 0)
+                            else self.blob_store.read(offset).decode("utf-8")
+                        )
                     elif field in self._json_fields:
                         value = rec[field]
                         offset = int(value["offset"])
                         n_slots = int(value["n_slots"])
-                        d[field] = None if (offset == 0 and n_slots == 0) else json.loads(self.blob_store.read(offset).decode("utf-8"))
+                        d[field] = (
+                            None
+                            if (offset == 0 and n_slots == 0)
+                            else json.loads(
+                                self.blob_store.read(offset).decode("utf-8")
+                            )
+                        )
                     elif field in self._blob_fields:
                         value = rec[field]
                         offset = int(value["offset"])
                         n_slots = int(value["n_slots"])
-                        d[field] = None if (offset == 0 and n_slots == 0) else (offset, n_slots)
+                        d[field] = (
+                            None
+                            if (offset == 0 and n_slots == 0)
+                            else (offset, n_slots)
+                        )
                     elif field in self._utf8_fields:
                         d[field] = bytes(rec[field]).rstrip(b"\x00").decode("utf-8")
                     elif field in self._datetime_fields:
@@ -699,7 +771,7 @@ class Dataset:
         if self._text_fields or self._json_fields:
             data = self.db.read(address, self.record_size)
             arr = np.frombuffer(data, dtype=self.schema)[0]
-            for field in (self._text_fields | self._json_fields):
+            for field in self._text_fields | self._json_fields:
                 value = arr[field]
                 offset = int(value["offset"])
                 n_slots = int(value["n_slots"])
@@ -761,8 +833,10 @@ class Dataset:
         if field_name in self._utf8_fields:
             field_dtype = self.user_schema.fields[field_name][0]
             packed = self._utf8_pack(
-                value, self._utf8_fields[field_name],
-                field_name in self._utf8_strict, field_name,
+                value,
+                self._utf8_fields[field_name],
+                field_name in self._utf8_strict,
+                field_name,
             )
             data = np.array([packed], dtype=field_dtype).tobytes()
             self.db.write(address + field_offset, data)
@@ -806,10 +880,18 @@ class Dataset:
             return bytes(value).rstrip(b"\x00").decode("utf-8")
         if field_name in self._text_fields:
             off, ns = int(value["offset"]), int(value["n_slots"])
-            return "" if (off == 0 and ns == 0) else self.blob_store.read(off).decode("utf-8")
+            return (
+                ""
+                if (off == 0 and ns == 0)
+                else self.blob_store.read(off).decode("utf-8")
+            )
         if field_name in self._json_fields:
             off, ns = int(value["offset"]), int(value["n_slots"])
-            return None if (off == 0 and ns == 0) else json.loads(self.blob_store.read(off).decode("utf-8"))
+            return (
+                None
+                if (off == 0 and ns == 0)
+                else json.loads(self.blob_store.read(off).decode("utf-8"))
+            )
         if field_name in self._blob_fields:
             off, ns = int(value["offset"]), int(value["n_slots"])
             return None if (off == 0 and ns == 0) else self.blob_store.read(off)
@@ -850,13 +932,23 @@ class Dataset:
             value = arr[field]
             if field in self._text_fields:
                 off, ns = int(value["offset"]), int(value["n_slots"])
-                result[field] = "" if (off == 0 and ns == 0) else self.blob_store.read(off).decode("utf-8")
+                result[field] = (
+                    ""
+                    if (off == 0 and ns == 0)
+                    else self.blob_store.read(off).decode("utf-8")
+                )
             elif field in self._json_fields:
                 off, ns = int(value["offset"]), int(value["n_slots"])
-                result[field] = None if (off == 0 and ns == 0) else json.loads(self.blob_store.read(off).decode("utf-8"))
+                result[field] = (
+                    None
+                    if (off == 0 and ns == 0)
+                    else json.loads(self.blob_store.read(off).decode("utf-8"))
+                )
             elif field in self._blob_fields:
                 off, ns = int(value["offset"]), int(value["n_slots"])
-                result[field] = None if (off == 0 and ns == 0) else self.blob_store.read(off)
+                result[field] = (
+                    None if (off == 0 and ns == 0) else self.blob_store.read(off)
+                )
             elif field in self._utf8_fields:
                 result[field] = bytes(value).rstrip(b"\x00").decode("utf-8")
             elif field in self._datetime_fields:
@@ -918,13 +1010,17 @@ class Dataset:
             address = address.addr
         record = as_record(record)
         if not isinstance(record, dict):
-            raise TypeError(f"Record must be a dict or Pydantic model, got {type(record).__name__}")
+            raise TypeError(
+                f"Record must be a dict or Pydantic model, got {type(record).__name__}"
+            )
         self.write(address, **record)
 
     def insert(self, record):
         record = as_record(record)
         if not isinstance(record, dict):
-            raise TypeError(f"Record must be a dict or Pydantic model, got {type(record).__name__}")
+            raise TypeError(
+                f"Record must be a dict or Pydantic model, got {type(record).__name__}"
+            )
         addr = self.allocate_block(1)
         self[addr] = record
         return Ref(self, int(addr))
