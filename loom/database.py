@@ -511,6 +511,77 @@ class DB:
         finally:
             pass
 
+    @contextmanager
+    def durable(self):
+        """Run a block with all-or-nothing crash safety (opt-in, off by default).
+
+        Wrap a set of writes — typically a bulk insert — so a hard crash
+        (power loss, ``kill -9``, container shutdown) cannot leave the database
+        torn.  On entry a consistent pre-image of the whole file is fsynced to
+        ``<file>.txn``; on clean exit the changes are fsynced and the snapshot
+        removed (that removal is the atomic commit point); on a crash mid-block
+        the next ``open()`` rolls the file back to its exact pre-block state.
+        An in-process exception rolls the block back live and re-raises — any
+        caller-held structure handle must then be re-fetched (``db[name]`` /
+        ``db.collection(name)``).
+
+        Re-entrant: nesting joins the outermost block.  The cost is one file
+        copy per outermost block, so wrap a whole bulk operation once rather
+        than each record.  Normal (non-durable) writes stay exactly as fast::
+
+            with db.durable():
+                posts.insert_many(batch)
+        """
+        if not self._is_open:
+            raise DatabaseNotOpenError()
+        self._ensure_writable()
+        with self.write_lock():
+            # Structures buffer their metadata in memory (auto-saved only every
+            # N ops), so the on-disk file lags until they save().  Force a
+            # checkpoint so the snapshot — and later the commit — capture a
+            # fully consistent state, not one whose header still reads length 0.
+            self._checkpoint_structures()
+            self._db.begin_txn()
+            committed = False
+            try:
+                yield
+                self._checkpoint_structures()
+                self._db.commit_txn()
+                committed = True
+            finally:
+                if not committed:
+                    self._rollback_durable()
+
+    def _checkpoint_structures(self):
+        """Push every structure's in-memory metadata into the header (as close()
+        does), so the file on disk is a consistent snapshot target."""
+        for ds in self._datastructures.values():
+            if hasattr(ds, "save"):
+                try:
+                    ds.save(force=True)
+                except TypeError:
+                    ds.save()
+        if self._blob_store is not None:
+            self._blob_store._save_freelist()
+
+    def _rollback_durable(self):
+        """Discard an aborted durable block: restore the pre-image and reload."""
+        self._db.rollback_txn()
+        # Handles cached against the discarded state are now stale — drop them
+        # and reload the registry from the restored file.
+        self._datasets.clear()
+        self._datastructures.clear()
+        self._blob_store = None
+        # The shared key→address cache holds addresses from the rolled-back
+        # writes; after restoring an older file they point at zeroed/absent
+        # records (WrongDatasetError on read).  Same hazard as drop_collection.
+        if self._shared_cache is not None:
+            self._shared_cache.clear()
+        self._load_registry()
+        saved_compression = self._db.get_header_field(self.BLOB_COMPRESSION_KEY)
+        if saved_compression is not None:
+            self._blob_compression = saved_compression
+
     def _reserve_name(self, name, in_dataset, exist_ok):
         """Validate a new name across BOTH the dataset and datastructure
         namespaces (so ``db[name]`` is never ambiguous).

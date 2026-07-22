@@ -993,8 +993,9 @@ At this scale FlatIndex reads ~150 MB of mmap data per query — it becomes the 
 ## Reliability
 
 **Crash safety**
-- Double-buffer header: two alternating slots, single-byte atomic flip. If the process crashes mid-write, the previous slot is intact.
+- Double-buffer header: two alternating slots, each stamped with a monotonic sequence number and a CRC32 over its payload. On load the newest slot that passes its CRC wins, so a torn write (a slot only half-flushed under lazy writeback) is rejected — recovery rolls back to the last fully-consistent header, never a page-spliced mix of two generations.
 - Write-Ahead Log (WAL) for multi-write atomic transactions (`db.apply_writes()`).
+- `db.durable()` — opt-in, all-or-nothing crash safety for a block of writes (see below).
 - `auto_save_interval=N` controls how often structure metadata (lengths, counters) is checkpointed to disk (default: every 100 ops per structure). Bulk ops (`append_many`, `push_many`) also checkpoint at the end, and `flush()`/`close()` persist it immediately. An `atexit` safety net also closes any still-open DB on a clean interpreter exit, so a script that forgets `close()`/`with` still persists its metadata. Prefer `with DB(...)` (or an explicit `close()`/`flush()`) anyway — `atexit` does not run on `kill -9` or a hard crash.
 
 **Durability modes**
@@ -1015,6 +1016,24 @@ db.flush()  # call every N seconds, or after critical transactions
 # Full sync on every write (safe, 3× slower)
 db = DB("app.db", sync_writes=True)
 ```
+
+**Durable transactions (`db.durable()`)** — opt-in, off by default
+
+`sync_writes` and `flush()` bound *when* data reaches disk, but a hard crash (power loss, `kill -9`, container shutdown) *mid-write* can still tear an individual record, index node or the header. For a block of writes that must be all-or-nothing across such a crash, wrap it in `db.durable()`:
+
+```python
+with db.durable():
+    posts.insert_many(batch)        # 244 articles, several indexes
+# ← either every write above is durably applied, or (on crash) none is
+```
+
+On entry it fsyncs a consistent snapshot of the whole file to `<file>.txn`; on clean exit it fsyncs the changes and removes the snapshot (the atomic commit point); on a crash mid-block the next `open()` rolls the file back to its exact pre-block state. `Collection.insert(durable=True)` / `insert_many(durable=True)` are shortcuts that wrap the call this way:
+
+```python
+posts.insert_many(batch, durable=True)   # one snapshot for the whole batch
+```
+
+The cost is **one file-copy per outermost block**, so wrap a whole bulk ingest once rather than each record — the default (non-durable) path stays untouched and fast. It's re-entrant (nesting joins the outer block); an in-process exception inside the block rolls back live, after which caller-held handles must be re-fetched (`db["name"]` / `db.collection(name)`).
 
 **Space reclamation**
 - `ByteFileDB` freelist: freed blocks (Queue pop exhaustion, List compaction) are reused by any future allocation — the file does not grow unboundedly in steady state.

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import numbers
 import struct
+from contextlib import nullcontext
 from datetime import date, datetime
 from functools import lru_cache
 
@@ -337,12 +338,18 @@ class Collection:
                 si["index"].delete(int(entry["doc_id"]))
                 del si["pk2docid"][pk]
 
-    def insert(self, record):
+    def insert(self, record, durable=False):
         """Insert a record, or upsert it if its primary key already exists
-        (the stored record is replaced and every index is re-pointed)."""
+        (the stored record is replaced and every index is re-pointed).
+
+        durable=True (default False) runs the write inside ``db.durable()`` so a
+        hard crash cannot leave a torn record/index — at the cost of one file
+        snapshot. For many rows prefer ``insert_many(..., durable=True)`` (one
+        snapshot per batch) or wrap a loop in ``with db.durable():``."""
         record = as_record(record)
         pk = self._pk_of(record)
-        with self._db.write_lock():
+        guard = self._db.durable() if durable else nullcontext()
+        with guard, self._db.write_lock():
             with self._db.batch(defer_save=True):
                 old = self._primary.get(pk)
                 if old is not None:        # upsert: drop the old index/search entries
@@ -353,10 +360,17 @@ class Collection:
                 self._add_to_search(record, pk)
         return pk
 
-    def insert_many(self, records):
+    def insert_many(self, records, durable=False):
         """Bulk insert, upserting any record whose primary key already exists
         (its old index/search entries are dropped first).  Within one batch a
-        repeated primary key keeps the last occurrence."""
+        repeated primary key keeps the last occurrence.
+
+        durable=True (default False) wraps the whole batch in ``db.durable()``:
+        one file snapshot up front, then an all-or-nothing commit, so a hard
+        crash (power loss / kill -9 / container shutdown) mid-insert rolls the
+        DB back to its pre-batch state instead of leaving a torn index.  Off by
+        default to keep the fast path fast; turn it on for the risky bulk
+        ingests where a partial write would corrupt the DB."""
         # Dedup within the batch (last write wins), preserving first-seen order.
         dedup = {}
         for r in records:
@@ -364,7 +378,8 @@ class Collection:
             dedup[self._pk_of(r)] = r
         pks = list(dedup.keys())
         records = list(dedup.values())
-        with self._db.write_lock():
+        guard = self._db.durable() if durable else nullcontext()
+        with guard, self._db.write_lock():
             with self._db.batch():
                 # Enforce unique constraints up front (before any write), both
                 # within the batch and against existing rows — a violation

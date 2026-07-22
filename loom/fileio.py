@@ -1,6 +1,7 @@
 import os
 import mmap
 import pickle
+import shutil
 import struct
 import zlib
 import numpy as np
@@ -42,6 +43,11 @@ class ByteFileDB:
             raise ValueError("flag must be one of 'r', 'r+', 'w', or 'rw'")
         self.filename = filename
         self.log_filename = self.filename + ".log"
+        # Opt-in durable transaction: a full-file pre-image snapshot. Its mere
+        # presence on disk means an in-flight durable block did not commit, so
+        # open() restores from it (see _recover_txn_snapshot / begin_txn).
+        self.txn_filename = self.filename + ".txn"
+        self._txn_depth = 0
         self.initial_size = initial_size
         self.header_size = header_size
         self._slot_size = (header_size - 1) // 2  # usable bytes per slot
@@ -87,11 +93,20 @@ class ByteFileDB:
                     "Cannot open read-only database with a pending WAL log; "
                     "reopen it writable once to recover"
                 )
+            if os.path.exists(self.txn_filename):
+                raise ReadOnlyError(
+                    "Cannot open read-only database with an interrupted durable "
+                    "transaction; reopen it writable once to roll back"
+                )
             self.file_handle = open(self.filename, "rb")
             self.mapped_file = mmap.mmap(
                 self.file_handle.fileno(), 0, access=mmap.ACCESS_READ
             )
         else:
+            # A leftover snapshot means a durable block was interrupted (hard
+            # crash / kill -9): roll the main file back to its pre-block state
+            # before mapping it.  Must run before ensure_file_size touches it.
+            self._recover_txn_snapshot()
             self.ensure_file_size(max(self.initial_size, self.header_size))
             self.file_handle = open(self.filename, "r+b")
             self.mapped_file = mmap.mmap(self.file_handle.fileno(), 0)
@@ -122,6 +137,95 @@ class ByteFileDB:
         if self.file_handle:
             self.file_handle.close()
             self.file_handle = None
+
+    # -------------------------------------------------------------------------
+    # Durable transaction: full-file pre-image snapshot (opt-in, off by default)
+    #
+    # begin_txn() fsyncs a consistent snapshot of the whole DB to <file>.txn
+    # BEFORE the block's writes touch the main file.  Everything then runs at
+    # normal (lazy, fast) speed against the main file.  commit_txn() fsyncs the
+    # main file, then removes the snapshot — that removal is the atomic commit
+    # point.  A hard crash anywhere in between leaves the snapshot on disk, so
+    # the next open() restores the main file to its exact pre-block state:
+    # all-or-nothing, no torn record/node/header can survive.  The cost is one
+    # file copy per outermost block, paid only when durability is requested.
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _fsync_path(path):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _fsync_dir(self):
+        directory = os.path.dirname(os.path.abspath(self.filename)) or "."
+        self._fsync_path(directory)
+
+    def _recover_txn_snapshot(self):
+        """Restore the main file from an interrupted durable block, if any.
+
+        No-op while a block is active (``_txn_depth > 0``): a _remap() during
+        the block reopens the file and must NOT roll back the very snapshot it
+        is protecting.
+        """
+        if self._txn_depth > 0:
+            return
+        if not os.path.exists(self.txn_filename):
+            return
+        shutil.copyfile(self.txn_filename, self.filename)
+        self._fsync_path(self.filename)
+        os.remove(self.txn_filename)
+        self._fsync_dir()
+        # The pre-image predates any WAL entries; drop a stale log too.
+        if os.path.exists(self.log_filename) and os.path.getsize(self.log_filename):
+            with open(self.log_filename, "wb"):
+                pass
+
+    def begin_txn(self):
+        """Enter a durable block. Re-entrant; only the outermost snapshots."""
+        self._ensure_writable()
+        if self._txn_depth == 0:
+            # Flush a consistent pre-image, then copy it durably to <file>.txn.
+            self.flush()
+            if self.file_handle is not None:
+                os.fsync(self.file_handle.fileno())
+            tmp = self.txn_filename + ".partial"
+            shutil.copyfile(self.filename, tmp)
+            self._fsync_path(tmp)
+            os.replace(tmp, self.txn_filename)  # atomic: .txn appears complete
+            self._fsync_dir()
+        self._txn_depth += 1
+
+    def commit_txn(self):
+        """Commit the durable block: make the main file durable, drop snapshot."""
+        if self._txn_depth == 0:
+            return
+        self._txn_depth -= 1
+        if self._txn_depth == 0:
+            self.flush()
+            if self.file_handle is not None:
+                os.fsync(self.file_handle.fileno())
+            if os.path.exists(self.txn_filename):
+                os.remove(self.txn_filename)
+                self._fsync_dir()
+
+    def rollback_txn(self):
+        """Abort: discard in-flight changes and restore the pre-image live."""
+        self._txn_depth = 0
+        if not os.path.exists(self.txn_filename):
+            return
+        if self.mapped_file is not None:
+            self.mapped_file.close()
+            self.mapped_file = None
+            self._map_size = 0
+        if self.file_handle is not None:
+            self.file_handle.close()
+            self.file_handle = None
+        # _recover_txn_snapshot() restores the file, clears the log, and (now
+        # that _txn_depth is 0) is not skipped; open() then remaps + reloads.
+        self.open()
 
     def _remap(self, min_size):
         """Grow file and re-create mmap. Flushes before closing."""
