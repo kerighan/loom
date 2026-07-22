@@ -61,7 +61,7 @@ class List(DataStructure):
     """
 
     # Nesting compatibility
-    _outer_types_supported = ("Dict", "List")   # Dict[List], List[List] OK
+    _outer_types_supported = ("Dict", "List")  # Dict[List], List[List] OK
     _inner_types_supported = ("List", "Dict", "Set", "BTree", "Queue")
 
     # Exponential growth parameters
@@ -316,6 +316,9 @@ class List(DataStructure):
         self.blocks = metadata["blocks"]
         self.block_valid_counts = metadata["block_valid_counts"]
 
+        # Heal a crash-recovered header whose fields span two generations.
+        self._reconcile_p_last()
+
         self._is_nested = metadata.get("is_nested", False)
 
         # Reconstruct template if nested
@@ -327,7 +330,10 @@ class List(DataStructure):
             template_class = _DS_REGISTRY.get(template_class_name, List)
 
             # Reconstruct template via class protocol (no per-type switch)
-            full_config = {**template_config, "_template_dataset": metadata.get("template_dataset")}
+            full_config = {
+                **template_config,
+                "_template_dataset": metadata.get("template_dataset"),
+            }
             self._template = template_class._reconstruct_template(
                 self._db, full_config, template_class_name
             )
@@ -385,7 +391,14 @@ class List(DataStructure):
         """
         cumulative = 0
 
-        for p in range(self.P_INIT, self.p_last + 2):  # +2 to check next block
+        # Scan the whole addressable block range rather than stopping at
+        # `p_last + 2`.  The bound is pure arithmetic (index vs. cumulative
+        # capacity) and does not depend on how many blocks are *allocated*, so
+        # deriving it from `p_last` made the append path crash whenever a
+        # crash-recovered header carried a `length` ahead of a stale `p_last`
+        # (IndexError "out of range" on a slot that is genuinely in range).
+        # Iterating the full range is O(MAX_BLOCKS) trivial int math.
+        for p in range(self.P_INIT, self.P_INIT + len(self.blocks)):
             capacity = self._get_capacity(p)
 
             if index < cumulative + capacity:
@@ -396,6 +409,28 @@ class List(DataStructure):
             cumulative += capacity
 
         raise IndexError(f"Index {index} out of range")
+
+    def _reconcile_p_last(self):
+        """Repair `p_last` so it is consistent with `blocks` and `length`.
+
+        A crash-recovered header can carry fields from two different
+        generations (see fileio double-buffer notes).  `p_last` only ever
+        grows, so the safe fix is to raise it to cover both the highest
+        allocated block and the block that `length` requires — never lower it.
+        This keeps to_ref()/slice paths (which read `p_last`) in step with the
+        append path and turns a would-be crash into a self-healing reopen.
+        """
+        p = self.p_last
+        # Highest allocated block.
+        for block_idx in range(len(self.blocks) - 1, -1, -1):
+            if self.blocks[block_idx]:
+                p = max(p, self.P_INIT + block_idx)
+                break
+        # Block required to hold `length` items (last occupied slot index).
+        if self.length > 0:
+            block_idx, _ = self._calculate_block_and_offset(self.length - 1)
+            p = max(p, self.P_INIT + block_idx)
+        self.p_last = p
 
     def _allocate_block(self, block_idx):
         """Allocate a new block.
@@ -500,7 +535,7 @@ class List(DataStructure):
             # Regular list: append data
             if item is None:
                 raise ValueError("Cannot append None to data list")
-            item = as_record(item)   # accept a Pydantic model
+            item = as_record(item)  # accept a Pydantic model
             if atomic:
                 # Use atomic one-item batch
                 self.append_many([item], atomic=True)
@@ -774,10 +809,10 @@ class List(DataStructure):
     def get_ref(self, index):
         """Return a Ref handle to the record at `index` (in-place reads/writes).
 
-            r = posts.get_ref(0)
-            r["likes"] += 1            # single-field update, no re-fetch
-            r.update(text="edited")    # partial update
-            r.get()                    # the record (without the 'valid' flag)
+        r = posts.get_ref(0)
+        r["likes"] += 1            # single-field update, no re-fetch
+        r.update(text="edited")    # partial update
+        r.get()                    # the record (without the 'valid' flag)
         """
         from loom.ref import Ref
 
@@ -789,7 +824,9 @@ class List(DataStructure):
             raise IndexError("list index out of range")
         if self.length == self.valid_count:
             block_idx, offset = self._calculate_block_and_offset(index)
-            item_addr = self.blocks[block_idx] + offset * self._items_dataset.record_size
+            item_addr = (
+                self.blocks[block_idx] + offset * self._items_dataset.record_size
+            )
         else:
             _block_idx, item_addr = self._find_nth_valid_item_address(index)
         return Ref(self._items_dataset, item_addr)
@@ -912,8 +949,8 @@ class List(DataStructure):
                 # resolves blob references → actual strings.
                 # Otherwise use the fast numpy bulk-read path.
                 has_variable = bool(
-                    getattr(self._items_dataset, "_text_fields", None) or
-                    getattr(self._items_dataset, "_blob_fields", None)
+                    getattr(self._items_dataset, "_text_fields", None)
+                    or getattr(self._items_dataset, "_blob_fields", None)
                 )
 
                 if has_variable:
@@ -983,7 +1020,7 @@ class List(DataStructure):
         if index < 0 or index >= self.valid_count:
             raise IndexError("list index out of range")
 
-        item = as_record(item)   # accept a Pydantic model
+        item = as_record(item)  # accept a Pydantic model
 
         # Fast path: no deletions
         if self.length == self.valid_count:
@@ -1339,6 +1376,9 @@ class List(DataStructure):
             instance.block_valid_counts = [0] * cls.MAX_BLOCKS
             for i in range(cls.MAX_BLOCKS_NESTED):
                 instance.block_valid_counts[i] = int(ref[f"bvc_{i}"])
+
+            # Heal a stale/mismatched p_last carried in the ref.
+            instance._reconcile_p_last()
 
             # Set other required attributes
             instance.name = f"_nested_{id(instance)}"

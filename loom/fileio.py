@@ -1,6 +1,8 @@
 import os
 import mmap
 import pickle
+import struct
+import zlib
 import numpy as np
 
 from loom.errors import ReadOnlyError
@@ -8,10 +10,25 @@ from loom.errors import ReadOnlyError
 
 class ByteFileDB:
     # Double-buffer header layout:
-    #   [0]            active slot indicator (0=A, 1=B)
-    #   [1 : slot_size+1]   slot A  — [LOOM 4B][size 4B][pickle NB]
+    #   [0]            active slot indicator (0=A, 1=B) — a hint, see below
+    #   [1 : slot_size+1]   slot A  — [LOM2 4B][seqno 8B][size 4B][crc32 4B][pickle NB]
     #   [slot_size+1 : header_size]  slot B  — same layout
-    # If crash during write to inactive slot, active slot is still intact.
+    #
+    # Crash consistency (why seqno + CRC, not just the double buffer):
+    #   With lazy writeback (sync_writes=False) mmap dirty pages reach disk in
+    #   arbitrary order and with no barrier, so a hard shutdown can flush the
+    #   active-slot flip byte while the slot's own pages are only half written.
+    #   A half-written pickle can still deserialize into a *plausible but mixed*
+    #   dict (two header generations spliced page-by-page) — which is exactly
+    #   how a List ended up with `length` from one generation and `p_last` from
+    #   another, crashing _calculate_block_and_offset on reopen.
+    #   The per-slot CRC rejects any torn slot; the monotonic seqno lets the
+    #   reader pick the newest *intact* slot regardless of the (possibly
+    #   half-flushed) hint byte.  A crash can still roll the header back to an
+    #   older but fully-consistent generation — never to a spliced one.
+    _MAGIC = b"LOM2"  # current slot format (seqno + CRC)
+    _LEGACY_MAGIC = b"LOOM"  # pre-CRC format, still readable
+    _SLOT_HDR = 20  # 4 magic + 8 seqno + 4 size + 4 crc
 
     def __init__(
         self,
@@ -39,6 +56,7 @@ class ByteFileDB:
 
         # Header metadata dictionary (in-memory cache)
         self._header_data = {}
+        self._header_seqno = 0  # monotonic; picks newest intact slot on load
         self._header_dirty = False
         self._write_count = 0  # tracks writes since last flush
         self._batch_mode = False
@@ -221,50 +239,102 @@ class ByteFileDB:
     def _peek_stored_header_size(self):
         """Read the stored header_size from slot A WITHOUT relying on the
         header_size we were constructed with.  Slot A always starts at byte
-        offset 1: [magic 4B][size 4B][pickle].  Returns int, or None for an
-        uninitialised file or one written before header_size was persisted."""
+        offset 1.  Handles both the CRC format and the legacy one.  Returns
+        int, or None for an uninitialised / torn / pre-header_size file."""
         mf = self.mapped_file
-        if mf is None or len(mf) < 9 or bytes(mf[1:5]) != b"LOOM":
+        if mf is None or len(mf) < 9:
             return None
+        magic = bytes(mf[1:5])
         try:
-            data_size = int(np.frombuffer(mf[5:9], dtype="uint32")[0])
-            if data_size <= 0 or 9 + data_size > len(mf):
+            if magic == self._MAGIC:
+                if len(mf) < 1 + self._SLOT_HDR:
+                    return None
+                _seqno, data_size, crc = struct.unpack("<QII", bytes(mf[5:21]))
+                start = 1 + self._SLOT_HDR
+                if data_size <= 0 or start + data_size > len(mf):
+                    return None
+                payload = bytes(mf[start : start + data_size])
+                if zlib.crc32(payload) & 0xFFFFFFFF != crc:
+                    return None
+                data = pickle.loads(payload)
+            elif magic == self._LEGACY_MAGIC:
+                data_size = int(np.frombuffer(mf[5:9], dtype="uint32")[0])
+                if data_size <= 0 or 9 + data_size > len(mf):
+                    return None
+                data = pickle.loads(bytes(mf[9 : 9 + data_size]))
+            else:
                 return None
-            data = pickle.loads(bytes(mf[9 : 9 + data_size]))
         except Exception:
             return None
         v = data.get(self._header_size_key) if isinstance(data, dict) else None
         return int(v) if isinstance(v, int) and v > 0 else None
 
     def _read_slot(self, slot):
-        """Try to deserialize header data from a slot. Returns dict or None."""
+        """Deserialize a slot.  Returns ``(header_dict, seqno)`` or None.
+
+        A slot whose CRC does not match its payload is a torn write and is
+        rejected (returns None) so its intact sibling wins.  Legacy slots
+        (``LOOM``, no CRC/seqno) are still read, tagged with seqno ``-1`` so
+        any modern slot is preferred over them.
+        """
         offset = self._slot_offset(slot)
-        slot_bytes = self.mapped_file[offset : offset + self._slot_size]
-        if slot_bytes[0:4] != b"LOOM":
+        slot_bytes = bytes(self.mapped_file[offset : offset + self._slot_size])
+        magic = slot_bytes[0:4]
+        if magic == self._MAGIC:
+            try:
+                seqno, data_size, crc = struct.unpack("<QII", slot_bytes[4:20])
+            except struct.error:
+                return None
+            if 0 < data_size <= self._slot_size - self._SLOT_HDR:
+                payload = slot_bytes[self._SLOT_HDR : self._SLOT_HDR + data_size]
+                if zlib.crc32(payload) & 0xFFFFFFFF == crc:
+                    try:
+                        return pickle.loads(payload), seqno
+                    except Exception:
+                        return None
             return None
-        try:
-            data_size = np.frombuffer(slot_bytes[4:8], dtype="uint32")[0]
-            if data_size > 0 and data_size < self._slot_size - 8:
-                return pickle.loads(slot_bytes[8 : 8 + data_size])
-        except Exception:
-            pass
+        if magic == self._LEGACY_MAGIC:
+            try:
+                data_size = int(np.frombuffer(slot_bytes[4:8], dtype="uint32")[0])
+                if 0 < data_size < self._slot_size - 8:
+                    return pickle.loads(slot_bytes[8 : 8 + data_size]), -1
+            except Exception:
+                pass
         return None
 
     def _load_header(self):
-        """Load header metadata from the active slot, fallback to other."""
+        """Load header from the newest intact slot.
+
+        Both slots are read and CRC-checked; the one with the highest seqno
+        wins (a torn slot fails CRC → None → loses to its intact sibling).
+        Ties, and the all-legacy case (seqno -1), fall back to the active-slot
+        hint byte.  This can never surface a page-spliced header: the worst
+        case is rolling back to an older but fully-consistent generation.
+        """
         if len(self.mapped_file) < self.header_size:
             return
 
-        # Read active slot indicator
         active = self.mapped_file[0]
         if active not in (0, 1):
             active = 0  # Default to slot A
 
-        # Try active slot first, fallback to other
-        data = self._read_slot(active)
-        if data is None:
-            data = self._read_slot(1 - active)
-        if data is None:
+        candidates = []
+        for slot in (0, 1):
+            r = self._read_slot(slot)
+            if r is not None:
+                candidates.append((slot, r[0], r[1]))  # (slot, data, seqno)
+
+        chosen = None
+        if candidates:
+            max_seq = max(seq for _, _, seq in candidates)
+            best = [c for c in candidates if c[2] == max_seq]
+            if len(best) == 1:
+                chosen = best[0]
+            else:
+                # Tie (typically both legacy, seqno -1): honour the hint byte.
+                chosen = next((c for c in best if c[0] == active), best[0])
+
+        if chosen is None:
             if self.read_only:
                 raise ReadOnlyError(
                     "Cannot initialize a missing header in read-only mode"
@@ -272,7 +342,8 @@ class ByteFileDB:
             self._initialize_header()
             return
 
-        self._header_data = data
+        self._header_data = chosen[1]
+        self._header_seqno = max(0, chosen[2])
         # Gracefully upgrade pre-existing files: record the header_size so the
         # next save makes the file self-describing (persisted on next write).
         self._header_data.setdefault(self._header_size_key, self.header_size)
@@ -287,29 +358,38 @@ class ByteFileDB:
             self._allocation_index_key: self.header_size,
             self._header_size_key: self.header_size,
         }
-        # Write to both slots for a clean start
+        # Write to both slots for a clean start (slot A gets the higher seqno
+        # so the hint byte and the seqno agree).
         self.mapped_file[0] = 0  # Slot A active
-        self._write_slot(0)
-        self._write_slot(1)
+        self._write_slot(1, 1)
+        self._write_slot(0, 2)
+        self._header_seqno = 2
         self.mapped_file.flush()
         self._header_dirty = False
 
-    def _write_slot(self, slot):
-        """Serialize current header data into a slot."""
+    def _write_slot(self, slot, seqno):
+        """Serialize current header data into a slot.
+
+        Layout: ``[LOM2][seqno u64][size u32][crc32 u32][pickle]``.  The CRC
+        covers the pickle payload so a partially-flushed slot is detectable;
+        the seqno orders the two slots independently of the hint byte.
+        """
         pickled_data = pickle.dumps(self._header_data)
         data_size = len(pickled_data)
-        max_data = self._slot_size - 8
+        max_data = self._slot_size - self._SLOT_HDR
 
         if data_size > max_data:
             from loom.errors import HeaderTooLargeError
 
             raise HeaderTooLargeError(data_size, max_data)
 
-        # Write only the marker + length prefix + payload.  The reader keys
-        # off the 4-byte length, so trailing bytes from a previous (possibly
-        # larger) write are ignored — no need to zero-pad the whole slot,
-        # which would copy megabytes per call on large headers.
-        slot_bytes = b"LOOM" + np.uint32(data_size).tobytes() + pickled_data
+        crc = zlib.crc32(pickled_data) & 0xFFFFFFFF
+        # Marker + seqno + length + CRC + payload.  The reader keys off the
+        # length and validates the CRC, so trailing bytes from a previous
+        # (possibly larger) write are ignored — no need to zero-pad the slot.
+        slot_bytes = (
+            self._MAGIC + struct.pack("<QII", seqno, data_size, crc) + pickled_data
+        )
 
         offset = self._slot_offset(slot)
         self.mapped_file[offset : offset + len(slot_bytes)] = slot_bytes
@@ -335,8 +415,11 @@ class ByteFileDB:
             active = 0
         inactive = 1 - active
 
-        # Write to inactive slot, then flip indicator.
-        self._write_slot(inactive)
+        # Write to inactive slot with the next seqno, then flip the hint byte.
+        # Correctness no longer rests on the flip landing after the slot: the
+        # seqno + CRC let _load_header pick the newest intact slot on their own.
+        self._header_seqno += 1
+        self._write_slot(inactive, self._header_seqno)
         self.mapped_file[0] = inactive
         self._header_dirty = False
         self._write_count += 1

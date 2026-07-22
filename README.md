@@ -816,13 +816,13 @@ All numbers use the **default shared cache** (`DB(cache_size=200_000)`) — one 
 
 | Operation | **loom** | **SqliteDict** | Ratio |
 |---|---:|---:|---:|
-| Dict insert (per-call) | **21 000 ops/s** | 5 000 ops/s (autocommit) | loom **4.2×** |
-| Dict insert (batch) | **22 000 ops/s** | 22 000 ops/s (single `COMMIT`) | loom **1.0×** |
-| Dict read | **167 000 ops/s** | 11 900 ops/s | loom **14×** |
-| Dict contains | **624 000 ops/s** | 12 300 ops/s | loom **51×** |
-| Dict keys() | **263 000 ops/s** | 111 000 ops/s | loom **2.4×** |
+| Dict insert (per-call) | **21 000 ops/s** | 4 900 ops/s (autocommit) | loom **4.4×** |
+| Dict insert (batch) | **22 000 ops/s** | 25 000 ops/s (single `COMMIT`) | SQLite **1.1×** |
+| Dict read | **194 000 ops/s** | 11 500 ops/s | loom **17×** |
+| Dict contains | **713 000 ops/s** | 11 800 ops/s | loom **60×** |
+| Dict keys() | **288 000 ops/s** | 118 000 ops/s | loom **2.4×** |
 
-loom is faster on every line, including SQLite's most favourable mode (defer all writes to a single transaction). The gap is widest on point ops because loom uses lazy mmap flush — no `msync()` per write, just OS page-cache writeback — while SQLite has to walk a B-tree per call. `contains` benefits from binary murmur128 slots (25 bytes regardless of key length), which makes the inner loop a couple of integer compares.
+loom is faster on every point operation, by a wide margin — only SQLite's most favourable *write* mode (defer every insert to a single transaction) edges out loom's per-call inserts, and then only marginally. The gap is widest on point ops because loom uses lazy mmap flush — no `msync()` per write, just OS page-cache writeback — while SQLite has to walk a B-tree per call. `contains` benefits from binary murmur128 slots (25 bytes regardless of key length), which makes the inner loop a couple of integer compares.
 
 Per-call inserts already run at batch speed in loom (the flush is already lazy), so wrapping inserts in `db.batch()` mostly matters for `text` / blob fields, where it amortises one BlobStore flush across many writes.
 
@@ -830,37 +830,37 @@ Per-call inserts already run at batch speed in loom (the flush is already lazy),
 
 | Structure | Operation | ops/s | µs/op |
 |---|---|---:|---:|
-| Dict | insert | 21 000 | 48 |
-| Dict | read | 167 000 | 6 |
-| Dict | contains | 624 000 | 2 |
-| Dict | keys() | 263 000 | 4 |
-| Dict | items() | 134 000 | 7 |
-| List | append | 91 000 | 11 |
-| List | read[i] | 190 000 | 5 |
-| Queue | push (batch) | 158 000 | 6 |
-| Queue | pop | 187 000 | 5 |
-| BTree | insert | 12 000 | 81 |
-| BTree | read | 104 000 | 10 |
-| BTree | contains | 175 000 | 6 |
-| BTree | keys() [sorted] | 6 160 000 | 0 |
+| Dict | insert | 21 000 | 47 |
+| Dict | read | 194 000 | 5 |
+| Dict | contains | 713 000 | 1 |
+| Dict | keys() | 288 000 | 3 |
+| Dict | items() | 130 000 | 8 |
+| List | append | 84 000 | 12 |
+| List | read[i] | 158 000 | 6 |
+| Queue | push (batch) | 152 000 | 7 |
+| Queue | pop | 178 000 | 6 |
+| BTree | insert | 29 000 | 35 |
+| BTree | read | 128 000 | 8 |
+| BTree | contains | 222 000 | 5 |
+| BTree | keys() [sorted] | 6 000 000 | 0 |
 | Set | add | 27 000 | 37 |
 | Set | contains | 441 000 | 2 |
 | Set | remove | 25 000 | 40 |
 | LRUDict | set | 8 500 | 118 |
 | LRUDict | get (hit) | 31 000 | 32 |
-| Graph | add_nodes / add_edges (bulk) | 26 000 | 38 |
-| Graph | add_edge (per-call) | 1 700 | 583 |
-| Graph | get_node | 184 000 | 5 |
-| Graph | has_edge | 61 000 | 16 |
-| Graph | neighbors | 263 000 edges/s | 4 |
+| Graph | add_nodes / add_edges (bulk) | 32 000 | 31 |
+| Graph | add_edge (per-call) | 2 000 | 490 |
+| Graph | get_node | 175 000 | 6 |
+| Graph | has_edge | 57 000 | 17 |
+| Graph | neighbors | 255 000 edges/s | 4 |
 
 All rows use the default shared cache; Graph rows are the FB15k reference benchmark below. `contains`/`read` on Dict, Set and BTree are dominated by cache hits (key→address), so they assume a working set that fits the cache. `Set add`/`LRUDict set` track `Dict insert` because both wrap a Dict (Set adds a membership record; LRUDict adds eviction bookkeeping), so neither can be faster than the underlying insert.
 
-**Dict vs BTree — pick the right tool.** The B-tree relies on keeping its internal nodes hot. With the shared cache its random `read` (~104k/s) and `contains` (~175k/s) are strong, and `keys()` iterates already-sorted, mostly-cached nodes at millions/s; at `cache_size=0` the same `read` collapses (every node a cold mmap read). The Dict reaches higher read rates from the address cache and inserts ~2× faster. So:
+**Dict vs BTree — pick the right tool.** The B-tree relies on keeping its internal nodes hot. With the shared cache its random `read` (~128k/s) and `contains` (~222k/s) are strong, and `keys()` iterates already-sorted, mostly-cached nodes at millions/s; at `cache_size=0` the same `read` collapses (every node a cold mmap read). The Dict still reaches higher *read* rates from the address cache. So:
 
-- **Insert**: Dict wins (~21k vs ~12k/s) — O(1) slot vs O(log n) node path. Building a fresh BTree from a batch, use `bulk_load()` (O(n) bottom-up, ~140k keys/s).
-- **Random read / contains**: comparable with a warm cache; the Dict is the simpler choice for pure point access.
-- **Ordered iteration / range / prefix**: BTree only — `keys()` comes out sorted, and `range()`/`prefix()` seek to the start key then walk the span (O(log n + k)). A range of 101 keys takes ~364 µs (~2 700 ranges/s).
+- **Insert**: comparable now (~21k Dict vs ~29k BTree/s) — the BTree's node path has caught up and edges ahead on this workload; both are fast. Building a fresh BTree from a batch, use `bulk_load()` (O(n) bottom-up, ~140k keys/s).
+- **Random read / contains**: comparable with a warm cache; the Dict reaches higher point-read rates and is the simpler choice for pure point access.
+- **Ordered iteration / range / prefix**: BTree only — `keys()` comes out sorted, and `range()`/`prefix()` seek to the start key then walk the span (O(log n + k)). A range of 101 keys takes ~284 µs (~3 500 ranges/s).
 
 Bottom line: use a `Dict` for pure point access, a `BTree` when you need ordering or range queries.
 
@@ -870,9 +870,9 @@ Bottom line: use a `Dict` for pure point access, a `BTree` when you need orderin
 
 | Schema | Compression | insert | read |
 |---|---|---:|---:|
-| Fixed fields only | — | 21 000 ops/s | 167 000 ops/s |
-| + `str` body (≈600 chars) | None (default) | 22 000 ops/s | 167 000 ops/s |
-| + `str` body (≈600 chars) | brotli | 1 300 ops/s | 59 000 ops/s |
+| Fixed fields only | — | 21 000 ops/s | 194 000 ops/s |
+| + `str` body (≈600 chars) | None (default) | 23 000 ops/s | 164 000 ops/s |
+| + `str` body (≈600 chars) | brotli | 1 400 ops/s | 58 000 ops/s |
 
 - `blob_compression=None` (**default**) — fastest writes, larger files.
 - `"brotli"` — 3–5× compression on natural language, but ~20× slower inserts; pick when storage > write throughput.
@@ -893,9 +893,9 @@ Build (write):
 
 | Operation | rate | µs/op |
 |---|---:|---:|
-| `add_nodes` (bulk) | 23 000 nodes/s | 44 |
-| `add_edges` (bulk) | 26 000 edges/s | 39 |
-| `add_edge` (per-call) | 1 700 edges/s | 583 |
+| `add_nodes` (bulk) | 22 000 nodes/s | 45 |
+| `add_edges` (bulk) | 32 000 edges/s | 31 |
+| `add_edge` (per-call) | 2 000 edges/s | 490 |
 
 `add_edges` groups edges by source for `_out` and by target for `_in`, then
 bulk-inserts each node's whole adjacency sub-dict in one shot (one allocation
@@ -907,11 +907,11 @@ Read (10 000 random samples):
 
 | Operation | rate | µs/op |
 |---|---:|---:|
-| `g[node_id]` (`get_node`) | 184 000 ops/s | 5 |
-| `has_edge` (hit) | 61 000 ops/s | 16 |
-| `get_edge` | 101 000 ops/s | 10 |
-| `out_degree` | 251 000 ops/s | 4 |
-| `neighbors` (iterate) | **263 000 edges/s** | 4 |
+| `g[node_id]` (`get_node`) | 175 000 ops/s | 6 |
+| `has_edge` (hit) | 57 000 ops/s | 17 |
+| `get_edge` | 98 000 ops/s | 10 |
+| `out_degree` | 224 000 ops/s | 4 |
+| `neighbors` (iterate) | **255 000 edges/s** | 4 |
 
 These are several × the uncached rates: every adjacency lookup now hits the
 shared address cache instead of re-scanning the source node's hash tables. The
@@ -922,13 +922,13 @@ Query engine (Cypher):
 
 | Query | rate |
 |---|---:|
-| label-seeded 1-hop `(a:Type)->(b) LIMIT 50` | 1 185 queries/s |
-| 2-hop chain `(a)->(b)->(c) LIMIT 100` | 590 queries/s |
-| 1-hop from a hub `id(a)=='X'` (all neighbours) | 193 queries/s |
-| variable-length `(a)-[*2]->(b) LIMIT 100` | 28 queries/s |
+| label-seeded 1-hop `(a:Type)->(b) LIMIT 50` | 1 070 queries/s |
+| 2-hop chain `(a)->(b)->(c) LIMIT 100` | 550 queries/s |
+| 1-hop from a hub `id(a)=='X'` (all neighbours) | 184 queries/s |
+| variable-length `(a)-[*2]->(b) LIMIT 100` | 30 queries/s |
 
 The label index (`nodes_with_label`, used to seed `(a:Type)…` queries) builds
-in ~110 ms for 15k nodes and then serves ~36 000 lookups/s. Reopen is ~1 ms.
+in ~100 ms for 15k nodes and then serves ~33 000 lookups/s. Reopen is ~1.5 ms.
 
 On-disk: **~277 bytes/edge** (127 MB for 483k edges, double-indexed `_out` +
 `_in`). Storing the adjacency key (`_key`, the destination/source node id) as
