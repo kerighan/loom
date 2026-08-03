@@ -50,8 +50,10 @@ Define your record schema as a Pydantic model. loom maps types automatically:
 | `bool` | `bool` | |
 | `datetime` / `date` | `datetime` | **Stored inline as int64 epoch-µs**, read/written as Python `datetime` — naturally ordered (range/sort/PriorityQueue work) |
 | `Literal["a", "b", …]` | `utf8[N]` | Closed string set → strict utf8 **sized to the longest value** (minimal space, refuses anything bigger). `Literal[1, 2]` → `int64`, `Literal[True, False]` → `bool` |
-| `str` | `text` | Variable-length, compressed via BlobStore |
+| `str` | `text` | Variable-length, stored in the BlobStore |
+| `Text(compression=…)` | `text[brotli\|zlib]` | Like `str`, but compresses **this field only** (see below) |
 | `dict` / `Json()` | `json` | Arbitrary JSON value (dict/list/nested) via BlobStore — `json.dumps`/`loads` transparently; `None` round-trips |
+| `Json(compression=…)` | `json[brotli\|zlib]` | JSON value, compressing **this field only** |
 | `Utf8(N)` | `utf8[N]` | **Fixed-width inline UTF-8, N bytes** — ~4× smaller than `U{N}` for ASCII, same read speed. **Raises** if a value exceeds N bytes; `Utf8(N, truncate=True)` to truncate instead |
 | `str = Field(max_length=N)` | `U{N}` | Fixed-length numpy UCS-4 (4 bytes/char) |
 | `FixedStr(N)` | `U{N}` | loom shorthand for the above |
@@ -874,12 +876,45 @@ Bottom line: use a `Dict` for pure point access, a `BTree` when you need orderin
 | + `str` body (≈600 chars) | None (default) | 23 000 ops/s | 164 000 ops/s |
 | + `str` body (≈600 chars) | brotli | 1 400 ops/s | 58 000 ops/s |
 
-- `blob_compression=None` (**default**) — fastest writes, larger files.
+- `blob_compression=None` (**default**) — fastest writes, larger files. This is the **DB-wide** setting (every blob field).
 - `"brotli"` — 3–5× compression on natural language, but ~20× slower inserts; pick when storage > write throughput.
 - `Field(max_length=N)` → `U{N}` — keeps the field in the fixed record (UCS-4, **4 bytes/char**), no BlobStore.
 - `Utf8(N)` → `utf8[N]` — fixed-width **inline UTF-8**: N bytes in the record, no BlobStore hop, so ~**4× smaller than `U{N}`** for ASCII at the same read speed. `N` is a byte budget; a value over budget **raises ValueError** by default (use `Utf8(N, truncate=True)` to truncate on a codepoint boundary instead). The sweet spot for short ASCII-ish strings — ids, URLs, codes, enums.
 
 **Choosing a string field**: `Utf8(N)` for bounded ASCII-ish values you read a lot (inline, compact, fast); `str`/`text` for long or unbounded natural language (BlobStore, compressible); `U{N}`/`FixedStr(N)` only when you specifically need fixed UCS-4. loom stores Dict/Graph **keys** (`_key`) as `utf8` by default for exactly this reason.
+
+#### Per-field compression — compress one big field, leave the rest fast
+
+`blob_compression=` on the DB compresses *every* blob field. Often you want the
+opposite: a collection of small varied fields plus **one** big one (an article
+body, a scraped HTML page, a large JSON document) — compress only that field and
+keep everything else uncompressed and fast. Declare it on the field:
+
+```python
+from pydantic import BaseModel
+from loom.schema import Utf8, Text, Json
+
+class Article(BaseModel):
+    id:     Utf8(32)
+    title:  str                          # text — DB default (usually none)
+    body:   Text(compression="brotli")   # ← only this field is brotli-compressed
+    payload: Json(compression="zlib")    # ← and this JSON field is zlib-compressed
+
+db.collection("articles", Article, indexes={"id": "primary"})
+```
+
+- `Text(compression="brotli"|"zlib"|None)` / `Json(compression=...)` — same as
+  `str`/`dict`, but sets the codec for **that field only**, independent of the
+  DB-wide `blob_compression`. `None` (default) follows the DB default.
+- The codec is a property of the field, stored with the schema, so it
+  **round-trips on reopen** — `db.collection("articles")` (no model) reads the
+  field back correctly with no re-declaration.
+- Equivalent raw dtype tags (for `create_dataset`/dict schemas):
+  `"text[brotli]"`, `"json[zlib]"`, and `"text[none]"` to force a field
+  *uncompressed* even when the DB default compresses. `"blob[…]"` is rejected —
+  a raw `blob` field has no field context at write time; use `text`/`json`.
+- Result: on a ~80 KB natural-language body, brotli shrinks the stored blob
+  ~100–900× while the record's other fields keep their normal insert/read speed.
 
 ### Graph — FB15k knowledge graph (reference benchmark)
 

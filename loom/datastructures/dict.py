@@ -1769,8 +1769,9 @@ class Dict(DataStructure):
         # 3) Resolve blobs in file-offset order (sequential I/O)
         if pending_blobs:
             pending_blobs.sort(key=lambda x: x[0])
+            codec_of = ds._blob_codec_of
             for off, key, field, is_text in pending_blobs:
-                raw_blob = ds.blob_store.read(off)
+                raw_blob = ds.blob_store.read(off, compression=codec_of[field])
                 result[key][field] = raw_blob.decode("utf-8") if is_text else raw_blob
 
         return result

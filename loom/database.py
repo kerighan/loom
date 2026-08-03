@@ -26,6 +26,18 @@ from loom.errors import (
 )
 
 
+def _needs_blob_store(dtype):
+    """Whether a schema dtype is stored in the BlobStore (blob/text/json),
+    tolerating a per-field compression suffix (e.g. ``"text[brotli]"``) and the
+    Python-type shorthands (`str`, `bytes`, `dict`)."""
+    if dtype is str or dtype is bytes or dtype is dict:
+        return True
+    if isinstance(dtype, str):
+        base = dtype.split("[", 1)[0]
+        return base in ("blob", "text", "json") or dtype in ("str", "string")
+    return False
+
+
 # Best-effort safety net: close any still-open writable DBs at interpreter exit,
 # so a script that forgets close()/`with` still persists structure metadata
 # (lengths, counters).  Data pages are flushed by the OS regardless, but the
@@ -303,7 +315,7 @@ class DB:
             schema = info["schema"]
 
             # Pass blob_store if the schema uses variable-length fields
-            needs_blobs = any(v in ("blob", "text", "json") for v in schema.values())
+            needs_blobs = any(_needs_blob_store(v) for v in schema.values())
             blob_store = self.blob_store if needs_blobs else None
 
             # Recreate Dataset instance
@@ -350,13 +362,24 @@ class DB:
 
     @staticmethod
     def _dtype_to_registry_str(dataset, field_name):
-        """Serialize one field's dtype for the registry, preserving array shapes."""
+        """Serialize one field's dtype for the registry, preserving array shapes
+        and any per-field blob compression codec so it round-trips on reopen."""
         from loom.dataset import dtype_to_str
 
+        codecs = getattr(dataset, "_blob_codecs", {})
+
+        def _tag(base):
+            # A field with an explicit per-field codec is stored as
+            # "text[brotli]" / "json[none]"; absent → plain "text"/"json"
+            # (falls back to the DB default, unchanged behaviour).
+            if field_name in codecs:
+                return f"{base}[{codecs[field_name] or 'none'}]"
+            return base
+
         if field_name in dataset._text_fields:
-            return "text"
+            return _tag("text")
         if field_name in getattr(dataset, "_json_fields", set()):
-            return "json"
+            return _tag("json")
         if field_name in dataset._blob_fields:
             return "blob"
         if field_name in getattr(dataset, "_utf8_fields", {}):
@@ -644,7 +667,7 @@ class DB:
         identifier = self._get_next_identifier()
 
         # Pass blob_store if schema uses variable-length fields
-        needs_blobs = any(v in ("blob", "text", "json") for v in schema.values())
+        needs_blobs = any(_needs_blob_store(v) for v in schema.values())
         blob_store = self.blob_store if needs_blobs else None
 
         # Create dataset

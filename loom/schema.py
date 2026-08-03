@@ -248,24 +248,82 @@ def Utf8(max_bytes: int, truncate: bool = False):
     return Annotated[str, _Utf8Meta]
 
 
-def Json():
+_VALID_COMPRESSION = (None, "brotli", "zlib")
+
+
+def _codec_suffix(base: str, compression):
+    """Build a dtype tag with an optional per-field compression suffix.
+
+    ``_codec_suffix("text", "brotli")`` → ``"text[brotli]"``;
+    ``_codec_suffix("text", None)`` → ``"text"`` (DB default applies).
+    """
+    if compression not in _VALID_COMPRESSION:
+        raise ValueError(
+            f"compression must be one of {_VALID_COMPRESSION}, got {compression!r}"
+        )
+    return base if compression is None else f"{base}[{compression}]"
+
+
+def Text(compression=None):
+    """Variable-length UTF-8 text field (→ 'text', stored in the BlobStore).
+
+    Same as a plain ``str`` annotation, but lets you set **per-field**
+    compression — independent of the DB-wide ``blob_compression``. Use it for
+    the one big field (an article/book body, a raw HTML page) you want squeezed
+    while the rest of the collection stays uncompressed and fast::
+
+        from loom.schema import Text
+
+        class Article(BaseModel):
+            id:      Utf8(32)
+            title:   str                    # 'text' — DB default (usually none)
+            body:    Text(compression="brotli")   # 'text[brotli]' — only this field
+
+    Args:
+        compression: ``None`` (default → follows the DB's ``blob_compression``),
+            ``"brotli"`` (best ratio, ~20× slower writes), or ``"zlib"``
+            (moderate ratio, cheap). Explicit ``None`` on a field is the same as
+            a plain ``str``; to force *uncompressed* even when the DB default
+            compresses, use the raw dtype string ``"text[none]"``.
+
+    The codec is persisted with the schema, so the field decodes correctly on
+    reopen without re-declaring it.
+    """
+    from typing import Annotated
+
+    tag = _codec_suffix("text", compression)
+
+    class _TextMeta:
+        loom_dtype = tag
+
+    return Annotated[str, _TextMeta]
+
+
+def Json(compression=None):
     """JSON field (→ 'json', stored as a json.dumps blob, loaded with json.loads).
 
     Accepts any JSON-serialisable value (dict, list, nested) and returns it
     parsed.  A bare ``dict`` annotation maps here automatically; use ``Json()``
     for lists or mixed values.  None round-trips as None.
 
+    Pass ``compression="brotli"``/``"zlib"`` to compress **this field only**
+    (independent of the DB-wide setting) — handy for a large embedded JSON
+    document. ``None`` (default) follows the DB default.
+
     Example::
 
         class Event(BaseModel):
             id:   int
-            meta: dict          # → 'json'
-            tags: Json()        # → 'json' (a list)
+            meta: dict                       # → 'json'
+            tags: Json()                     # → 'json' (a list)
+            raw:  Json(compression="brotli") # → 'json[brotli]' (big payload)
     """
     from typing import Annotated, Any
 
+    tag = _codec_suffix("json", compression)
+
     class _JsonMeta:
-        loom_dtype = "json"
+        loom_dtype = tag
 
     return Annotated[Any, _JsonMeta]
 

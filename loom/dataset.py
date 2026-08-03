@@ -6,6 +6,7 @@ import sys
 import numpy as np
 
 from loom.ref import Ref
+from loom.blob import _DEFAULT as _BLOB_DEFAULT
 from loom.errors import (
     InvalidIdentifierError,
     DeletedRecordError,
@@ -71,6 +72,43 @@ def _normalize_dtype(field, dtype):
             f"(fixed-width, stored inline) or 'text' (unbounded, blob store)"
         )
     return dtype
+
+
+_BLOB_CODECS = ("brotli", "zlib", "none")
+
+
+def _split_blob_codec(dtype):
+    """Split a per-field compression suffix off a text/json dtype tag.
+
+    Returns ``(base_dtype, codec)`` where codec is:
+      * ``_BLOB_DEFAULT``  — no per-field tag → fall back to the DB default
+        (``"text"``, ``"json"``, and every non-blob dtype).
+      * ``None``           — explicitly uncompressed (``"text[none]"``), even
+        if the DB default compresses.
+      * ``"brotli"``/``"zlib"`` — this field's codec (``"text[brotli]"``).
+
+    Only text/json carry a codec — a raw ``blob`` field is written through the
+    low-level BlobStore API without field context, so its codec can't be
+    threaded reliably; ``blob[...]`` is rejected loudly.
+    """
+    if not isinstance(dtype, str) or "[" not in dtype:
+        return dtype, _BLOB_DEFAULT
+    base, _, rest = dtype.partition("[")
+    if base not in ("text", "json", "blob") or not rest.endswith("]"):
+        return dtype, _BLOB_DEFAULT  # e.g. utf8[N], float32[8,8] — not a codec
+    codec = rest[:-1]
+    if codec not in _BLOB_CODECS:
+        raise ValueError(
+            f"unknown compression {codec!r} in dtype {dtype!r}; "
+            f"expected one of {_BLOB_CODECS}"
+        )
+    if base == "blob":
+        raise ValueError(
+            "per-field compression is only supported on 'text'/'json' fields "
+            "(a raw 'blob' field is written via the low-level BlobStore API "
+            "with no field context); use text[...] / json[...]"
+        )
+    return base, (None if codec == "none" else codec)
 
 
 def dtype_to_str(dtype):
@@ -229,10 +267,22 @@ class Dataset:
         # Track array (vector) fields for proper serialization
         self._array_fields = {}  # field_name → shape tuple
 
+        # Per-field blob compression: field_name → codec ("brotli"/"zlib"/None).
+        # A field present here overrides the DB-wide blob compression for THAT
+        # field only (that's the whole point: compress one big-text field while
+        # leaving the rest of the DB uncompressed).  None means "explicitly
+        # uncompressed".  Fields absent from this map fall back to the store
+        # default (see _blob_codec()).
+        self._blob_codecs = {}
+
         # Convert dtype strings, handling "blob", "text", "utf8[N]", "datetime", "float32[N]"
         processed_schema = []
         for field, dtype in schema.items():
             dtype = _normalize_dtype(field, dtype)
+            dtype, _codec = _split_blob_codec(dtype)
+            if _codec is not _BLOB_DEFAULT:
+                # Explicit per-field codec ("brotli"/"zlib", or None for "none").
+                self._blob_codecs[field] = _codec
             if dtype == "blob":
                 self._blob_fields.add(field)
                 processed_schema.append((field, BLOB_DTYPE))
@@ -281,6 +331,13 @@ class Dataset:
 
         # For the unknown-field check in _serialize (frozenset → C-level <=)
         self._field_set = frozenset(self.user_schema.names)
+
+        # Resolve each blob field's codec ONCE (avoids a dict lookup per r/w).
+        # Absent → _BLOB_DEFAULT sentinel = "use the store's own compression".
+        self._blob_codec_of = {
+            f: self._blob_codecs.get(f, _BLOB_DEFAULT)
+            for f in (self._text_fields | self._json_fields | self._blob_fields)
+        }
 
         # Pre-built zero record for fast bulk-init (one write instead of N)
         self._zero_record = self._serialize_zero()
@@ -445,14 +502,14 @@ class Dataset:
                     raise TypeError  # generic reproduces the real error
                 if blobs is None:
                     blobs = []
-                blobs.append((off, payload))
+                blobs.append((off, payload, self._blob_codec_of[field]))
             elif kind == "j":
                 if value is None:
                     continue
                 payload = json.dumps(value, separators=(",", ":")).encode("utf-8")
                 if blobs is None:
                     blobs = []
-                blobs.append((off, payload))
+                blobs.append((off, payload, self._blob_codec_of[field]))
             elif kind == "r":
                 if value is None:
                     continue  # NULL blob ref
@@ -504,8 +561,8 @@ class Dataset:
                 buf, blobs = packed
                 if blobs:
                     pack_into = struct.pack_into
-                    for off, payload in blobs:
-                        b_off, b_slots = self.blob_store.write(payload)
+                    for off, payload, codec in blobs:
+                        b_off, b_slots = self.blob_store.write(payload, compression=codec)
                         pack_into("<QH", buf, off, b_off, b_slots)
                 return bytes(buf)
         # Use zeros + field assignment to avoid numpy dtype __str__ overhead
@@ -523,7 +580,9 @@ class Dataset:
                         encoded = (
                             value.encode("utf-8") if isinstance(value, str) else value
                         )
-                        offset, n_slots = self.blob_store.write(encoded)
+                        offset, n_slots = self.blob_store.write(
+                            encoded, compression=self._blob_codec_of[field]
+                        )
                         arr[field]["offset"] = offset
                         arr[field]["n_slots"] = n_slots
                 elif field in self._json_fields:
@@ -531,7 +590,8 @@ class Dataset:
                         pass  # NULL_BLOB → None on read
                     else:
                         offset, n_slots = self.blob_store.write(
-                            json.dumps(value, separators=(",", ":")).encode("utf-8")
+                            json.dumps(value, separators=(",", ":")).encode("utf-8"),
+                            compression=self._blob_codec_of[field],
                         )
                         arr[field]["offset"] = offset
                         arr[field]["n_slots"] = n_slots
@@ -589,14 +649,20 @@ class Dataset:
                 result[field] = (
                     ""
                     if (off == 0 and ns == 0)
-                    else self.blob_store.read(int(off)).decode("utf-8")
+                    else self.blob_store.read(
+                        int(off), compression=self._blob_codec_of[field]
+                    ).decode("utf-8")
                 )
             for field in self._json_fields:
                 off, ns = result[field]
                 result[field] = (
                     None
                     if (off == 0 and ns == 0)
-                    else json.loads(self.blob_store.read(int(off)).decode("utf-8"))
+                    else json.loads(
+                        self.blob_store.read(
+                            int(off), compression=self._blob_codec_of[field]
+                        ).decode("utf-8")
+                    )
                 )
             for field in self._blob_fields:
                 off, ns = result[field]
@@ -614,14 +680,20 @@ class Dataset:
                 result[field] = (
                     ""
                     if (offset == 0 and n_slots == 0)
-                    else self.blob_store.read(offset).decode("utf-8")
+                    else self.blob_store.read(
+                        offset, compression=self._blob_codec_of[field]
+                    ).decode("utf-8")
                 )
             elif field in self._json_fields:
                 offset, n_slots = int(value["offset"]), int(value["n_slots"])
                 result[field] = (
                     None
                     if (offset == 0 and n_slots == 0)
-                    else json.loads(self.blob_store.read(offset).decode("utf-8"))
+                    else json.loads(
+                        self.blob_store.read(
+                            offset, compression=self._blob_codec_of[field]
+                        ).decode("utf-8")
+                    )
                 )
             elif field in self._blob_fields:
                 offset, n_slots = int(value["offset"]), int(value["n_slots"])
@@ -723,7 +795,9 @@ class Dataset:
                         d[field] = (
                             ""
                             if (offset == 0 and n_slots == 0)
-                            else self.blob_store.read(offset).decode("utf-8")
+                            else self.blob_store.read(
+                                offset, compression=self._blob_codec_of[field]
+                            ).decode("utf-8")
                         )
                     elif field in self._json_fields:
                         value = rec[field]
@@ -733,7 +807,9 @@ class Dataset:
                             None
                             if (offset == 0 and n_slots == 0)
                             else json.loads(
-                                self.blob_store.read(offset).decode("utf-8")
+                                self.blob_store.read(
+                                    offset, compression=self._blob_codec_of[field]
+                                ).decode("utf-8")
                             )
                         )
                     elif field in self._blob_fields:
@@ -808,7 +884,9 @@ class Dataset:
                 new_ref = np.array([_NULL_BLOB], dtype=BLOB_DTYPE)
             else:
                 encoded = value.encode("utf-8") if isinstance(value, str) else value
-                new_offset, new_n_slots = self.blob_store.write(encoded)
+                new_offset, new_n_slots = self.blob_store.write(
+                    encoded, compression=self._blob_codec_of[field_name]
+                )
                 new_ref = np.array([(new_offset, new_n_slots)], dtype=BLOB_DTYPE)
 
             self.db.write(address + field_offset, new_ref.tobytes())
@@ -824,7 +902,8 @@ class Dataset:
                 new_ref = np.array([_NULL_BLOB], dtype=BLOB_DTYPE)
             else:
                 no, nn = self.blob_store.write(
-                    json.dumps(value, separators=(",", ":")).encode("utf-8")
+                    json.dumps(value, separators=(",", ":")).encode("utf-8"),
+                    compression=self._blob_codec_of[field_name],
                 )
                 new_ref = np.array([(no, nn)], dtype=BLOB_DTYPE)
             self.db.write(address + field_offset, new_ref.tobytes())
@@ -883,18 +962,30 @@ class Dataset:
             return (
                 ""
                 if (off == 0 and ns == 0)
-                else self.blob_store.read(off).decode("utf-8")
+                else self.blob_store.read(
+                    off, compression=self._blob_codec_of[field_name]
+                ).decode("utf-8")
             )
         if field_name in self._json_fields:
             off, ns = int(value["offset"]), int(value["n_slots"])
             return (
                 None
                 if (off == 0 and ns == 0)
-                else json.loads(self.blob_store.read(off).decode("utf-8"))
+                else json.loads(
+                    self.blob_store.read(
+                        off, compression=self._blob_codec_of[field_name]
+                    ).decode("utf-8")
+                )
             )
         if field_name in self._blob_fields:
             off, ns = int(value["offset"]), int(value["n_slots"])
-            return None if (off == 0 and ns == 0) else self.blob_store.read(off)
+            return (
+                None
+                if (off == 0 and ns == 0)
+                else self.blob_store.read(
+                    off, compression=self._blob_codec_of[field_name]
+                )
+            )
         if field_name in self._datetime_fields:
             return _micros_to_dt(int(value))
         return _to_native(value)
@@ -935,19 +1026,29 @@ class Dataset:
                 result[field] = (
                     ""
                     if (off == 0 and ns == 0)
-                    else self.blob_store.read(off).decode("utf-8")
+                    else self.blob_store.read(
+                        off, compression=self._blob_codec_of[field]
+                    ).decode("utf-8")
                 )
             elif field in self._json_fields:
                 off, ns = int(value["offset"]), int(value["n_slots"])
                 result[field] = (
                     None
                     if (off == 0 and ns == 0)
-                    else json.loads(self.blob_store.read(off).decode("utf-8"))
+                    else json.loads(
+                        self.blob_store.read(
+                            off, compression=self._blob_codec_of[field]
+                        ).decode("utf-8")
+                    )
                 )
             elif field in self._blob_fields:
                 off, ns = int(value["offset"]), int(value["n_slots"])
                 result[field] = (
-                    None if (off == 0 and ns == 0) else self.blob_store.read(off)
+                    None
+                    if (off == 0 and ns == 0)
+                    else self.blob_store.read(
+                        off, compression=self._blob_codec_of[field]
+                    )
                 )
             elif field in self._utf8_fields:
                 result[field] = bytes(value).rstrip(b"\x00").decode("utf-8")

@@ -22,6 +22,10 @@ try:
 except ImportError:
     HAS_ZLIB = False
 
+# Sentinel: "no per-call codec given → use the store's default compression".
+# Distinct from None, which means "explicitly store this blob uncompressed".
+_DEFAULT = object()
+
 
 class BlobStore:
     """Append-only blob storage with slot-based allocation and freelist reuse.
@@ -74,19 +78,23 @@ class BlobStore:
         # Load freelist from header if exists
         self._load_freelist()
 
-    def _compress(self, data: bytes) -> bytes:
-        """Compress data using configured algorithm."""
-        if self._compression == "brotli":
+    def _compress(self, data: bytes, algo) -> bytes:
+        """Compress data using the given algorithm ("brotli"/"zlib"/None)."""
+        if algo == "brotli":
+            if not HAS_BROTLI:
+                raise ImportError("brotli package required for brotli compression")
             return brotli.compress(data)
-        elif self._compression == "zlib":
+        elif algo == "zlib":
+            if not HAS_ZLIB:
+                raise ImportError("zlib module required for zlib compression")
             return zlib.compress(data)
         return data
 
-    def _decompress(self, data: bytes) -> bytes:
-        """Decompress data using configured algorithm."""
-        if self._compression == "brotli":
+    def _decompress(self, data: bytes, algo) -> bytes:
+        """Decompress data using the given algorithm ("brotli"/"zlib"/None)."""
+        if algo == "brotli":
             return brotli.decompress(data)
-        elif self._compression == "zlib":
+        elif algo == "zlib":
             return zlib.decompress(data)
         return data
 
@@ -161,17 +169,23 @@ class BlobStore:
 
         self._freelist = merged
 
-    def write(self, data: bytes) -> tuple[int, int]:
+    def write(self, data: bytes, compression=_DEFAULT) -> tuple[int, int]:
         """Write blob to storage.
 
         Args:
             data: Raw bytes to store
+            compression: Per-call codec override ("brotli"/"zlib"/None). When
+                left at the default sentinel, the store's own compression (the
+                DB-level setting) is used — preserving prior behaviour. Callers
+                that know a field's declared codec (see Dataset) pass it here so
+                one field can be compressed while the rest of the DB is not.
 
         Returns:
             Tuple of (offset, n_slots) - needed for later deletion
         """
+        algo = self._compression if compression is _DEFAULT else compression
         # Compress
-        compressed = self._compress(data)
+        compressed = self._compress(data, algo)
 
         # Build blob record: [compressed_size][original_size][data]
         header = struct.pack("<II", len(compressed), len(data))
@@ -198,15 +212,20 @@ class BlobStore:
         self._save_freelist()
         return offset, n_slots
 
-    def read(self, offset: int) -> bytes:
+    def read(self, offset: int, compression=_DEFAULT) -> bytes:
         """Read blob from storage.
 
         Args:
             offset: Blob offset (from write())
+            compression: Per-call codec override — MUST match what the blob was
+                written with (blobs are not self-describing). Defaults to the
+                store's compression, as before. The Dataset passes the field's
+                declared codec so a per-field-compressed blob decodes correctly.
 
         Returns:
             Original uncompressed data
         """
+        algo = self._compression if compression is _DEFAULT else compression
         # Read header
         header = self._db.read(offset, self.HEADER_SIZE)
         compressed_size, original_size = struct.unpack("<II", header)
@@ -215,7 +234,7 @@ class BlobStore:
         compressed = self._db.read(offset + self.HEADER_SIZE, compressed_size)
 
         # Decompress
-        return self._decompress(compressed)
+        return self._decompress(compressed, algo)
 
     def delete(self, offset: int, n_slots: int):
         """Delete blob and return slots to freelist.

@@ -325,12 +325,22 @@ class DataStructure(ABC):
             # It's a Dataset object — extract schema, preserving all markers
             from loom.dataset import dtype_to_str
             ds = dataset_or_dict
+            codecs = getattr(ds, "_blob_codecs", {})
+
+            def _tag(base):
+                # Preserve a per-field blob codec ("text[brotli]"/"json[none]")
+                # so re-derived schemas (nested structures, introspection) keep
+                # compressing the same field the same way.
+                if name in codecs:
+                    return f"{base}[{codecs[name] or 'none'}]"
+                return base
+
             result = {}
             for name in ds.user_schema.names:
                 if hasattr(ds, "_text_fields") and name in ds._text_fields:
-                    result[name] = "text"
+                    result[name] = _tag("text")
                 elif name in getattr(ds, "_json_fields", set()):
-                    result[name] = "json"
+                    result[name] = _tag("json")
                 elif hasattr(ds, "_blob_fields") and name in ds._blob_fields:
                     result[name] = "blob"
                 elif name in getattr(ds, "_utf8_fields", {}):
