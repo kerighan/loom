@@ -26,6 +26,12 @@ except ImportError:
 # Distinct from None, which means "explicitly store this blob uncompressed".
 _DEFAULT = object()
 
+# Default compression level per codec when none is specified.  brotli's own
+# default is quality 11 — pathologically slow (tens of ms for a few KB) for a
+# marginal ratio gain over ~5; zlib's is 6.  These are the write-side levels;
+# decompression needs no level (it's self-describing in the stream).
+_DEFAULT_LEVEL = {"brotli": 5, "zlib": 6}
+
 
 class BlobStore:
     """Append-only blob storage with slot-based allocation and freelist reuse.
@@ -53,16 +59,21 @@ class BlobStore:
     SLOT_SIZE = 64  # Minimum allocation unit (bytes)
     HEADER_SIZE = 8  # compressed_size (4) + original_size (4)
 
-    def __init__(self, db, compression=None):
+    def __init__(self, db, compression=None, level=None):
         """Initialize blob store.
 
         Args:
             db: ByteFileDB instance
             compression: Compression algorithm ("brotli", "zlib", or None).
-                Default None — brotli costs ~20× on insert throughput.
+                Default None — no compression.
+            level: Compression level. None → the codec default (brotli 5,
+                zlib 6). brotli accepts 0–11, zlib 0–9. A per-write override
+                is possible via write(..., level=...); a per-field one via the
+                schema tag ``text[brotli:5]`` (see Dataset).
         """
         self._db = db
         self._compression = compression
+        self._level = level
 
         # Validate compression
         if compression == "brotli" and not HAS_BROTLI:
@@ -78,16 +89,21 @@ class BlobStore:
         # Load freelist from header if exists
         self._load_freelist()
 
-    def _compress(self, data: bytes, algo) -> bytes:
-        """Compress data using the given algorithm ("brotli"/"zlib"/None)."""
+    def _compress(self, data: bytes, algo, level=None) -> bytes:
+        """Compress data with the given algorithm and level.
+
+        level=None picks the codec default (see _DEFAULT_LEVEL).
+        """
         if algo == "brotli":
             if not HAS_BROTLI:
                 raise ImportError("brotli package required for brotli compression")
-            return brotli.compress(data)
+            q = _DEFAULT_LEVEL["brotli"] if level is None else level
+            return brotli.compress(data, quality=q)
         elif algo == "zlib":
             if not HAS_ZLIB:
                 raise ImportError("zlib module required for zlib compression")
-            return zlib.compress(data)
+            lv = _DEFAULT_LEVEL["zlib"] if level is None else level
+            return zlib.compress(data, lv)
         return data
 
     def _decompress(self, data: bytes, algo) -> bytes:
@@ -169,7 +185,7 @@ class BlobStore:
 
         self._freelist = merged
 
-    def write(self, data: bytes, compression=_DEFAULT) -> tuple[int, int]:
+    def write(self, data: bytes, compression=_DEFAULT, level=_DEFAULT) -> tuple[int, int]:
         """Write blob to storage.
 
         Args:
@@ -179,13 +195,17 @@ class BlobStore:
                 DB-level setting) is used — preserving prior behaviour. Callers
                 that know a field's declared codec (see Dataset) pass it here so
                 one field can be compressed while the rest of the DB is not.
+            level: Per-call compression level (int) or None for the codec
+                default; the sentinel means "use the store's level". Write-only
+                — reads don't need it.
 
         Returns:
             Tuple of (offset, n_slots) - needed for later deletion
         """
         algo = self._compression if compression is _DEFAULT else compression
+        lvl = self._level if level is _DEFAULT else level
         # Compress
-        compressed = self._compress(data, algo)
+        compressed = self._compress(data, algo, lvl)
 
         # Build blob record: [compressed_size][original_size][data]
         header = struct.pack("<II", len(compressed), len(data))

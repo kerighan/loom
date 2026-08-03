@@ -873,11 +873,12 @@ Bottom line: use a `Dict` for pure point access, a `BTree` when you need orderin
 | Schema | Compression | insert | read |
 |---|---|---:|---:|
 | Fixed fields only | — | 21 000 ops/s | 194 000 ops/s |
-| + `str` body (≈600 chars) | None (default) | 23 000 ops/s | 164 000 ops/s |
-| + `str` body (≈600 chars) | brotli | 1 400 ops/s | 58 000 ops/s |
+| + `str` body (≈600 chars) | None (default) | 21 000 ops/s | 136 000 ops/s |
+| + `str` body (≈600 chars) | brotli (level 5) | 12 400 ops/s | 59 000 ops/s |
 
 - `blob_compression=None` (**default**) — fastest writes, larger files. This is the **DB-wide** setting (every blob field).
-- `"brotli"` — 3–5× compression on natural language, but ~20× slower inserts; pick when storage > write throughput.
+- `"brotli"` — 3–5× compression on natural language. The default level is **5** (not brotli's own 11): a good speed/ratio balance that keeps inserts fast (~2× vs uncompressed here, not ~20×). Tune with `blob_compression_level=` (brotli 0–11) — level 11 maximises ratio but is dramatically slower to write.
+- `"zlib"` — cheaper than brotli at a similar ratio on text; a good middle ground (default level 6).
 - `Field(max_length=N)` → `U{N}` — keeps the field in the fixed record (UCS-4, **4 bytes/char**), no BlobStore.
 - `Utf8(N)` → `utf8[N]` — fixed-width **inline UTF-8**: N bytes in the record, no BlobStore hop, so ~**4× smaller than `U{N}`** for ASCII at the same read speed. `N` is a byte budget; a value over budget **raises ValueError** by default (use `Utf8(N, truncate=True)` to truncate on a codepoint boundary instead). The sweet spot for short ASCII-ish strings — ids, URLs, codes, enums.
 
@@ -896,25 +897,32 @@ from loom.schema import Utf8, Text, Json
 
 class Article(BaseModel):
     id:     Utf8(32)
-    title:  str                          # text — DB default (usually none)
-    body:   Text(compression="brotli")   # ← only this field is brotli-compressed
-    payload: Json(compression="zlib")    # ← and this JSON field is zlib-compressed
+    title:  str                                   # text — DB default (usually none)
+    body:   Text(compression="brotli")            # ← only this field, brotli level 5
+    html:   Text(compression="brotli", level=9)   # ← squeeze harder (slower write)
+    payload: Json(compression="zlib")             # ← this JSON field, zlib
 
 db.collection("articles", Article, indexes={"id": "primary"})
 ```
 
-- `Text(compression="brotli"|"zlib"|None)` / `Json(compression=...)` — same as
-  `str`/`dict`, but sets the codec for **that field only**, independent of the
-  DB-wide `blob_compression`. `None` (default) follows the DB default.
-- The codec is a property of the field, stored with the schema, so it
-  **round-trips on reopen** — `db.collection("articles")` (no model) reads the
-  field back correctly with no re-declaration.
+- `Text(compression="brotli"|"zlib"|None, level=None)` / `Json(compression=..., level=...)`
+  — same as `str`/`dict`, but sets the codec **and level** for **that field
+  only**, independent of the DB-wide `blob_compression`. `None` compression
+  follows the DB default; `level=None` uses the codec default (**brotli 5**,
+  zlib 6). The level only affects writes — reads don't need it.
+- Codec and level are properties of the field, stored with the schema, so they
+  **round-trip on reopen** — `db.collection("articles")` (no model) reads the
+  field back correctly and keeps compressing new writes the same way.
 - Equivalent raw dtype tags (for `create_dataset`/dict schemas):
-  `"text[brotli]"`, `"json[zlib]"`, and `"text[none]"` to force a field
-  *uncompressed* even when the DB default compresses. `"blob[…]"` is rejected —
-  a raw `blob` field has no field context at write time; use `text`/`json`.
+  `"text[brotli]"`, `"text[brotli:9]"`, `"json[zlib]"`, and `"text[none]"` to
+  force a field *uncompressed* even when the DB default compresses. `"blob[…]"`
+  is rejected — a raw `blob` field has no field context at write time; use
+  `text`/`json`.
 - Result: on a ~80 KB natural-language body, brotli shrinks the stored blob
   ~100–900× while the record's other fields keep their normal insert/read speed.
+  Compression is per-blob and independent (random-access reads stay O(1)); there
+  is deliberately no cross-record "solid" batch mode. Decompression is fast and
+  level-independent (~0.06 ms), so it's never the bottleneck.
 
 ### Graph — FB15k knowledge graph (reference benchmark)
 

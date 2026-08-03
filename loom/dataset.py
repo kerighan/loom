@@ -77,26 +77,41 @@ def _normalize_dtype(field, dtype):
 _BLOB_CODECS = ("brotli", "zlib", "none")
 
 
+def _codec_tag(codec_level):
+    """Inverse of the codec part of _split_blob_codec, for schema persistence.
+
+    ``(None, None)`` → ``"none"``; ``("brotli", None)`` → ``"brotli"``;
+    ``("brotli", 9)`` → ``"brotli:9"``.  So a field round-trips as
+    ``text[brotli:9]`` and reopens with the same codec + level.
+    """
+    codec, level = codec_level
+    if codec is None:
+        return "none"
+    return f"{codec}:{level}" if level is not None else codec
+
+
 def _split_blob_codec(dtype):
     """Split a per-field compression suffix off a text/json dtype tag.
 
-    Returns ``(base_dtype, codec)`` where codec is:
-      * ``_BLOB_DEFAULT``  — no per-field tag → fall back to the DB default
-        (``"text"``, ``"json"``, and every non-blob dtype).
-      * ``None``           — explicitly uncompressed (``"text[none]"``), even
-        if the DB default compresses.
-      * ``"brotli"``/``"zlib"`` — this field's codec (``"text[brotli]"``).
+    Returns ``(base_dtype, codec, level)``:
+      * codec ``_BLOB_DEFAULT``  — no per-field tag → fall back to the DB
+        default (``"text"``, ``"json"``, and every non-blob dtype).
+      * codec ``None``           — explicitly uncompressed (``"text[none]"``).
+      * codec ``"brotli"``/``"zlib"`` — this field's codec, with an optional
+        level: ``"text[brotli]"`` → level ``None`` (codec default),
+        ``"text[brotli:9]"`` → level ``9``.
 
     Only text/json carry a codec — a raw ``blob`` field is written through the
     low-level BlobStore API without field context, so its codec can't be
     threaded reliably; ``blob[...]`` is rejected loudly.
     """
     if not isinstance(dtype, str) or "[" not in dtype:
-        return dtype, _BLOB_DEFAULT
+        return dtype, _BLOB_DEFAULT, None
     base, _, rest = dtype.partition("[")
     if base not in ("text", "json", "blob") or not rest.endswith("]"):
-        return dtype, _BLOB_DEFAULT  # e.g. utf8[N], float32[8,8] — not a codec
-    codec = rest[:-1]
+        return dtype, _BLOB_DEFAULT, None  # e.g. utf8[N], float32[8,8]
+    spec = rest[:-1]
+    codec, _, lvl = spec.partition(":")
     if codec not in _BLOB_CODECS:
         raise ValueError(
             f"unknown compression {codec!r} in dtype {dtype!r}; "
@@ -108,7 +123,15 @@ def _split_blob_codec(dtype):
             "(a raw 'blob' field is written via the low-level BlobStore API "
             "with no field context); use text[...] / json[...]"
         )
-    return base, (None if codec == "none" else codec)
+    level = None
+    if lvl != "":
+        if codec == "none":
+            raise ValueError(f"'none' takes no level in dtype {dtype!r}")
+        try:
+            level = int(lvl)
+        except ValueError:
+            raise ValueError(f"invalid compression level {lvl!r} in dtype {dtype!r}")
+    return base, (None if codec == "none" else codec), level
 
 
 def dtype_to_str(dtype):
@@ -267,22 +290,22 @@ class Dataset:
         # Track array (vector) fields for proper serialization
         self._array_fields = {}  # field_name → shape tuple
 
-        # Per-field blob compression: field_name → codec ("brotli"/"zlib"/None).
-        # A field present here overrides the DB-wide blob compression for THAT
-        # field only (that's the whole point: compress one big-text field while
-        # leaving the rest of the DB uncompressed).  None means "explicitly
-        # uncompressed".  Fields absent from this map fall back to the store
-        # default (see _blob_codec()).
+        # Per-field blob compression: field_name → (codec, level).  A field
+        # present here overrides the DB-wide blob compression for THAT field
+        # only (the whole point: compress one big-text field while leaving the
+        # rest of the DB uncompressed).  codec None = "explicitly uncompressed";
+        # level None = "the codec's default level".  Fields absent from this map
+        # fall back to the store default (see _blob_codec_of / _blob_level_of).
         self._blob_codecs = {}
 
         # Convert dtype strings, handling "blob", "text", "utf8[N]", "datetime", "float32[N]"
         processed_schema = []
         for field, dtype in schema.items():
             dtype = _normalize_dtype(field, dtype)
-            dtype, _codec = _split_blob_codec(dtype)
+            dtype, _codec, _level = _split_blob_codec(dtype)
             if _codec is not _BLOB_DEFAULT:
                 # Explicit per-field codec ("brotli"/"zlib", or None for "none").
-                self._blob_codecs[field] = _codec
+                self._blob_codecs[field] = (_codec, _level)
             if dtype == "blob":
                 self._blob_fields.add(field)
                 processed_schema.append((field, BLOB_DTYPE))
@@ -332,11 +355,17 @@ class Dataset:
         # For the unknown-field check in _serialize (frozenset → C-level <=)
         self._field_set = frozenset(self.user_schema.names)
 
-        # Resolve each blob field's codec ONCE (avoids a dict lookup per r/w).
-        # Absent → _BLOB_DEFAULT sentinel = "use the store's own compression".
+        # Resolve each blob field's codec + level ONCE (avoids a dict lookup per
+        # r/w).  Absent → _BLOB_DEFAULT sentinel = "use the store's own setting".
+        # Reads only need the codec; writes need both.
+        _blobs = self._text_fields | self._json_fields | self._blob_fields
         self._blob_codec_of = {
-            f: self._blob_codecs.get(f, _BLOB_DEFAULT)
-            for f in (self._text_fields | self._json_fields | self._blob_fields)
+            f: (self._blob_codecs[f][0] if f in self._blob_codecs else _BLOB_DEFAULT)
+            for f in _blobs
+        }
+        self._blob_level_of = {
+            f: (self._blob_codecs[f][1] if f in self._blob_codecs else _BLOB_DEFAULT)
+            for f in _blobs
         }
 
         # Pre-built zero record for fast bulk-init (one write instead of N)
@@ -502,14 +531,18 @@ class Dataset:
                     raise TypeError  # generic reproduces the real error
                 if blobs is None:
                     blobs = []
-                blobs.append((off, payload, self._blob_codec_of[field]))
+                blobs.append(
+                    (off, payload, self._blob_codec_of[field], self._blob_level_of[field])
+                )
             elif kind == "j":
                 if value is None:
                     continue
                 payload = json.dumps(value, separators=(",", ":")).encode("utf-8")
                 if blobs is None:
                     blobs = []
-                blobs.append((off, payload, self._blob_codec_of[field]))
+                blobs.append(
+                    (off, payload, self._blob_codec_of[field], self._blob_level_of[field])
+                )
             elif kind == "r":
                 if value is None:
                     continue  # NULL blob ref
@@ -561,8 +594,10 @@ class Dataset:
                 buf, blobs = packed
                 if blobs:
                     pack_into = struct.pack_into
-                    for off, payload, codec in blobs:
-                        b_off, b_slots = self.blob_store.write(payload, compression=codec)
+                    for off, payload, codec, level in blobs:
+                        b_off, b_slots = self.blob_store.write(
+                            payload, compression=codec, level=level
+                        )
                         pack_into("<QH", buf, off, b_off, b_slots)
                 return bytes(buf)
         # Use zeros + field assignment to avoid numpy dtype __str__ overhead
@@ -581,7 +616,9 @@ class Dataset:
                             value.encode("utf-8") if isinstance(value, str) else value
                         )
                         offset, n_slots = self.blob_store.write(
-                            encoded, compression=self._blob_codec_of[field]
+                            encoded,
+                            compression=self._blob_codec_of[field],
+                            level=self._blob_level_of[field],
                         )
                         arr[field]["offset"] = offset
                         arr[field]["n_slots"] = n_slots
@@ -592,6 +629,7 @@ class Dataset:
                         offset, n_slots = self.blob_store.write(
                             json.dumps(value, separators=(",", ":")).encode("utf-8"),
                             compression=self._blob_codec_of[field],
+                            level=self._blob_level_of[field],
                         )
                         arr[field]["offset"] = offset
                         arr[field]["n_slots"] = n_slots
@@ -885,7 +923,9 @@ class Dataset:
             else:
                 encoded = value.encode("utf-8") if isinstance(value, str) else value
                 new_offset, new_n_slots = self.blob_store.write(
-                    encoded, compression=self._blob_codec_of[field_name]
+                    encoded,
+                    compression=self._blob_codec_of[field_name],
+                    level=self._blob_level_of[field_name],
                 )
                 new_ref = np.array([(new_offset, new_n_slots)], dtype=BLOB_DTYPE)
 
@@ -904,6 +944,7 @@ class Dataset:
                 no, nn = self.blob_store.write(
                     json.dumps(value, separators=(",", ":")).encode("utf-8"),
                     compression=self._blob_codec_of[field_name],
+                    level=self._blob_level_of[field_name],
                 )
                 new_ref = np.array([(no, nn)], dtype=BLOB_DTYPE)
             self.db.write(address + field_offset, new_ref.tobytes())

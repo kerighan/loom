@@ -251,20 +251,29 @@ def Utf8(max_bytes: int, truncate: bool = False):
 _VALID_COMPRESSION = (None, "brotli", "zlib")
 
 
-def _codec_suffix(base: str, compression):
+def _codec_suffix(base: str, compression, level=None):
     """Build a dtype tag with an optional per-field compression suffix.
 
     ``_codec_suffix("text", "brotli")`` → ``"text[brotli]"``;
+    ``_codec_suffix("text", "brotli", 9)`` → ``"text[brotli:9]"``;
     ``_codec_suffix("text", None)`` → ``"text"`` (DB default applies).
     """
     if compression not in _VALID_COMPRESSION:
         raise ValueError(
             f"compression must be one of {_VALID_COMPRESSION}, got {compression!r}"
         )
-    return base if compression is None else f"{base}[{compression}]"
+    if compression is None:
+        if level is not None:
+            raise ValueError("level requires a compression codec (brotli/zlib)")
+        return base
+    if level is None:
+        return f"{base}[{compression}]"
+    if not isinstance(level, int):
+        raise ValueError(f"compression level must be an int, got {level!r}")
+    return f"{base}[{compression}:{level}]"
 
 
-def Text(compression=None):
+def Text(compression=None, level=None):
     """Variable-length UTF-8 text field (→ 'text', stored in the BlobStore).
 
     Same as a plain ``str`` annotation, but lets you set **per-field**
@@ -277,21 +286,25 @@ def Text(compression=None):
         class Article(BaseModel):
             id:      Utf8(32)
             title:   str                    # 'text' — DB default (usually none)
-            body:    Text(compression="brotli")   # 'text[brotli]' — only this field
+            body:    Text(compression="brotli")      # 'text[brotli]'
+            html:    Text(compression="brotli", level=9)  # 'text[brotli:9]'
 
     Args:
         compression: ``None`` (default → follows the DB's ``blob_compression``),
-            ``"brotli"`` (best ratio, ~20× slower writes), or ``"zlib"``
-            (moderate ratio, cheap). Explicit ``None`` on a field is the same as
-            a plain ``str``; to force *uncompressed* even when the DB default
-            compresses, use the raw dtype string ``"text[none]"``.
+            ``"brotli"`` (best ratio) or ``"zlib"`` (cheaper). Explicit ``None``
+            is the same as a plain ``str``; to force *uncompressed* even when
+            the DB default compresses, use the raw dtype string ``"text[none]"``.
+        level: compression level. ``None`` (default) uses the codec default —
+            **brotli 5**, zlib 6 — a good speed/ratio balance (brotli's own
+            default, 11, is far slower for little gain). brotli accepts 0–11,
+            zlib 0–9; higher = smaller but slower to write.
 
-    The codec is persisted with the schema, so the field decodes correctly on
-    reopen without re-declaring it.
+    Codec **and** level are persisted with the schema, so the field decodes and
+    keeps compressing the same way on reopen without re-declaring it.
     """
     from typing import Annotated
 
-    tag = _codec_suffix("text", compression)
+    tag = _codec_suffix("text", compression, level)
 
     class _TextMeta:
         loom_dtype = tag
@@ -299,28 +312,29 @@ def Text(compression=None):
     return Annotated[str, _TextMeta]
 
 
-def Json(compression=None):
+def Json(compression=None, level=None):
     """JSON field (→ 'json', stored as a json.dumps blob, loaded with json.loads).
 
     Accepts any JSON-serialisable value (dict, list, nested) and returns it
     parsed.  A bare ``dict`` annotation maps here automatically; use ``Json()``
     for lists or mixed values.  None round-trips as None.
 
-    Pass ``compression="brotli"``/``"zlib"`` to compress **this field only**
-    (independent of the DB-wide setting) — handy for a large embedded JSON
-    document. ``None`` (default) follows the DB default.
+    Pass ``compression="brotli"``/``"zlib"`` (and optional ``level=``) to
+    compress **this field only**, independent of the DB-wide setting — handy for
+    a large embedded JSON document. ``None`` (default) follows the DB default;
+    ``level=None`` uses the codec default (brotli 5, zlib 6).
 
     Example::
 
         class Event(BaseModel):
             id:   int
-            meta: dict                       # → 'json'
-            tags: Json()                     # → 'json' (a list)
-            raw:  Json(compression="brotli") # → 'json[brotli]' (big payload)
+            meta: dict                                 # → 'json'
+            tags: Json()                               # → 'json' (a list)
+            raw:  Json(compression="brotli", level=9)  # → 'json[brotli:9]'
     """
     from typing import Annotated, Any
 
-    tag = _codec_suffix("json", compression)
+    tag = _codec_suffix("json", compression, level)
 
     class _JsonMeta:
         loom_dtype = tag

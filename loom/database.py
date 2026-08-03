@@ -88,6 +88,7 @@ class DB:
     NEXT_ID_KEY = "_next_identifier"
     FREE_IDS_KEY = "_free_dataset_ids"
     BLOB_COMPRESSION_KEY = "_blob_compression"
+    BLOB_COMPRESSION_LEVEL_KEY = "_blob_compression_level"
 
     def __init__(
         self,
@@ -96,6 +97,7 @@ class DB:
         header_size=32768,
         auto_open=True,
         blob_compression=None,
+        blob_compression_level=None,
         auto_save_interval=100,
         cache_size=200_000,
         sync_writes=False,
@@ -109,10 +111,15 @@ class DB:
             initial_size: Initial file size in bytes
             header_size: Header region size in bytes
             auto_open: Automatically open database (default: True)
-            blob_compression: Compression for blobs ("brotli", "zlib", or None).
-                Default is None — compression typically costs ~20× on insert
-                throughput (CPU-bound).  Pass "brotli" to trade speed for
-                ~3–5× space savings on natural language.
+            blob_compression: DB-wide compression for blob/text/json fields
+                ("brotli", "zlib", or None). Default None — no compression. Set
+                it on the DB to compress every blob field, or leave it None and
+                compress just one big field via Text(compression=...) in the
+                schema. (Per-field beats DB-wide when only one field is large.)
+            blob_compression_level: DB-wide compression level. None → the codec
+                default (brotli 5, zlib 6 — a good speed/ratio balance; brotli's
+                own default 11 is far slower for little gain). Overridable
+                per-field with Text(compression=..., level=...).
             auto_save_interval: Auto-save metadata every N operations per
                 data structure.  Lower = safer (less data lost on crash),
                 higher = faster.  Use 0 to disable (manual save only).
@@ -183,6 +190,7 @@ class DB:
         self._is_open = False
         self._loading_registry = False  # Flag to prevent saving during load
         self._blob_compression = blob_compression
+        self._blob_compression_level = blob_compression_level
         self._blob_store = None  # Lazy initialized
 
         # Auto-open by default for convenience
@@ -226,12 +234,20 @@ class DB:
         self._db.open()
         self._is_open = True
         _OPEN_DBS.add(self)   # auto-close at interpreter exit if not closed
-        self._load_registry()
 
-        # Load blob compression setting from header (for existing DBs)
+        # Load blob compression settings from the header BEFORE _load_registry:
+        # recreating a blob-backed dataset there triggers the blob_store
+        # property, which writes these settings back — so if we loaded them
+        # after, the property would clobber the persisted codec/level with this
+        # instance's constructor defaults.
         saved_compression = self._db.get_header_field(self.BLOB_COMPRESSION_KEY)
         if saved_compression is not None:
             self._blob_compression = saved_compression
+        saved_level = self._db.get_header_field(self.BLOB_COMPRESSION_LEVEL_KEY)
+        if saved_level is not None:
+            self._blob_compression_level = saved_level
+
+        self._load_registry()
 
         return self
 
@@ -239,12 +255,20 @@ class DB:
     def blob_store(self):
         """Get the blob store (lazy initialized)."""
         if self._blob_store is None:
-            self._blob_store = BlobStore(self._db, compression=self._blob_compression)
-            # Save compression setting
+            self._blob_store = BlobStore(
+                self._db,
+                compression=self._blob_compression,
+                level=self._blob_compression_level,
+            )
+            # Save compression settings
             if not self.read_only:
                 self._db.set_header_field(
                     self.BLOB_COMPRESSION_KEY, self._blob_compression
                 )
+                if self._blob_compression_level is not None:
+                    self._db.set_header_field(
+                        self.BLOB_COMPRESSION_LEVEL_KEY, self._blob_compression_level
+                    )
         return self._blob_store
 
     def close(self):
@@ -364,17 +388,17 @@ class DB:
     def _dtype_to_registry_str(dataset, field_name):
         """Serialize one field's dtype for the registry, preserving array shapes
         and any per-field blob compression codec so it round-trips on reopen."""
-        from loom.dataset import dtype_to_str
+        from loom.dataset import dtype_to_str, _codec_tag
 
         codecs = getattr(dataset, "_blob_codecs", {})
 
         def _tag(base):
             # A field with an explicit per-field codec is stored as
-            # "text[brotli]" / "json[none]"; absent → plain "text"/"json"
-            # (falls back to the DB default, unchanged behaviour).
-            if field_name in codecs:
-                return f"{base}[{codecs[field_name] or 'none'}]"
-            return base
+            # "text[brotli]" / "text[brotli:9]" / "json[none]"; absent → plain
+            # "text"/"json" (falls back to the DB default, unchanged behaviour).
+            if field_name not in codecs:
+                return base
+            return f"{base}[{_codec_tag(codecs[field_name])}]"
 
         if field_name in dataset._text_fields:
             return _tag("text")
@@ -604,6 +628,9 @@ class DB:
         saved_compression = self._db.get_header_field(self.BLOB_COMPRESSION_KEY)
         if saved_compression is not None:
             self._blob_compression = saved_compression
+        saved_level = self._db.get_header_field(self.BLOB_COMPRESSION_LEVEL_KEY)
+        if saved_level is not None:
+            self._blob_compression_level = saved_level
 
     def _reserve_name(self, name, in_dataset, exist_ok):
         """Validate a new name across BOTH the dataset and datastructure

@@ -119,6 +119,68 @@ class TestPydanticDeclaration:
                 assert len(bodies) == 25
 
 
+class TestCompressionLevel:
+    def test_default_brotli_level_is_5_not_11(self):
+        from loom.blob import _DEFAULT_LEVEL
+
+        assert _DEFAULT_LEVEL["brotli"] == 5   # fast default, not brotli's own 11
+
+    def test_explicit_level_roundtrips_in_schema(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.loom")
+
+            class Doc(BaseModel):
+                id: Utf8(16)
+                body: Text(compression="brotli", level=9)
+
+            with DB(path) as db:
+                db.collection("docs", Doc, indexes={"id": "primary"}).insert(
+                    {"id": "x", "body": BOOK})
+                reg = db._db.get_header_field("_dataset_registry")
+                tags = [s["schema"]["body"] for s in reg.values() if "body" in s["schema"]]
+                assert all(t == "text[brotli:9]" for t in tags), tags
+
+            # reopen with no model: level tag persisted → still decodes + the
+            # field keeps its declared codec/level for new writes
+            with DB(path) as db:
+                docs = db.collection("docs")
+                assert docs["x"]["body"] == BOOK
+                docs.insert({"id": "y", "body": BOOK + "!"})
+                assert docs["y"]["body"] == BOOK + "!"
+
+    def test_level_1_and_11_both_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            for lvl in (1, 11):
+                path = os.path.join(d, f"l{lvl}.loom")
+
+                class Doc(BaseModel):
+                    id: Utf8(16)
+                    body: Text(compression="brotli", level=lvl)
+
+                with DB(path) as db:
+                    c = db.collection("d", Doc, indexes={"id": "primary"})
+                    c.insert({"id": "x", "body": BOOK})
+                    assert c["x"]["body"] == BOOK
+
+    def test_db_level_default_level_applies_and_persists(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.loom")
+            with DB(path, blob_compression="brotli", blob_compression_level=9) as db:
+                ds = db.create_dataset("t", id="utf8[16]", body="text")
+                ref = ds.insert({"id": "x", "body": BOOK})
+                assert ds.read(ref.addr)["body"] == BOOK
+            # the DB-level level is remembered on reopen (persisted in the header)
+            with DB(path) as db:
+                assert db._blob_compression_level == 9
+                assert db._blob_compression == "brotli"
+
+    def test_bad_level_type_rejected(self):
+        with pytest.raises(ValueError, match="level"):
+            Text(compression="brotli", level="high")
+        with pytest.raises(ValueError, match="level requires a compression codec"):
+            Text(compression=None, level=5)
+
+
 class TestRawDtypeTags:
     def test_text_none_forces_uncompressed_against_db_default(self):
         with tempfile.TemporaryDirectory() as d:
