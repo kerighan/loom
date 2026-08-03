@@ -26,6 +26,13 @@ from loom.errors import (
 )
 
 
+def _is_pydantic_model(obj):
+    """True if obj is a Pydantic BaseModel *class* (v2 or v1)."""
+    return isinstance(obj, type) and (
+        hasattr(obj, "model_fields") or hasattr(obj, "__fields__")
+    )
+
+
 def _needs_blob_store(dtype):
     """Whether a schema dtype is stored in the BlobStore (blob/text/json),
     tolerating a per-field compression suffix (e.g. ``"text[brotli]"``) and the
@@ -657,9 +664,11 @@ class DB:
 
         Args:
             dataset_name: Dataset name (must be unique)
-            model: Optional Pydantic BaseModel class — schema is derived
-                   from its fields (int→int64, float→float64, str→text, etc.)
-            **schema: Field definitions as numpy dtypes (ignored if model given)
+            model: Optional Pydantic BaseModel class (schema derived from its
+                   fields) or a schema dict.  A field named ``model`` in a
+                   schema is fine — see the note below.
+            **schema: Field definitions as dtype strings (ignored if a Pydantic
+                   model is given)
 
         Returns:
             Dataset instance
@@ -675,16 +684,41 @@ class DB:
                 name: str
                 score: float
             users = db.create_dataset('users', User)
+
+        Note:
+            A field literally named ``model`` or ``exist_ok`` collides with this
+            method's own parameters under Python's keyword dispatch (whether via
+            a direct ``model="utf8[48]"`` or an internal ``**schema`` spread).
+            loom detects the misuse — a real ``model=`` is a Pydantic class or a
+            dict, a real ``exist_ok=`` is a bool — and restores the field, so
+            such columns are no longer silently dropped.
         """
         if not self._is_open:
             raise DatabaseNotOpenError()
         self._ensure_writable()
 
-        # Convert Pydantic model to schema if provided
-        if model is not None and not schema:
-            from loom.schema import schema_from_model
+        # A field named `model`/`exist_ok` gets bound to our own parameter by
+        # keyword dispatch, silently stealing the column (it only surfaced as
+        # `unknown field 'model'` at insert time).  A genuine `model=` is a
+        # Pydantic class or a schema dict; a genuine `exist_ok=` is a bool —
+        # anything else was a field, so put it back into the schema.
+        if model is not None and not (
+            _is_pydantic_model(model) or isinstance(model, dict)
+        ):
+            schema["model"] = model
+            model = None
+        if not isinstance(exist_ok, bool):
+            schema["exist_ok"] = exist_ok
+            exist_ok = False
 
-            schema = schema_from_model(model)
+        # Convert a Pydantic model / dict schema to a plain schema dict
+        if model is not None and not schema:
+            if isinstance(model, dict):
+                schema = dict(model)
+            else:
+                from loom.schema import schema_from_model
+
+                schema = schema_from_model(model)
 
         existing = self._reserve_name(dataset_name, in_dataset=True, exist_ok=exist_ok)
         if existing is not None:
