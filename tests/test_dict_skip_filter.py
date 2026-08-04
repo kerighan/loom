@@ -67,14 +67,13 @@ class TestSkipFilterCorrectness:
             with DB(path) as db:
                 col = db.collection("c", Rec, indexes={"id": "primary"})
                 col.insert_many([{"id": f"k{i:06d}", "v": i} for i in range(20000)])
-            # reopen: filters are not persisted → rebuilt on first write
+            # reopen: filters are not persisted → rebuilt eagerly at open
             with DB(path) as db:
                 col = db.collection("c")
                 dk = col._primary
-                assert dk._blooms == []                      # not built until a write
-                # a new key whose absence must be seen correctly after rebuild
+                assert dk._blooms and dk.use_bloom           # built at open
+                # a new key whose absence must be seen correctly
                 col.insert({"id": "k999999", "v": -1})
-                assert dk._blooms and dk.use_bloom           # rebuilt on that write
                 assert len(col) == 20001
                 assert col["k010000"]["v"] == 10000          # old key still found
                 assert col["k999999"]["v"] == -1
@@ -152,19 +151,20 @@ class TestVectorisedRebuildEquivalence:
         assert all((int(hi), int(lo)) in bulk for hi, lo in zip(his[:1000], los[:1000]))
 
 
-class TestReadOnlyOpenSkipsRebuild:
-    def test_read_only_open_does_not_build_filters(self):
+class TestEagerBuildAtOpen:
+    def test_open_builds_filter_so_cold_reads_benefit(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "a.loom")
             with DB(path) as db:
                 col = db.collection("c", Rec, indexes={"id": "primary"})
                 col.insert_many([{"id": f"k{i:05d}", "v": i} for i in range(4000)])
+            # A fresh open (no write yet) must already have the filter — that's
+            # what lets a cold read skip non-owning tables from the first lookup.
             with DB(path) as db:
                 col = db.collection("c")
-                # pure reads: filters must stay unbuilt (no O(n) rebuild scan)
+                assert col._primary._blooms and col._primary.use_bloom
                 assert col["k00042"]["v"] == 42
                 assert "k99999" not in col
-                assert col._primary._blooms == []
 
 
 if __name__ == "__main__":
