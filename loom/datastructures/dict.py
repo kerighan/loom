@@ -2,11 +2,94 @@
 
 import struct
 import mmh3
+import numpy as np
 from loom.datastructures.base import DataStructure, write_op
 from loom.datastructures.template import DataStructureTemplate
-from loom.datastructures.counting_bloomfilter import CountingBloomFilter
 from loom.dataset import _to_native, as_record
 from loom.ref import Ref
+
+
+class _HashSkipFilter:
+    """In-RAM per-table membership filter, keyed on the 128-bit murmur hash.
+
+    Its sole job is to let _find_slot skip a table that definitely does not
+    hold a key (the Dict never rehashes — it stacks exponentially larger
+    tables — so an absent-key existence check otherwise scans every table).
+
+    Deliberately NOT a CountingBloomFilter:
+      * No re-hashing — the ``(hi, lo)`` pair IS a 128-bit murmur hash, so the
+        k probe positions are derived from it by double hashing (h1 = lo,
+        h2 = hi | 1, both already uniform).  No ``str()``, no ``mmh3`` per op —
+        that rehash was the bulk of the old filter's cost.
+      * A plain bitset in RAM — no mmap-backed counters.  It is never written
+        to the file (rebuilt from the tables on open), so the on-disk format is
+        unchanged and old files just skip it.
+      * ``lo`` seeds the probe while the hash table buckets on the low bits of
+        ``hi`` — different 64-bit halves, so the filter is not isomorphic to
+        the table it guards.  ``m`` is sized from capacity independently (×
+        BITS_PER_ITEM, rounded up to a power of two), not equal to it.
+
+    Deletes are not tracked: a removed key leaves its bits set (a harmless
+    false positive → one un-skipped table scan), never a false negative.
+    """
+
+    __slots__ = ("_mask", "_bits", "_k")
+    BITS_PER_ITEM = 12
+    K = 6
+
+    def __init__(self, capacity):
+        m = 64
+        target = max(64, int(capacity) * self.BITS_PER_ITEM)
+        while m < target:
+            m <<= 1
+        self._mask = m - 1
+        self._bits = bytearray(m >> 3)
+        self._k = self.K
+
+    def add(self, hilo):
+        hi, lo = hilo
+        mask, bits = self._mask, self._bits
+        h = lo & mask
+        step = (hi | 1) & mask
+        for _ in range(self._k):
+            bits[h >> 3] |= 1 << (h & 7)
+            h = (h + step) & mask
+
+    def __contains__(self, hilo):
+        hi, lo = hilo
+        mask, bits = self._mask, self._bits
+        h = lo & mask
+        step = (hi | 1) & mask
+        for _ in range(self._k):
+            if not (bits[h >> 3] >> (h & 7)) & 1:
+                return False
+            h = (h + step) & mask
+        return True
+
+    def add_many(self, his, los):
+        """Vectorised bulk add of numpy uint64 hash columns (rebuild path).
+
+        Sets the same bits as add() would per key, but with k vectorised
+        passes over all keys at once — ``np.bitwise_or.at`` folds the duplicate
+        byte indices correctly.  Operates on a numpy *view* of the bytearray,
+        so the scalar hot path (add/contains) keeps its plain-bytearray speed.
+        """
+        mask = np.uint64(self._mask)
+        view = np.frombuffer(self._bits, dtype=np.uint8)
+        h = los & mask
+        step = (his | np.uint64(1)) & mask
+        seven = np.uint64(7)
+        three = np.uint64(3)
+        one = np.uint8(1)
+        for i in range(self._k):
+            bit = one << (h & seven).astype(np.uint8)
+            np.bitwise_or.at(view, (h >> three).astype(np.intp), bit)
+            if i + 1 < self._k:
+                h = (h + step) & mask
+
+    def remove(self, hilo):
+        # No-op: a stale bit is a safe false positive, never a false negative.
+        pass
 
 
 class Dict(DataStructure):
@@ -152,9 +235,11 @@ class Dict(DataStructure):
         self._hash_key_fn = None  # legacy hex mode only
         self._key_size = 0  # no longer used for slot sizing
 
-        # Bloom filters: only meaningful for legacy store_key-in-slot mode
-        # With binary hash table the integer comparison is already O(1)
-        self.use_bloom = False
+        # Per-table skip filter (see _HashSkipFilter): lets _find_slot avoid
+        # scanning tables that can't hold the key.  In-RAM, rebuilt on open, so
+        # enabling it changes nothing on disk.  Honour the caller (default on);
+        # binary-key mode only — legacy hex-key mode has no (hi,lo) to filter on.
+        self.use_bloom = bool(use_bloom) and not hash_keys
 
         if hash_keys and store_key:
             # Legacy hex-string mode: key stored as SHA hex in the slot
@@ -474,14 +559,7 @@ class Dict(DataStructure):
         # Each table has its own bloom filter to quickly check if a key might be there
         self._blooms = []
         if self.use_bloom and not self._parent:
-            # Create counting bloom filter for the first table (supports delete!)
-            bloom = CountingBloomFilter(
-                f"{self.name}_bloom_0",
-                self._db,
-                expected_items=capacity,
-                false_positive_rate=0.01,
-            )
-            self._blooms.append(bloom)
+            self._blooms.append(_HashSkipFilter(capacity))
 
         # Save metadata on initialization.
         #
@@ -531,23 +609,16 @@ class Dict(DataStructure):
         self._hash_table = self._get_dataset(metadata["hash_table_name"])
         self._values_dataset = self._get_dataset(metadata["values_dataset_name"])
 
-        # Load per-table counting bloom filters
+        # Skip filters are in-RAM: rebuild from the tables on open (never
+        # persisted).  Always on for a top-level binary-key Dict — it's cheap
+        # and format-transparent, so the stale persisted `use_bloom` flag of an
+        # older file is ignored and old files get the speedup too.  Legacy
+        # hex-key mode has no (hi,lo) tuple to filter on, so it stays off.
+        self.use_bloom = (not self._parent) and not getattr(self, "_hash_keys", False)
+        # Built lazily on the first write (see _setitem_fast), never eagerly:
+        # a read-only open then pays no rebuild scan, and reads fall back to the
+        # (correct) un-skipped table scan when no filter is present.
         self._blooms = []
-        if self.use_bloom and "bloom_names" in metadata:
-            for bloom_name in metadata["bloom_names"]:
-                bloom = self._db._datastructures.get(bloom_name) or CountingBloomFilter(
-                    bloom_name, self._db
-                )
-                self._blooms.append(bloom)
-        elif self.use_bloom and "bloom_name" in metadata:
-            # Legacy: single bloom filter - convert to list
-            bloom_name = metadata["bloom_name"]
-            bloom = self._db._datastructures.get(bloom_name) or CountingBloomFilter(
-                bloom_name, self._db
-            )
-            self._blooms.append(bloom)
-        elif not self.use_bloom:
-            self._blooms = []
 
         if self._is_nested:
             from loom.datastructures.base import _DS_REGISTRY
@@ -740,9 +811,7 @@ class Dict(DataStructure):
             "hash_bits": getattr(self, "_hash_bits", 128),
             "store_key": getattr(self, "_store_key", True),
         }
-        # Save per-table bloom filter names
-        if self.use_bloom and self._blooms:
-            metadata["bloom_names"] = [b.name for b in self._blooms]
+        # Skip filters are in-RAM (rebuilt on open) — nothing to persist.
         if self._is_nested and self._template:
             metadata["template_dataset"] = self._template.dataset.name
             metadata["template_config"] = self._template.config
@@ -1001,16 +1070,31 @@ class Dict(DataStructure):
         new_table_addr = self._hash_table.allocate_block(capacity)
         self.table_addrs.append(int(new_table_addr))
 
-        # Create counting bloom filter for the new table (supports delete!)
+        # Add a skip filter for the new table.
         if self.use_bloom and not self._parent:
-            table_idx = len(self.table_addrs) - 1
-            bloom = CountingBloomFilter(
-                f"{self.name}_bloom_{table_idx}",
-                self._db,
-                expected_items=capacity,
-                false_positive_rate=0.01,
-            )
-            self._blooms.append(bloom)
+            self._blooms.append(_HashSkipFilter(capacity))
+
+    def _rebuild_filters(self):
+        """Rebuild the in-RAM per-table skip filters from the stored slots.
+
+        The filters are never persisted, so this runs on open.  Binary-key
+        mode only: the slot carries the 128-bit hash as hash_hi/hash_lo at
+        fixed offsets 1 and 9 (matching _find_slot_in_table)."""
+        self._blooms = []
+        p_init = getattr(self, "_p_init", self.P_INIT)
+        ht = self._hash_table
+        rs = ht.record_size
+        for table_idx, table_addr in enumerate(self.table_addrs):
+            capacity = self._get_capacity(p_init + table_idx)
+            filt = _HashSkipFilter(capacity)
+            # Parse the whole table as one structured array, mask on `valid`,
+            # and bulk-add the two hash columns — no per-slot Python loop.
+            raw = ht.db.read(int(table_addr), capacity * rs)
+            arr = np.frombuffer(raw, dtype=ht.schema)
+            occupied = arr["valid"] != 0
+            if occupied.any():
+                filt.add_many(arr["hash_hi"][occupied], arr["hash_lo"][occupied])
+            self._blooms.append(filt)
 
         self.save()
 
@@ -1098,6 +1182,11 @@ class Dict(DataStructure):
 
     def _setitem_fast(self, key, value):
         """Fast path for non-atomic insert/update (current implementation)."""
+        # Lazily build the in-RAM skip filters on the first write after an open
+        # (a fresh Dict already has them from _initialize, so this is a no-op
+        # except right after loading a non-empty Dict).
+        if self.use_bloom and not self._blooms:
+            self._rebuild_filters()
         # Keep original string key for _key injection in values dataset
         orig_key = key if isinstance(key, str) else str(key)
         key = self._to_internal_key(key)
