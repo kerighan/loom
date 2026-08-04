@@ -15,6 +15,7 @@ allowing flexible value sizes and nested structures.
 import struct
 import sys
 from bisect import bisect_left
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -137,6 +138,13 @@ class BTree(DataStructure):
 
         # Node cache for performance
         self._node_cache = self._make_cache("nodes")
+
+        # Deferred-write buffer for bulk inserts (see deferred_node_writes()).
+        # When active, _write_node buffers the node here instead of serialising
+        # it to disk on every touch — a leaf inserted into K times is written
+        # once at flush, not K times.
+        self._defer_writes = False
+        self._dirty_nodes = None
 
     def _should_cache(self):
         # The node cache stores mutable node *contents*.  A nested btree is
@@ -564,6 +572,8 @@ class BTree(DataStructure):
 
             instance._initial_capacity = 0
             instance._node_cache = instance._make_cache("nodes")
+            instance._defer_writes = False
+            instance._dirty_nodes = None
 
             return instance
 
@@ -710,6 +720,14 @@ class BTree(DataStructure):
         if addr == 0:
             return None
 
+        # Pending (not-yet-flushed) writes win over disk and the LRU: they are
+        # pinned here so a bulk insert has read-your-writes even if the shared
+        # cache evicts the node mid-batch.
+        if self._dirty_nodes is not None:
+            node = self._dirty_nodes.get(addr)
+            if node is not None:
+                return node
+
         # Check cache
         if self._node_cache:
             cached = self._node_cache.get(addr)
@@ -767,7 +785,21 @@ class BTree(DataStructure):
         return node
 
     def _write_node(self, node):
-        """Write a node to disk."""
+        """Persist a node — or buffer it, inside a deferred-write block.
+
+        During a bulk insert the same leaf is touched many times; buffering by
+        address (read-your-writes via _dirty_nodes) collapses those to a single
+        serialise-and-write at flush, which is the bulk of the per-row cost once
+        the tree is non-empty."""
+        if self._defer_writes:
+            self._dirty_nodes[node["addr"]] = node
+            if self._node_cache:
+                self._node_cache[node["addr"]] = node
+            return
+        self._write_node_now(node)
+
+    def _write_node_now(self, node):
+        """Serialise a node straight to disk (the un-deferred write path)."""
         addr = node["addr"]
 
         layout = self._node_layout()
@@ -807,6 +839,39 @@ class BTree(DataStructure):
         # Update cache
         if self._node_cache:
             self._node_cache[addr] = node
+
+    @contextmanager
+    def deferred_node_writes(self):
+        """Buffer node writes for the duration of a bulk insert.
+
+        A per-row insert rewrites its whole leaf on every touch, so filling a
+        leaf of L keys costs L serialise-and-writes — the dominant cost of
+        inserting into a non-empty tree (bulk_load, which builds bottom-up,
+        writes each node once).  Inside this block _write_node only updates an
+        in-memory buffer keyed by address; on exit every touched node is
+        serialised **once**, in address order (sequential mmap writes).
+
+        Correctness: buffered nodes are pinned (read-your-writes even under LRU
+        eviction) and mutated in place exactly as the un-deferred path mutates
+        cached node objects, so the flushed bytes are identical to what N
+        separate writes would have left — same on-disk B+tree, just written
+        far fewer times.  Re-entrant (a nested block is a no-op).  Feed keys in
+        sorted order for the best locality, but correctness does not require it.
+        """
+        if self._defer_writes:
+            yield
+            return
+        self._defer_writes = True
+        self._dirty_nodes = {}
+        try:
+            yield
+        finally:
+            dirty = self._dirty_nodes
+            # Stop buffering BEFORE flushing so _write_node_now writes through.
+            self._defer_writes = False
+            self._dirty_nodes = None
+            for addr in sorted(dirty):
+                self._write_node_now(dirty[addr])
 
     def _invalidate_cache(self, addr):
         """Invalidate a node in the cache."""

@@ -443,8 +443,15 @@ class Collection:
                         if struct.size == 0 and struct.root_addr == 0:
                             struct.bulk_load(entries)        # fresh index: O(n) build
                         else:
-                            for key, val in entries:
-                                struct[key] = val
+                            # Non-empty tree: insert in key order under a
+                            # deferred-write block, so each touched leaf is
+                            # written once (sequential) instead of once per row.
+                            # Without this an incremental (chunked) ingest costs
+                            # ~2x a single bulk_load; with it, ~parity.
+                            entries.sort(key=lambda kv: kv[0])
+                            with struct.deferred_node_writes():
+                                for key, val in entries:
+                                    struct[key] = val
                     if ix.get("counter") is not None:
                         # one counter write per group, not per record
                         deltas, values = {}, {}
