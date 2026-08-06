@@ -725,8 +725,27 @@ class BTree(DataStructure):
         return addr
 
     def _free_node(self, addr):
-        """Return a node freed by a merge to the freelist (intrusive-list head
-        push; a node record is always >= 8 bytes)."""
+        """Return a node freed by a merge to the freelist.
+
+        Inside a deferred-write block the free is DEFERRED: linking it now would
+        write the intrusive next-pointer into the node's first 8 bytes, but that
+        same node may still have a buffered content write pending — the flush at
+        block exit would then clobber the pointer, corrupting the freelist. So
+        during a block we only record the address (and drop any pending write
+        for it, since a freed node needs none); the block links them after the
+        flush (see deferred_node_writes)."""
+        addr = int(addr)
+        if self._defer_writes:
+            if self._dirty_nodes is not None:
+                self._dirty_nodes.pop(addr, None)
+            self._invalidate_cache(addr)
+            self._pending_node_frees.append(addr)
+        else:
+            self._free_node_now(addr)
+
+    def _free_node_now(self, addr):
+        """Link a freed node into the freelist (intrusive-list head push; a node
+        record is always >= 8 bytes)."""
         addr = int(addr)
         prev_head = int(getattr(self, "_node_freelist_head", 0))
         self._node_dataset.db.write(addr, struct.pack("<Q", prev_head))
@@ -931,15 +950,22 @@ class BTree(DataStructure):
             return
         self._defer_writes = True
         self._dirty_nodes = {}
+        self._pending_node_frees = []
         try:
             yield
         finally:
             dirty = self._dirty_nodes
+            frees = self._pending_node_frees
             # Stop buffering BEFORE flushing so _write_node_now writes through.
             self._defer_writes = False
             self._dirty_nodes = None
+            self._pending_node_frees = None
             for addr in sorted(dirty):
                 self._write_node_now(dirty[addr])
+            # Link freed nodes AFTER their (dropped) content would have been
+            # flushed — the intrusive pointer now can't be overwritten.
+            for addr in frees:
+                self._free_node_now(addr)
 
     def _invalidate_cache(self, addr):
         """Invalidate a node in the cache."""

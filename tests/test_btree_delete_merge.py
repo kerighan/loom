@@ -162,6 +162,51 @@ class TestDeleteMergeInvariants:
                     assert [k for k in bt.keys()] == sorted(ref)
 
 
+class TestDeleteInsideDeferredBlock:
+    """Regression: a del inside deferred_node_writes() must not corrupt the node
+    freelist. The freed node's intrusive next-pointer used to be clobbered by a
+    still-pending buffered write flushed at block exit; the freelist head then
+    pointed at garbage and the next _create_node read a wild address. Frees are
+    now deferred and linked only after the flush."""
+
+    def test_del_and_insert_in_one_deferred_block(self):
+        with tempfile.TemporaryDirectory() as d:
+            with DB(os.path.join(d, "a.loom")) as db:
+                bt = db.create_btree("t", {"v": "int64"}, key_size=8)
+                ref = {}
+                for i in range(3000):
+                    bt[f"{i:06d}"] = {"v": i}; ref[f"{i:06d}"] = i
+                with bt.deferred_node_writes():
+                    for i in range(2000):                 # many merges
+                        del bt[f"{i:06d}"]; del ref[f"{i:06d}"]
+                    for i in range(3000, 3500):           # splits (create_node)
+                        bt[f"{i:06d}"] = {"v": i}; ref[f"{i:06d}"] = i
+                _check_invariants(bt)
+                # hammering inserts pops the freelist — used to crash here
+                for i in range(3500, 6000):
+                    bt[f"{i:06d}"] = {"v": i}; ref[f"{i:06d}"] = i
+                _check_invariants(bt)
+                assert [k for k in bt.keys()] == sorted(ref)
+                assert bt[f"005000"]["v"] == 5000
+
+    def test_moves_in_deferred_block_reuse_freed_nodes(self):
+        # A batched "move" pattern (del old key + insert new key) inside one
+        # deferred block, exactly like a batched counter re-index.
+        with tempfile.TemporaryDirectory() as d:
+            with DB(os.path.join(d, "a.loom")) as db:
+                bt = db.create_btree("t", {"v": "int64"}, key_size=12)
+                for i in range(5000):
+                    bt[f"a{i:06d}"] = {"v": i}
+                with bt.deferred_node_writes():
+                    for i in range(5000):                 # move every key
+                        del bt[f"a{i:06d}"]
+                        bt[f"b{i:06d}"] = {"v": i}
+                _check_invariants(bt)
+                assert len(bt) == 5000
+                assert [k for k in bt.keys()] == [f"b{i:06d}" for i in range(5000)]
+                assert bt["b002500"]["v"] == 2500
+
+
 class TestCollectionDeleteMerge:
     def test_collection_delete_heavy_stays_consistent(self):
         from pydantic import BaseModel
