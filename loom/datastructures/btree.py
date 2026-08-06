@@ -399,6 +399,8 @@ class BTree(DataStructure):
         # Records < 8 bytes can't hold a pointer → in-memory (unpersisted) list.
         self._value_freelist_head = 0
         self._value_freelist = []
+        # Nodes freed by a delete-merge, reused by the next split.
+        self._node_freelist_head = 0
 
         # Initialize empty tree (no root yet)
         self.root_addr = 0  # 0 means empty tree
@@ -445,6 +447,7 @@ class BTree(DataStructure):
         # exactly the old behaviour: fully backward-compatible.
         self._value_freelist_head = int(metadata.get("value_freelist_head", 0))
         self._value_freelist = []
+        self._node_freelist_head = int(metadata.get("node_freelist_head", 0))
 
         self._is_nested = metadata.get("is_nested", False)
 
@@ -517,6 +520,7 @@ class BTree(DataStructure):
                 getattr(self, "current_values_block_offset", 0)
             ),
             "value_freelist_head": int(getattr(self, "_value_freelist_head", 0)),
+            "node_freelist_head": int(getattr(self, "_node_freelist_head", 0)),
         }
 
         if self._is_nested:
@@ -583,6 +587,7 @@ class BTree(DataStructure):
             # reuse), which matches their prior behaviour.
             instance._value_freelist_head = 0
             instance._value_freelist = []
+            instance._node_freelist_head = 0
             instance._key_size = int(ref.get("key_size", 50))
 
             instance.name = f"_nested_btree_{id(instance)}"
@@ -699,8 +704,16 @@ class BTree(DataStructure):
         self.save()
 
     def _create_node(self, is_leaf=True):
-        """Create a new node and return its address."""
-        addr = self._node_dataset.allocate_block(1)
+        """Create a new node and return its address, reusing a node freed by a
+        merge (see _free_node) before bump-allocating — so delete-merge keeps
+        the node arena bounded instead of leaking one node per merge."""
+        head = getattr(self, "_node_freelist_head", 0)
+        if head:
+            nxt = struct.unpack("<Q", self._node_dataset.db.read(int(head), 8))[0]
+            self._node_freelist_head = int(nxt)
+            addr = int(head)
+        else:
+            addr = self._node_dataset.allocate_block(1)
         node = {
             "addr": addr,
             "is_leaf": is_leaf,
@@ -710,6 +723,15 @@ class BTree(DataStructure):
         }
         self._write_node(node)
         return addr
+
+    def _free_node(self, addr):
+        """Return a node freed by a merge to the freelist (intrusive-list head
+        push; a node record is always >= 8 bytes)."""
+        addr = int(addr)
+        prev_head = int(getattr(self, "_node_freelist_head", 0))
+        self._node_dataset.db.write(addr, struct.pack("<Q", prev_head))
+        self._node_freelist_head = addr
+        self._invalidate_cache(addr)
 
     def _node_layout(self):
         """Precomputed byte offsets of the node record fields, or None.
@@ -1085,32 +1107,106 @@ class BTree(DataStructure):
     # ========== Delete Operations ==========
 
     def _delete(self, key):
-        """Delete a key from the tree (B+ tree style).
+        """Delete a key, rebalancing on the way up (classic B+ tree delete).
 
-        In a B+ tree, all data is in leaves. We simply find the leaf
-        and delete from there. Internal node separators can stay as-is
-        (they're just for navigation, not actual data).
+        Removes the (key, value) from its leaf, frees the value slot, then, if
+        the leaf fell below MIN_KEYS, borrows from a sibling or merges with one
+        — cascading the deficiency up the recorded path and collapsing the root
+        when it loses its last key.  Merged-away nodes are freed for reuse, so a
+        delete-heavy / moving-key index stays compact instead of growing.
         """
         if self.root_addr == 0:
             raise KeyError(key)
 
-        # Find the leaf containing this key
-        node, idx, found = self._search(key)
-
+        path, leaf, idx, found = self._search_path(key)
         if not found:
             raise KeyError(key)
 
-        # Delete from leaf — the popped child is the value slot; free it for
-        # reuse (leaf children are value addresses in a B+ tree).
-        node["keys"].pop(idx)
-        value_addr = node["children"].pop(idx)
-        node["num_keys"] -= 1
-        self._write_node(node)
-        self._invalidate_cache(node["addr"])
+        # Remove from the leaf; its child is the value slot → free it.
+        leaf["keys"].pop(idx)
+        value_addr = leaf["children"].pop(idx)
+        leaf["num_keys"] -= 1
+        self._write_node(leaf)
         if not self._is_nested:
             self._free_value_addr(value_addr)
 
-        self._update_parent_ref()
+        self._rebalance_after_delete(path, leaf)
+
+    def _rebalance_after_delete(self, path, node):
+        """Restore the MIN_KEYS invariant from ``node`` up, via borrow/merge."""
+        while path and node["num_keys"] < self.MIN_KEYS:
+            parent, ci = path[-1]        # node is parent["children"][ci]
+
+            left = self._read_node(parent["children"][ci - 1]) if ci > 0 else None
+            right = (self._read_node(parent["children"][ci + 1])
+                     if ci < parent["num_keys"] else None)
+
+            if left is not None and left["num_keys"] > self.MIN_KEYS:
+                self._borrow_from_left(parent, ci, left, node)
+                self._write_node(left); self._write_node(node); self._write_node(parent)
+                return
+            if right is not None and right["num_keys"] > self.MIN_KEYS:
+                self._borrow_from_right(parent, ci, node, right)
+                self._write_node(right); self._write_node(node); self._write_node(parent)
+                return
+
+            # No spare sibling → merge, then the deficiency may move to parent.
+            if left is not None:
+                self._merge_nodes(parent, ci - 1, left, node)   # node into left
+                self._write_node(left)
+            else:
+                self._merge_nodes(parent, ci, node, right)      # right into node
+                self._write_node(node)
+            self._write_node(parent)
+            node = parent
+            path = path[:-1]
+
+        if not path:                     # reached the root
+            if not node["is_leaf"] and node["num_keys"] == 0:
+                # Root has a single child left → that child becomes the root.
+                old = node["addr"]
+                self.root_addr = int(node["children"][0])
+                self.height -= 1
+                self._free_node(old)
+
+    def _borrow_from_left(self, parent, ci, left, node):
+        """Move one entry from the left sibling into ``node`` (right of it)."""
+        if node["is_leaf"]:
+            node["keys"].insert(0, left["keys"].pop())
+            node["children"].insert(0, left["children"].pop())
+            parent["keys"][ci - 1] = node["keys"][0]        # new split key
+        else:
+            node["keys"].insert(0, parent["keys"][ci - 1])  # separator rotates down
+            node["children"].insert(0, left["children"].pop())
+            parent["keys"][ci - 1] = left["keys"].pop()      # left's last key rotates up
+        node["num_keys"] += 1
+        left["num_keys"] -= 1
+
+    def _borrow_from_right(self, parent, ci, node, right):
+        """Move one entry from the right sibling into ``node`` (left of it)."""
+        if node["is_leaf"]:
+            node["keys"].append(right["keys"].pop(0))
+            node["children"].append(right["children"].pop(0))
+            parent["keys"][ci] = right["keys"][0]           # new split key
+        else:
+            node["keys"].append(parent["keys"][ci])         # separator rotates down
+            node["children"].append(right["children"].pop(0))
+            parent["keys"][ci] = right["keys"].pop(0)        # right's first key rotates up
+        node["num_keys"] += 1
+        right["num_keys"] -= 1
+
+    def _merge_nodes(self, parent, sep, left, right):
+        """Merge ``right`` into ``left`` (siblings around parent.keys[sep]) and
+        drop the separator from the parent.  ``right`` is freed."""
+        if not left["is_leaf"]:
+            left["keys"].append(parent["keys"][sep])         # separator pulled down
+        left["keys"].extend(right["keys"])
+        left["children"].extend(right["children"])
+        left["num_keys"] = len(left["keys"])
+        parent["keys"].pop(sep)
+        parent["children"].pop(sep + 1)
+        parent["num_keys"] -= 1
+        self._free_node(right["addr"])
 
     # ========== Public API ==========
 
