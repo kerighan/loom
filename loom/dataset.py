@@ -962,6 +962,16 @@ class Dataset:
             self.db.write(address + field_offset, data)
             return
 
+        if field_name in self._array_fields:
+            # Sub-array (vector) field: np.array([value], dtype=('f4',(N,)))
+            # broadcasts wrong (it wrote the first element N times). Pack the
+            # raw values against the element base dtype instead, exactly like
+            # _serialize's array path.
+            base = self.user_schema.fields[field_name][0].base
+            data = np.asarray(value, dtype=base).tobytes()
+            self.db.write(address + field_offset, data)
+            return
+
         if field_name in self._datetime_fields:
             value = _dt_to_micros(value)
 

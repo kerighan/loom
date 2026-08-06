@@ -510,7 +510,14 @@ class Collection:
                         doc_id = si["index"].add(None, text=text)
                         si["docid2pk"].append({"pk": pk})
                         si["pk2docid"][pk] = {"doc_id": doc_id}
-                self._primary[pk] = new
+                # Write ONLY the changed fields, in place — not the whole record.
+                # An unchanged field keeps its stored bytes untouched, so a
+                # `text`/`json`/`blob` field that didn't change keeps its blob
+                # reference (no decompress-then-recompress of data that is
+                # identical). Rewriting the whole record made a one-field bump
+                # (e.g. a counter) needlessly re-encode every blob in the row.
+                for f, v in changes.items():
+                    self._primary[pk, f] = v
         return new
 
     def delete(self, pk):
