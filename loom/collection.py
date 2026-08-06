@@ -552,6 +552,95 @@ class Collection:
             self._primary[pk, field] = new
             return new
 
+    def increment_many(self, pairs, field, amount=1):
+        """Add a per-key amount to a numeric ``field`` across many rows at once.
+
+        ``pairs`` is a mapping ``{pk: amount}`` or an iterable of ``(pk, amount)``
+        (a bare pk uses ``amount``); amounts for a repeated pk are summed.
+        Returns ``{pk: new_value}``.
+
+        Same result as calling ``increment(pk, field, amount)`` on each key, but
+        when ``field`` feeds an ordered index (a ``range`` / ``Many`` sort key)
+        the re-index does all the entry MOVES in one deferred-write block per
+        index — ~2x cheaper per key than one-at-a-time once the index is
+        non-empty — and only the counter field is rewritten in place, so
+        unchanged blob fields keep their references (no decompress/recompress).
+        Ideal for a batched counter (URL/domain hit counts coalesced per flush).
+        """
+        deltas = {}
+        items = pairs.items() if isinstance(pairs, dict) else pairs
+        for it in items:
+            pk, amt = it if isinstance(it, tuple) else (it, amount)
+            pk = str(pk)
+            deltas[pk] = deltas.get(pk, 0) + amt
+        if not deltas:
+            return {}
+
+        affected = [ix for ix in self._indexes.values() if field in ix["sources"]]
+        need = {field}
+        for ix in affected:
+            need.add(ix["field"])
+            if ix["spec"].sort is not None:
+                need.add(ix["spec"].sort)
+        need = list(need)
+
+        results = {}
+        with self._db.write_lock():
+            with self._db.batch(defer_save=True):
+                olds, news = {}, {}
+                for pk, dv in deltas.items():
+                    rec = self._primary.get_fields(pk, need)
+                    if rec is None:
+                        raise KeyError(pk)
+                    nv = int(rec[field]) + dv
+                    olds[pk] = rec
+                    news[pk] = {**rec, field: nv}
+                    results[pk] = nv
+
+                for ix in affected:
+                    struct = ix["struct"]
+                    moves = []
+                    for pk in deltas:
+                        ok = self._index_key(ix, olds[pk], pk)
+                        nk = self._index_key(ix, news[pk], pk)
+                        if ok != nk:
+                            moves.append((ok, nk, pk))
+
+                    if ix["spec"].kind == "unique":
+                        for ok, nk, pk in moves:
+                            if ok is not None and ok in struct:
+                                del struct[ok]
+                            if nk is not None:
+                                ex = struct.get(nk)
+                                if ex is not None and str(ex["pk"]) != pk:
+                                    raise ValueError(
+                                        f"duplicate value for unique index "
+                                        f"{ix['name']!r}"
+                                    )
+                                struct[nk] = {"pk": pk}
+                    elif moves:  # BTree (range/many): batch the moves
+                        moves.sort(key=lambda m: (m[1] is None, m[1]))
+                        with struct.deferred_node_writes():
+                            for ok, nk, pk in moves:
+                                if ok is not None and ok in struct:
+                                    del struct[ok]
+                                if nk is not None:
+                                    struct[nk] = {"pk": pk}
+
+                    # Maintained group counter: only moves if the GROUP field
+                    # itself changed (i.e. we incremented the group field, not a
+                    # separate sort field).
+                    if ix.get("counter") is not None and field == ix["field"]:
+                        for pk in deltas:
+                            ov, nv = olds[pk].get(field), news[pk].get(field)
+                            if ov != nv:
+                                self._count_add(ix, ov, -1)
+                                self._count_add(ix, nv, +1)
+
+                for pk, nv in results.items():
+                    self._primary[pk, field] = nv
+        return results
+
     def reindex(self):
         """Rebuild every secondary index from the primary store (O(n))."""
         with self._db.write_lock():

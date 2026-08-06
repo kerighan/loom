@@ -485,6 +485,7 @@ posts.search("body", "inverted",               # full-text AND structured filter
              where={"username": "alice", "created_at": (date(2026, 1, 1), None)})
 
 posts.increment("p1", "engagement", 1)         # atomic counter bump
+posts.increment_many({"p1": 3, "p2": 1}, "engagement")  # batched: ~2× per key
 posts.update("p1", engagement=5000)            # re-indexes only changed fields
 posts["p1"]["engagement"] = 5000               # same thing — write-through record
 posts.delete("p1")                             # removed from every index
