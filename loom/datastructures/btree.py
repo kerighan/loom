@@ -172,9 +172,21 @@ class BTree(DataStructure):
         }
 
     def _allocate_value_addr(self):
-        """Allocate an address for a new value record."""
+        """Allocate an address for a new value record, reusing a freed slot
+        first (see _free_value_addr) so a delete-heavy or moving-key index does
+        not grow the values arena forever."""
         if not getattr(self, "values_blocks_head", 0):
             raise RuntimeError("BTree values blocks are not initialized")
+
+        rs = self._values_dataset.record_size
+        if rs >= 8:
+            head = getattr(self, "_value_freelist_head", 0)
+            if head:
+                nxt = struct.unpack("<Q", self._values_dataset.db.read(int(head), 8))[0]
+                self._value_freelist_head = int(nxt)
+                return int(head)
+        elif getattr(self, "_value_freelist", None):
+            return int(self._value_freelist.pop())
 
         if self.current_values_block_offset >= self.current_values_block_capacity:
             new_capacity = int(self.current_values_block_capacity) * 2
@@ -201,6 +213,23 @@ class BTree(DataStructure):
         self.current_values_block_offset += 1
         self.next_data_offset += 1
         return int(value_addr)
+
+    def _free_value_addr(self, addr):
+        """Return a value slot to the freelist (intrusive-list head push).
+
+        The slot is unreferenced once its key is gone, so its first 8 bytes are
+        repurposed to hold the previous head; a later _allocate_value_addr pops
+        it and the caller overwrites it with a fresh record.  Records < 8 bytes
+        can't hold a pointer → an in-memory (unpersisted) list."""
+        addr = int(addr)
+        if self._values_dataset.record_size >= 8:
+            prev_head = int(getattr(self, "_value_freelist_head", 0))
+            self._values_dataset.db.write(addr, struct.pack("<Q", prev_head))
+            self._value_freelist_head = addr
+        else:
+            if not hasattr(self, "_value_freelist"):
+                self._value_freelist = []
+            self._value_freelist.append(addr)
 
     @classmethod
     def get_shared_dataset_specs(cls, parent_name, inner_schema, **kwargs):
@@ -363,6 +392,13 @@ class BTree(DataStructure):
         self.current_values_block_addr = int(self.values_block_addr)
         self.current_values_block_capacity = int(self.values_capacity)
         self.current_values_block_offset = 0
+        # Freed value slots (from delete) are reused before bump-allocating —
+        # else a delete-heavy or moving-key (counter) index grows forever.
+        # Intrusive singly-linked list: each free slot stores the next free
+        # address in its own first 8 bytes; the header keeps only the head.
+        # Records < 8 bytes can't hold a pointer → in-memory (unpersisted) list.
+        self._value_freelist_head = 0
+        self._value_freelist = []
 
         # Initialize empty tree (no root yet)
         self.root_addr = 0  # 0 means empty tree
@@ -405,6 +441,10 @@ class BTree(DataStructure):
         self.current_values_block_offset = int(
             metadata.get("current_values_block_offset", 0)
         )
+        # Absent in files written before the freelist → 0 (empty) → bump-only,
+        # exactly the old behaviour: fully backward-compatible.
+        self._value_freelist_head = int(metadata.get("value_freelist_head", 0))
+        self._value_freelist = []
 
         self._is_nested = metadata.get("is_nested", False)
 
@@ -476,6 +516,7 @@ class BTree(DataStructure):
             "current_values_block_offset": int(
                 getattr(self, "current_values_block_offset", 0)
             ),
+            "value_freelist_head": int(getattr(self, "_value_freelist_head", 0)),
         }
 
         if self._is_nested:
@@ -537,6 +578,11 @@ class BTree(DataStructure):
             instance.current_values_block_offset = int(
                 ref.get("current_values_block_offset", 0)
             )
+            # Nested BTrees don't round-trip the freelist head through the
+            # compact ref — they just start empty (no cross-materialisation
+            # reuse), which matches their prior behaviour.
+            instance._value_freelist_head = 0
+            instance._value_freelist = []
             instance._key_size = int(ref.get("key_size", 50))
 
             instance.name = f"_nested_btree_{id(instance)}"
@@ -1054,12 +1100,15 @@ class BTree(DataStructure):
         if not found:
             raise KeyError(key)
 
-        # Delete from leaf
+        # Delete from leaf — the popped child is the value slot; free it for
+        # reuse (leaf children are value addresses in a B+ tree).
         node["keys"].pop(idx)
-        node["children"].pop(idx)
+        value_addr = node["children"].pop(idx)
         node["num_keys"] -= 1
         self._write_node(node)
         self._invalidate_cache(node["addr"])
+        if not self._is_nested:
+            self._free_value_addr(value_addr)
 
         self._update_parent_ref()
 
