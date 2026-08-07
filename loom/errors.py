@@ -47,6 +47,19 @@ class ReadOnlyError(DatabaseError):
         super().__init__(msg)
 
 
+class DatabaseLockedError(DatabaseError):
+    """Raised when opening with exclusive=True while another process already
+    holds the exclusive write lock on the file."""
+
+    def __init__(self, path):
+        super().__init__(
+            f"{path!r} is already open for writing by another process "
+            f"(exclusive lock held). Only one writer at a time; retry once the "
+            f"other writer closes, or open read-only (flag='r')."
+        )
+        self.path = path
+
+
 class DuplicateNameError(DatabaseError):
     """A dataset or data structure with this name already exists.
 

@@ -20,6 +20,7 @@ from loom.datastructures import BloomFilter, CountingBloomFilter, List, Set
 from loom.blob import BlobStore
 from loom.errors import (
     DatabaseNotOpenError,
+    DatabaseLockedError,
     DuplicateNameError,
     ReadOnlyError,
     StructureNotFoundError,
@@ -109,6 +110,7 @@ class DB:
         cache_size=200_000,
         sync_writes=False,
         multiprocess_safe=False,
+        exclusive=False,
         flag="r+",
     ):
         """Initialize database.
@@ -151,6 +153,15 @@ class DB:
                 Readers never block each other — Linux shared mmap pages give
                 immediate inter-process visibility without msync.
                 Cost: ~1-2 µs per write (flock syscall, uncontested).
+            exclusive: If True, take a non-blocking exclusive fcntl.flock at
+                open() and hold it until close(). A second process opening the
+                same file for writing fails immediately with DatabaseLockedError
+                instead of writing concurrently — the OS-enforced guarantee
+                behind a "one writer owns this file" model (a hash/router only
+                *attributes*, it can't *exclude* a stale owner). Readers
+                (flag="r") are unaffected, and the lock is auto-released if the
+                writer crashes. POSIX only. Prefer this over multiprocess_safe
+                when you want a single hard writer per file, fail-fast.
         """
         self.filename = filename
         self.flag = flag
@@ -165,10 +176,19 @@ class DB:
         self._lock = threading.RLock()
 
         # Process-safety (opt-in): exclusive flock on a companion lock file.
+        #   multiprocess_safe — per-write LOCK_EX/UN (SWMR: one writer + readers)
+        #   exclusive         — LOCK_EX held open→close, non-blocking: a second
+        #                       WRITER opener fails fast (DatabaseLockedError)
+        #                       instead of two writers corrupting the file. This
+        #                       is the enforcement behind any hash/routing that
+        #                       merely *attributes* a file to one writer.
+        # Readers (flag="r") take no lock either way. flock is auto-released by
+        # the OS on process death, so a crashed writer leaves no stale lock.
         self._multiprocess_safe = multiprocess_safe
+        self._exclusive = exclusive
         self._lockfile = None
-        if multiprocess_safe:
-            import fcntl as _fcntl  # noqa: F401 — validate availability early
+        if (multiprocess_safe or exclusive) and flag != "r":
+            import fcntl as _fcntl  # POSIX only; validate availability early
 
             lockpath = filename + ".lock"
             self._lockfile = open(lockpath, "w")
@@ -220,13 +240,16 @@ class DB:
         """
         if self.read_only:
             raise ReadOnlyError()
-        if self._multiprocess_safe:
+        # Under exclusive= the LOCK_EX is already held for the whole session;
+        # a per-op LOCK_UN here would drop it mid-session, so skip it.
+        per_op = self._multiprocess_safe and not self._exclusive
+        if per_op:
             self._fcntl.flock(self._lockfile, self._fcntl.LOCK_EX)
         try:
             with self._lock:
                 yield
         finally:
-            if self._multiprocess_safe:
+            if per_op:
                 self._fcntl.flock(self._lockfile, self._fcntl.LOCK_UN)
 
     def open(self):
@@ -237,6 +260,17 @@ class DB:
         """
         if self._is_open:
             return self  # Already open
+
+        # Grab the exclusive lock BEFORE touching the file (ByteFileDB.open()
+        # replays the WAL / rolls back a .txn snapshot — writes), so two writers
+        # never recover the same file at once. Read-only opens never lock.
+        if self._exclusive and not self.read_only:
+            try:
+                self._fcntl.flock(
+                    self._lockfile, self._fcntl.LOCK_EX | self._fcntl.LOCK_NB
+                )
+            except OSError:
+                raise DatabaseLockedError(self.filename)
 
         self._db.open()
         self._is_open = True
@@ -299,6 +333,13 @@ class DB:
             self._datasets.clear()
             self._datastructures.clear()
             self._blob_store = None
+            # Release the session-long exclusive lock (if held); the OS would
+            # drop it on process exit anyway, but free it promptly on close.
+            if self._exclusive and self._lockfile is not None:
+                try:
+                    self._fcntl.flock(self._lockfile, self._fcntl.LOCK_UN)
+                except OSError:
+                    pass
 
     # -------------------------------------------------------------------------
     # Blob methods

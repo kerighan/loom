@@ -1,0 +1,92 @@
+"""DB(exclusive=True): OS-enforced single writer per file.
+
+A second WRITER opening the same file fails fast (DatabaseLockedError) instead
+of corrupting it — the enforcement behind any hash/router that only *attributes*
+a file to one writer. Readers (flag="r") never lock; the lock is auto-released
+on close (and by the OS if the writer crashes). POSIX only.
+"""
+
+import os
+import tempfile
+import multiprocessing as mp
+
+import pytest
+
+from loom import DB, DatabaseLockedError
+
+
+def _child_open_exclusive(path, q):
+    try:
+        db = DB(path, exclusive=True)
+        q.put("acquired")
+        db.close()
+    except DatabaseLockedError:
+        q.put("locked")
+    except Exception as e:  # pragma: no cover - surfaces unexpected failures
+        q.put(f"err:{type(e).__name__}:{e}")
+
+
+def _seed(path):
+    with DB(path) as db:
+        db.create_dict("d", {"v": "int64"})["a"] = {"v": 1}
+
+
+@pytest.fixture
+def ctx():
+    return mp.get_context("spawn")   # clean process, no inherited fds
+
+
+class TestExclusiveLock:
+    def test_second_writer_fails_fast(self, ctx):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x.loom")
+            _seed(path)
+            holder = DB(path, exclusive=True)
+            try:
+                holder["d"]["b"] = {"v": 2}         # holder can write
+                q = ctx.Queue()
+                p = ctx.Process(target=_child_open_exclusive, args=(path, q))
+                p.start(); p.join()
+                assert q.get() == "locked"
+            finally:
+                holder.close()
+
+    def test_lock_released_on_close(self, ctx):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x.loom")
+            _seed(path)
+            DB(path, exclusive=True).close()        # acquire then release
+            q = ctx.Queue()
+            p = ctx.Process(target=_child_open_exclusive, args=(path, q))
+            p.start(); p.join()
+            assert q.get() == "acquired"
+
+    def test_reader_not_blocked(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x.loom")
+            _seed(path)
+            holder = DB(path, exclusive=True)
+            try:
+                r = DB(path, flag="r")              # reader takes no lock
+                assert r["d"]["a"]["v"] == 1
+                r.close()
+                # exclusive + read_only also takes no lock
+                ro = DB(path, exclusive=True, flag="r")
+                assert ro["d"]["a"]["v"] == 1
+                ro.close()
+            finally:
+                holder.close()
+
+    def test_single_writer_normal_use(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x.loom")
+            with DB(path, exclusive=True) as db:
+                dd = db.create_dict("d", {"v": "int64"})
+                dd["a"] = {"v": 1}
+                assert dd["a"]["v"] == 1
+            with DB(path, exclusive=True) as db:    # reopen after close
+                assert db["d"]["a"]["v"] == 1
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

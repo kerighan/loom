@@ -1094,9 +1094,12 @@ The cost is **one file-copy per outermost block**, so wrap a whole bulk ingest o
 | Multiple HTTP clients → `db.serve()` | ✅ | same RLock shared across all request handlers |
 | Multiple processes, reads only | ✅ | Linux shared mmap pages, x86 TSO ordering |
 | Multiple processes, SWMR | ✅ | `DB(path, multiprocess_safe=True)` + `fcntl.flock(LOCK_EX)` on writes; readers never block |
-| Multiple concurrent writers | ❌ | not supported — use a single writer process |
+| Single writer, enforced | ✅ | `DB(path, exclusive=True)` — `fcntl.flock(LOCK_EX)` held open→close; a **second writer fails fast** with `DatabaseLockedError` |
+| Multiple concurrent writers | ❌ | not supported — a second writer either fails fast (`exclusive=True`) or must be prevented by the caller |
 
 Every public write method (`__setitem__`, `append`, `push`, `add`, …) acquires the lock automatically — no manual wrapping required.  For compound operations that must be atomic together, use `with db.write_lock(): ...`.
+
+**Enforcing a single writer (`exclusive=True`).** When a file is owned by one writer — e.g. a hash/router assigns each shard-file to a worker — that assignment is only a *convention*; it can't stop a stale owner writing during a scale/rebalance, or two routers disagreeing for a moment. `DB(path, exclusive=True)` turns it into an OS-enforced guarantee: it takes a non-blocking exclusive `flock` at open and holds it until close, so a **second writer process fails immediately** with `DatabaseLockedError` instead of corrupting the file. Readers (`flag="r"`) never take the lock, and the OS releases it automatically if the writer crashes — no stale lock to clean up. POSIX only. Use it as the safety net behind any multi-file routing scheme: the router optimises, `exclusive=` guarantees.
 
 ---
 
