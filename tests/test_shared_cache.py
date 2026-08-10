@@ -174,6 +174,104 @@ class TestCacheParamValidation:
             assert db._owns_cache is False
 
 
+class TestStalenessInvalidation:
+    """A shared cache outlives the DB handle, so a reader reopened on a path
+    another writer has since modified would keep serving pre-write nodes.
+    cache_id versioning (scan-free) and invalidate_prefix (explicit) fix it.
+    """
+
+    def _count(self, db, hi=300):
+        return sum(1 for k in range(hi) if db["b"].get(k) is not None)
+
+    def test_reopen_with_default_id_serves_stale(self, two_paths):
+        pa, _ = two_paths
+        _seed_btree(pa, [(k, k) for k in range(100)])
+        shared = LRUCache(200_000)
+
+        r1 = DB(pa, flag="r", cache=shared)
+        assert self._count(r1) == 100          # warm every node into cache
+        r1.close()
+
+        with DB(pa) as w:                       # external writer adds 200 more
+            bt = w["b"]
+            for k in range(100, 300):
+                bt[k] = {"v": k}
+
+        r2 = DB(pa, flag="r", cache=shared)     # same path -> same namespace
+        try:
+            assert self._count(r2) < 300        # STALE: pre-write view survives
+        finally:
+            r2.close()
+
+    def test_versioned_cache_id_reads_fresh(self, two_paths):
+        pa, _ = two_paths
+        _seed_btree(pa, [(k, k) for k in range(100)])
+        shared = LRUCache(200_000)
+
+        r1 = DB(pa, flag="r", cache=shared)
+        self._count(r1)
+        r1.close()
+        with DB(pa) as w:
+            bt = w["b"]
+            for k in range(100, 300):
+                bt[k] = {"v": k}
+
+        rp = "path:" + os.path.realpath(pa)
+        r2 = DB(pa, flag="r", cache=shared, cache_id=rp + "#2")
+        try:
+            assert self._count(r2) == 300       # fresh namespace, no stale hits
+        finally:
+            r2.close()
+
+    def test_invalidate_prefix_reads_fresh_and_spares_siblings(self, two_paths):
+        pa, pb = two_paths
+        _seed_btree(pa, [(k, k) for k in range(100)])
+        _seed_btree(pb, [(k, 1000 + k) for k in range(50)])
+        shared = LRUCache(200_000)
+
+        def n_entries(prefix):
+            return sum(
+                1 for k in shared._cache.keys()
+                if isinstance(k, tuple) and k and isinstance(k[0], str)
+                and k[0].startswith(prefix)
+            )
+
+        a1 = DB(pa, flag="r", cache=shared)
+        b = DB(pb, flag="r", cache=shared)
+        self._count(a1)
+        for k in range(50):
+            b["b"].get(k)                        # warm B's nodes
+        a1.close()
+        with DB(pa) as w:
+            bt = w["b"]
+            for k in range(100, 300):
+                bt[k] = {"v": k}
+
+        rp_a = "path:" + os.path.realpath(pa)
+        rp_b = "path:" + os.path.realpath(pb)
+        b_before = n_entries(rp_b)
+        assert b_before > 0
+        # A's entries live under rp_a; B's under rp_b — evict only A's.
+        n = shared.invalidate_prefix(rp_a)
+        assert n > 0
+        assert n_entries(rp_a) == 0               # A fully evicted...
+        assert n_entries(rp_b) == b_before        # ...B untouched
+        try:
+            a2 = DB(pa, flag="r", cache=shared)   # default id, but A was evicted
+            assert self._count(a2) == 300         # fresh
+            a2.close()
+            for k in range(50):                   # B still correct
+                assert b["b"].get(k)["v"] == 1000 + k
+        finally:
+            b.close()
+
+    def test_cache_id_overrides_realpath(self, two_paths):
+        pa, _ = two_paths
+        _seed_btree(pa, [(1, 1)])
+        with DB(pa, flag="r", cache_id="custom#7") as db:
+            assert db._cache_id == "custom#7"
+
+
 class TestPathIdentity:
     def test_symlinked_path_resolves_to_same_identity(self, two_paths):
         # realpath resolves symlinks, so a file opened via a symlink shares

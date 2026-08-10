@@ -95,6 +95,33 @@ class LRUCache:
         self.hits = 0
         self.misses = 0
 
+    def invalidate_prefix(self, prefix: str) -> int:
+        """Evict every entry whose namespace begins with ``prefix``.
+
+        Keys are ``(namespace, generation, item_key)`` tuples where the
+        namespace is ``f"{cache_id}\\x1f{struct}:{suffix}"`` (see
+        NamespacedCache / DataStructure._make_cache).  Passing a DB's
+        ``cache_id`` drops exactly that file's entries from a shared cache,
+        leaving every other file's warm — unlike ``clear()``, which cold-starts
+        the whole budget.
+
+        This is an O(n) scan of the cache.  When you don't need the RAM back
+        immediately, prefer *versioning* the namespace instead — reopen the
+        reader with a bumped ``DB(cache_id=f"{path}#{gen}")`` and let the stale
+        entries age out under LRU pressure (no scan at all).
+
+        Returns the number of entries evicted.
+        """
+        victims = [
+            k
+            for k in self._cache.keys()
+            if isinstance(k, tuple) and k and isinstance(k[0], str)
+            and k[0].startswith(prefix)
+        ]
+        for k in victims:
+            del self._cache[k]
+        return len(victims)
+
     @property
     def hit_rate(self) -> float:
         """Calculate cache hit rate."""

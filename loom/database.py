@@ -109,6 +109,7 @@ class DB:
         auto_save_interval=100,
         cache_size=200_000,
         cache=None,
+        cache_id=None,
         sync_writes=False,
         multiprocess_safe=False,
         exclusive=False,
@@ -147,12 +148,26 @@ class DB:
                 single memory budget rather than N independent ones:
                     shared = LRUCache(1_000_000)
                     dbs = [DB(p, flag="r", cache=shared) for p in paths]
-                Entries are namespaced by a stable per-file identity, so files
-                that share a schema never read each other's cached addresses.
-                Takes precedence over ``cache_size``.  The passed cache is
-                *borrowed*, never cleared on this DB's close() — but a rare
-                drop_collection / vacuum / durable-rollback still clears the
-                whole shared cache (safe, just cold-starts siblings).
+                Entries are namespaced by a stable per-file identity (see
+                ``cache_id``), so files that share a schema never read each
+                other's cached addresses.  Takes precedence over ``cache_size``.
+                The passed cache is *borrowed*, never cleared on this DB's
+                close() — but a rare drop_collection / vacuum / durable-
+                rollback still clears the whole shared cache (safe, just
+                cold-starts siblings).
+                STALENESS: a shared cache outlives the DB handle, so a NEW
+                handle on a path another writer has since modified would keep
+                serving pre-write entries (the cache holds decoded btree nodes,
+                not just stable addresses).  Version the namespace via
+                ``cache_id`` after a write — see below.
+            cache_id: Override the per-file cache namespace prefix (default is
+                the file's realpath).  A service that knows it just wrote to a
+                file reopens its reader with a bumped id — ``f"{realpath}#{gen}"``
+                — so post-write reads start a fresh namespace and the stale
+                entries simply age out under LRU pressure.  This is scan-free:
+                no ``cache.clear()`` that would cold-start every other file
+                sharing the budget.  (For explicit, immediate reclamation
+                instead, call ``cache.invalidate_prefix(cache_id)``.)
             sync_writes: If True, flush mmap to disk after every header write
                 (slow but fully durable — use for long-running servers).
                 If False (default), flush only on close() — fast, but data
@@ -230,11 +245,17 @@ class DB:
         # shared LRU cache (see _make_cache).  Two files that share a schema
         # have homonymous structures at identical table offsets; without this
         # prefix a single cache handed to several DBs would let one file's
-        # cached node/block addresses answer another file's reads.  realpath
-        # (not id(self), not a minted UUID) keeps file bytes deterministic and
-        # is distinct per concurrently-open file — which is the requirement.
-        import os as _os_id
-        self._cache_id = "path:" + _os_id.path.realpath(filename)
+        # cached node/block addresses answer another file's reads.  Default is
+        # realpath (not id(self), not a minted UUID: keeps file bytes
+        # deterministic, distinct per concurrently-open file).  A caller that
+        # just wrote a file passes a bumped `cache_id` (e.g. f"{path}#{gen}")
+        # so a reopened reader starts a fresh namespace and the stale entries
+        # age out under LRU pressure — no cache.clear() cold-starting siblings.
+        if cache_id is not None:
+            self._cache_id = str(cache_id)
+        else:
+            import os as _os_id
+            self._cache_id = "path:" + _os_id.path.realpath(filename)
         self._db = ByteFileDB(
             filename,
             initial_size,
