@@ -9,6 +9,14 @@ from typing import Any
 
 _SENTINEL = object()
 
+# Separator between a file's cache identity and the per-structure namespace in
+# a NamespacedCache key's first element: f"{cache_id}{NS_SEP}{struct}:{suffix}".
+# cache_id never contains it, so matching a prefix of `cache_id + NS_SEP` is an
+# exact, collision-free way to select exactly one file's entries (whereas a
+# bare cache_id prefix would also match a sibling whose id extends it —
+# "a.loom" vs "a.loom.bak", "p#1" vs "p#10").
+NS_SEP = "\x1f"
+
 
 class LRUCache:
     """Fast LRU cache wrapping lru-dict C implementation.
@@ -109,6 +117,11 @@ class LRUCache:
         immediately, prefer *versioning* the namespace instead — reopen the
         reader with a bumped ``DB(cache_id=f"{path}#{gen}")`` and let the stale
         entries age out under LRU pressure (no scan at all).
+
+        Matching is a plain string prefix.  To target exactly one file, pass
+        ``db._cache_id + loom.cache.NS_SEP`` — a bare id would also match a
+        sibling whose id extends it ("a.loom" vs "a.loom.bak").  To drop every
+        generation of a versioned id, pass the stem before the ``#``.
 
         Returns the number of entries evicted.
         """

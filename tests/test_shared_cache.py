@@ -39,6 +39,18 @@ def _seed_btree(path, items):
             bt[k] = {"v": v}
 
 
+def _seed_collection(path, n, base=0):
+    """Create a collection "c" with a primary + Many index, n records."""
+    from loom import Many
+
+    with DB(path) as db:
+        col = db.collection("c", {"id": "utf8[8]", "grp": "utf8[4]",
+                                  "v": "int64"},
+                            indexes={"id": "primary", "grp": Many()})
+        col.insert_many([{"id": f"r{i}", "grp": f"g{i % 4}", "v": base + i}
+                         for i in range(n)])
+
+
 class TestSharedCacheIsolation:
     def test_shared_btree_reads_are_isolated(self, two_paths):
         # BTree's node cache maps addr -> the *deserialised node* (keys,
@@ -270,6 +282,54 @@ class TestStalenessInvalidation:
         _seed_btree(pa, [(1, 1)])
         with DB(pa, flag="r", cache_id="custom#7") as db:
             assert db._cache_id == "custom#7"
+
+    def _warm_collection(self, db, n):
+        for i in range(n):
+            db["c"][f"r{i}"]
+
+    def test_drop_collection_spares_siblings_in_shared_cache(self, two_paths):
+        # drop_collection must invalidate only THIS file's namespace when the
+        # cache is borrowed — not clear() the whole shared budget and cold-
+        # start every other project.
+        pa, pb = two_paths
+        _seed_collection(pa, 50)
+        _seed_collection(pb, 50, base=1000)
+        shared = LRUCache(200_000)
+
+        def n_entries(db):
+            pref = db._cache_id + "\x1f"
+            return sum(
+                1 for k in shared._cache.keys()
+                if isinstance(k, tuple) and k and isinstance(k[0], str)
+                and k[0].startswith(pref)
+            )
+
+        wa = DB(pa, cache=shared)                 # writer on A (borrows cache)
+        b = DB(pb, flag="r", cache=shared)        # reader on B
+        try:
+            self._warm_collection(wa, 50)
+            self._warm_collection(b, 50)
+            b_before = n_entries(b)
+            assert n_entries(wa) > 0 and b_before > 0
+
+            wa.drop_collection("c")               # borrowed cache: spare B
+            assert n_entries(wa) == 0             # A's entries gone
+            assert n_entries(b) == b_before       # B's entries untouched
+            for i in range(50):                   # B still reads correctly
+                assert b["c"][f"r{i}"]["v"] == 1000 + i
+        finally:
+            wa.close()
+            b.close()
+
+    def test_owned_cache_drop_still_clears(self, two_paths):
+        # With a private cache there are no siblings; clear() is fine.
+        pa, _ = two_paths
+        _seed_collection(pa, 50)
+        with DB(pa) as db:                        # owns a private cache
+            self._warm_collection(db, 50)
+            assert len(db._shared_cache) > 0
+            db.drop_collection("c")
+            assert len(db._shared_cache) == 0
 
 
 class TestPathIdentity:

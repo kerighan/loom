@@ -152,9 +152,9 @@ class DB:
                 ``cache_id``), so files that share a schema never read each
                 other's cached addresses.  Takes precedence over ``cache_size``.
                 The passed cache is *borrowed*, never cleared on this DB's
-                close() — but a rare drop_collection / vacuum / durable-
-                rollback still clears the whole shared cache (safe, just
-                cold-starts siblings).
+                close().  A drop_collection / vacuum / durable-rollback evicts
+                only THIS file's namespace from the shared cache (siblings stay
+                warm), so no maintenance op cold-starts the other files.
                 STALENESS: a shared cache outlives the DB handle, so a NEW
                 handle on a path another writer has since modified would keep
                 serving pre-write entries (the cache holds decoded btree nodes,
@@ -395,6 +395,27 @@ class DB:
                     self._fcntl.flock(self._lockfile, self._fcntl.LOCK_UN)
                 except OSError:
                     pass
+
+    def _invalidate_file_cache(self):
+        """Drop THIS file's cached entries after an op that moves or removes
+        its records (durable rollback, drop_collection, vacuum).
+
+        A private cache holds only this file's entries, so clear() is cheapest
+        and total.  A *borrowed* (shared) cache also holds sibling files'
+        entries — clearing it would needlessly cold-start every other project
+        sharing the budget, so evict only this file's namespace.  Matching on
+        ``_cache_id + NS_SEP`` is collision-free (a bare id would also catch a
+        sibling whose id extends it).
+        """
+        c = self._shared_cache
+        if c is None:
+            return
+        if self._owns_cache:
+            c.clear()
+        else:
+            from loom.cache import NS_SEP
+
+            c.invalidate_prefix(self._cache_id + NS_SEP)
 
     # -------------------------------------------------------------------------
     # Blob methods
@@ -725,8 +746,7 @@ class DB:
         # The shared key→address cache holds addresses from the rolled-back
         # writes; after restoring an older file they point at zeroed/absent
         # records (WrongDatasetError on read).  Same hazard as drop_collection.
-        if self._shared_cache is not None:
-            self._shared_cache.clear()
+        self._invalidate_file_cache()
         self._load_registry()
         saved_compression = self._db.get_header_field(self.BLOB_COMPRESSION_KEY)
         if saved_compression is not None:
@@ -1830,8 +1850,7 @@ class DB:
         # Drop cached addresses: a recreated structure of the same name would
         # otherwise read this collection's stale value addresses (the shared
         # cache namespaces by name, and a fresh structure resets its gen to 0).
-        if self._shared_cache is not None:
-            self._shared_cache.clear()
+        self._invalidate_file_cache()
         self._save_datastructures_registry()
         self._save_registry()
         if _poison_handles:
@@ -2008,8 +2027,7 @@ class DB:
         self._datastructures = {}
         self._blob_store = None
         self._is_open = False
-        if self._shared_cache is not None:
-            self._shared_cache.clear()
+        self._invalidate_file_cache()
         self.open()
         self._rebind_live_collections()
 

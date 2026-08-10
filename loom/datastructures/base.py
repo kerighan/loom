@@ -222,7 +222,7 @@ class DataStructure(ABC):
                        e.g. "values", "nodes", "blocks".
             hint_size: Ignored (legacy per-structure cache size).
         """
-        from loom.cache import NamespacedCache, NullCache
+        from loom.cache import NamespacedCache, NullCache, NS_SEP
 
         shared = getattr(self._db, "_shared_cache", None)
         if shared is not None and self._should_cache():
@@ -240,7 +240,7 @@ class DataStructure(ABC):
             # never serve each other's cached addresses.
             file_id = getattr(self._db, "_cache_id", "")
             return NamespacedCache(
-                shared, lambda: f"{file_id}\x1f{self._cache_namespace()}:{suffix}"
+                shared, lambda: f"{file_id}{NS_SEP}{self._cache_namespace()}:{suffix}"
             )
         return NullCache()
 
