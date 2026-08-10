@@ -232,7 +232,16 @@ class DataStructure(ABC):
             # ids get reused after GC, so an id()-based namespace would let a
             # fresh nested structure read a dead sibling's cached entries —
             # silent data corruption.
-            return NamespacedCache(shared, lambda: f"{self._cache_namespace()}:{suffix}")
+            #
+            # The per-structure identity (name / nested address) is only unique
+            # WITHIN one file.  When one LRUCache is shared across several DBs,
+            # prefix it with the DB's stable per-file id so two files that
+            # share a schema (homonymous structures at identical offsets) can
+            # never serve each other's cached addresses.
+            file_id = getattr(self._db, "_cache_id", "")
+            return NamespacedCache(
+                shared, lambda: f"{file_id}\x1f{self._cache_namespace()}:{suffix}"
+            )
         return NullCache()
 
     def _should_cache(self):

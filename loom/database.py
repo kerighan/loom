@@ -108,6 +108,7 @@ class DB:
         blob_compression_level=None,
         auto_save_interval=100,
         cache_size=200_000,
+        cache=None,
         sync_writes=False,
         multiprocess_safe=False,
         exclusive=False,
@@ -140,6 +141,18 @@ class DB:
                     DB(path, cache_size=50_000)  # 50K entries total
                 This lets hot structures grow their share naturally via LRU
                 without pre-allocating per-structure budgets.
+            cache: An existing ``loom.LRUCache`` to use as this DB's shared
+                cache instead of allocating a private one.  Pass ONE cache to
+                several DBs so a service holding many files open shares a
+                single memory budget rather than N independent ones:
+                    shared = LRUCache(1_000_000)
+                    dbs = [DB(p, flag="r", cache=shared) for p in paths]
+                Entries are namespaced by a stable per-file identity, so files
+                that share a schema never read each other's cached addresses.
+                Takes precedence over ``cache_size``.  The passed cache is
+                *borrowed*, never cleared on this DB's close() — but a rare
+                drop_collection / vacuum / durable-rollback still clears the
+                whole shared cache (safe, just cold-starts siblings).
             sync_writes: If True, flush mmap to disk after every header write
                 (slow but fully durable — use for long-running servers).
                 If False (default), flush only on close() — fast, but data
@@ -194,13 +207,34 @@ class DB:
             self._lockfile = open(lockpath, "w")
             self._fcntl = _fcntl
 
-        # Shared cache: one LRU for the entire DB, namespaced per-structure
-        if cache_size > 0:
-            from loom.cache import LRUCache
+        # Shared cache: one LRU for the entire DB, namespaced per-structure.
+        # A caller-supplied `cache` is borrowed (shared budget across DBs);
+        # otherwise we own a private LRU sized by `cache_size`.
+        from loom.cache import LRUCache
 
+        if cache is not None:
+            if not isinstance(cache, LRUCache):
+                raise TypeError(
+                    "cache must be a loom.LRUCache instance "
+                    f"(got {type(cache).__name__})"
+                )
+            self._shared_cache = cache
+            self._owns_cache = False
+        elif cache_size > 0:
             self._shared_cache = LRUCache(cache_size)
+            self._owns_cache = True
         else:
             self._shared_cache = None
+            self._owns_cache = False
+        # Stable per-file identity used to namespace this file's entries in a
+        # shared LRU cache (see _make_cache).  Two files that share a schema
+        # have homonymous structures at identical table offsets; without this
+        # prefix a single cache handed to several DBs would let one file's
+        # cached node/block addresses answer another file's reads.  realpath
+        # (not id(self), not a minted UUID) keeps file bytes deterministic and
+        # is distinct per concurrently-open file — which is the requirement.
+        import os as _os_id
+        self._cache_id = "path:" + _os_id.path.realpath(filename)
         self._db = ByteFileDB(
             filename,
             initial_size,
