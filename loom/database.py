@@ -215,12 +215,7 @@ class DB:
         self._multiprocess_safe = multiprocess_safe
         self._exclusive = exclusive
         self._lockfile = None
-        if (multiprocess_safe or exclusive) and flag != "r":
-            import fcntl as _fcntl  # POSIX only; validate availability early
-
-            lockpath = filename + ".lock"
-            self._lockfile = open(lockpath, "w")
-            self._fcntl = _fcntl
+        self._open_lockfile()
 
         # Shared cache: one LRU for the entire DB, namespaced per-structure.
         # A caller-supplied `cache` is borrowed (shared budget across DBs);
@@ -307,6 +302,24 @@ class DB:
             if per_op:
                 self._fcntl.flock(self._lockfile, self._fcntl.LOCK_UN)
 
+    def _open_lockfile(self):
+        """Open the companion ``.lock`` fd for exclusive/multiprocess_safe
+        writers, if not already open.
+
+        Idempotent and re-openable: close() closes this fd — otherwise it
+        would leak until GC, and DB holds reference cycles so __del__ may never
+        run, so a service cycling through projects climbs toward EMFILE — and
+        open() calls this again (vacuum() does close()+open() on one object).
+        Readers (flag="r") never take a lock, so they open no fd.
+        """
+        if self._lockfile is not None:
+            return
+        if (self._multiprocess_safe or self._exclusive) and not self.read_only:
+            import fcntl as _fcntl  # POSIX only; validate availability early
+
+            self._lockfile = open(self.filename + ".lock", "w")
+            self._fcntl = _fcntl
+
     def open(self):
         """Open database and load dataset registry.
 
@@ -315,6 +328,10 @@ class DB:
         """
         if self._is_open:
             return self  # Already open
+
+        # Re-open the lock fd if a previous close() freed it (e.g. vacuum()
+        # does close()+open() on the same object).
+        self._open_lockfile()
 
         # Grab the exclusive lock BEFORE touching the file (ByteFileDB.open()
         # replays the WAL / rolls back a .txn snapshot — writes), so two writers
@@ -395,6 +412,19 @@ class DB:
                     self._fcntl.flock(self._lockfile, self._fcntl.LOCK_UN)
                 except OSError:
                     pass
+
+        # Close the lock fd (opened in __init__ for exclusive/multiprocess_safe
+        # writers, independent of whether open() ran).  Without this it leaks
+        # until GC — and DB has reference cycles, so __del__ may never fire,
+        # pushing a service that cycles projects toward EMFILE.  Closing also
+        # releases any flock held via this fd.  Idempotent + re-openable: a
+        # later open() re-creates it (e.g. vacuum's close()+open()).
+        if self._lockfile is not None:
+            try:
+                self._lockfile.close()
+            except OSError:
+                pass
+            self._lockfile = None
 
     def _invalidate_file_cache(self):
         """Drop THIS file's cached entries after an op that moves or removes

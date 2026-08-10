@@ -88,5 +88,57 @@ class TestExclusiveLock:
                 assert db["d"]["a"]["v"] == 1
 
 
+class TestLockfileFdLifecycle:
+    """close() must close the lock fd, not just release the flock — otherwise
+    it leaks until GC (DB holds reference cycles, so __del__ may never run) and
+    a service cycling projects climbs toward EMFILE.
+    """
+
+    def _nfd(self):
+        return len(os.listdir("/proc/self/fd"))
+
+    @pytest.mark.parametrize("kw", [{"exclusive": True},
+                                    {"multiprocess_safe": True}])
+    def test_close_does_not_leak_fd(self, kw):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x.loom")
+            _seed(path)
+            base = self._nfd()
+            for _ in range(20):
+                db = DB(path, **kw)
+                db["d"]["a"]
+                db.close()                          # must free the lock fd
+            assert self._nfd() - base <= 1          # no per-close leak
+
+    def test_close_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x.loom")
+            _seed(path)
+            db = DB(path, exclusive=True)
+            db.close()
+            db.close()                              # second close() is a no-op
+            assert db._lockfile is None
+
+    def test_reopen_after_close_reacquires_lock(self):
+        # vacuum() does close()+open() on one object; the fd must re-open.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x.loom")
+            _seed(path)
+            db = DB(path, exclusive=True)
+            db.close()
+            assert db._lockfile is None
+            db.open()
+            assert db._lockfile is not None
+            assert db["d"]["a"]["v"] == 1
+            db.close()
+
+    def test_reader_opens_no_lock_fd(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x.loom")
+            _seed(path)
+            with DB(path, flag="r") as r:           # readers never lock
+                assert r._lockfile is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
