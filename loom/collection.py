@@ -55,6 +55,17 @@ def _hash_value(value):
     No order is preserved (equality grouping only)."""
     return f"{mmh3.hash128(str(value), signed=False):032x}"
 
+def _values_differ(new, old):
+    """True if ``new`` differs from the stored ``old`` (no-op detection for
+    update_many).  Handles array/Vec fields whose ``!=`` is elementwise."""
+    if new is None or old is None:
+        return new is not old                # None vs None → False
+    try:
+        return bool(new != old)
+    except (ValueError, TypeError):          # numpy arrays → ambiguous truth
+        return not np.array_equal(new, old)
+
+
 _SEP = "\x00"          # composite-key separator (numpy U preserves embedded NULs)
 _INT_OFFSET = 1 << 63  # map signed int64 → unsigned for zero-padded ordering
 _UINT_MAX = (1 << 64) - 1
@@ -204,17 +215,59 @@ def encode_value(value, desc=False):
     return _desc_str(s) if desc else s
 
 
+def _decode_int(enc, desc):
+    """Inverse of encode_value for a signed integer key (see encode_value)."""
+    u = int(enc)
+    if desc:
+        u = _UINT_MAX - u
+    return u - _INT_OFFSET
+
+
+def _decode_float(enc, desc):
+    """Inverse of _float_key: undo desc, unmunge the IEEE-754 bits."""
+    bits = int(enc)
+    if desc:
+        bits = _UINT_MAX - bits
+    if bits & 0x8000000000000000:      # sign bit set after munge ⇒ was positive
+        bits ^= 0x8000000000000000
+    else:                               # clear ⇒ was negative (all bits flipped)
+        bits ^= 0xFFFFFFFFFFFFFFFF
+    return struct.unpack(">d", struct.pack(">Q", bits))[0]
+
+
+def _decode_str(enc, desc):
+    """Inverse of the string branch of encode_value (_desc_str is self-inverse)."""
+    return _desc_str(enc) if desc else enc
+
+
+def _decode_datetime(enc, desc):
+    """Inverse of the datetime branch of encode_value (microsecond dt_key).
+
+    Parses the fixed "%Y%m%dT%H%M%S%f" layout by slicing rather than via
+    strptime — strptime is ~5x slower and would make an index-only timestamp
+    projection cost more than just reading the record's inline int64."""
+    s = _desc_str(enc) if desc else enc
+    return datetime(int(s[0:4]), int(s[4:6]), int(s[6:8]),
+                    int(s[9:11]), int(s[11:13]), int(s[13:15]), int(s[15:21]))
+
+
 @lru_cache(maxsize=4096)
-def _encode_value_cached(value, desc):
+def _encode_value_cached(typ, value, desc):
     return encode_value(value, desc)
 
 
 def _encode_sort(value, desc):
     """encode_value with a small LRU — several Many indexes typically sort on
     the same field (e.g. five indexes × created_at), so within one record's
-    index pass the same (value, desc) encodes once instead of N times."""
+    index pass the same (value, desc) encodes once instead of N times.
+
+    The cache key carries the value's *type*: encode_value branches on type
+    (int → zero-padded, float → IEEE munge, …), yet ``5 == 5.0`` and hash the
+    same — so a bare (value, desc) key would let an int and a numerically equal
+    float collide and return the wrong encoding.  Keying on type as well keeps
+    each branch's encoding distinct."""
     try:
-        return _encode_value_cached(value, desc)
+        return _encode_value_cached(type(value), value, desc)
     except TypeError:  # unhashable sort value — encode directly
         return encode_value(value, desc)
 
@@ -641,6 +694,154 @@ class Collection:
                     self._primary[pk, field] = nv
         return results
 
+    def update_many(self, updates=None, **changes):
+        """Update many rows at once, amortising index maintenance.
+
+        Two call forms:
+
+            col.update_many(["p1", "p2", ...], status="done")   # same change
+            col.update_many({"p1": {...}, "p2": {...}})          # per-row change
+            col.update_many([("p1", {...}), ("p2", {...})])      # per-row (pairs)
+
+        Same result as calling :meth:`update` on each row, but every affected
+        ordered index (``Many`` / ``range``) does all its entry MOVES in one
+        deferred-write block, keyed in sort order — one amortised set of BTree
+        descents instead of one descent per row (the same trick as
+        :meth:`increment_many`; ~2x on a sorted index once it is non-empty).
+        Counters are batched per group.
+
+        No-op preserving: a field whose new value equals the stored one is
+        never written, and a row whose changes are all no-ops costs nothing —
+        so a restore/replay pass that re-applies the current state is cheap.
+
+        Missing primary keys raise ``KeyError`` before any write (all-or-nothing
+        validation).  Returns the number of rows actually changed.
+        """
+        # ── normalise both call forms into {pk: changes_dict} ────────────────
+        if changes:
+            if updates is None:
+                raise TypeError(
+                    "update_many(ids, **changes) needs an iterable of ids"
+                )
+            per = {str(pk): changes for pk in updates}
+        else:
+            if updates is None:
+                return 0
+            items = updates.items() if isinstance(updates, dict) else updates
+            per = {}
+            for pk, c in items:
+                per[str(pk)] = c
+        if not per:
+            return 0
+
+        changed_fields = set()
+        for c in per.values():
+            changed_fields.update(c.keys())
+        if self._key_field in changed_fields:
+            for pk, c in per.items():
+                if self._key_field in c and str(c[self._key_field]) != pk:
+                    raise ValueError(
+                        "cannot change the primary key via update_many()"
+                    )
+
+        affected = [ix for ix in self._indexes.values()
+                    if any(f in changed_fields for f in ix["sources"])]
+        need = set(changed_fields)
+        for ix in affected:
+            need.add(ix["field"])
+            sort = getattr(ix["spec"], "sort", None)
+            if sort is not None:
+                need.add(sort)
+        search_touched = bool(self._search) and any(
+            f in changed_fields for f in self._search_fields)
+        if search_touched:
+            for si in self._search.values():
+                need.update(si["fields"])
+        need = list(need)
+
+        with self._db.write_lock():
+            with self._db.batch(defer_save=True):
+                # Phase 1 — read olds, compute the *effective* (non-no-op)
+                # change per row.  Raises before any mutation if a pk is absent.
+                olds, effective = {}, {}
+                for pk, c in per.items():
+                    old = self._primary.get_fields(pk, need)
+                    if old is None:
+                        raise KeyError(pk)
+                    olds[pk] = old
+                    effective[pk] = {f: v for f, v in c.items()
+                                     if _values_differ(v, old.get(f))}
+
+                # Phase 2 — index moves, batched per index in key order.
+                for ix in affected:
+                    struct = ix["struct"]
+                    srcs = ix["sources"]
+                    moves = []
+                    for pk, eff in effective.items():
+                        if not any(f in eff for f in srcs):
+                            continue
+                        old = olds[pk]
+                        new = {**old, **eff}
+                        ok = self._index_key(ix, old, pk)
+                        nk = self._index_key(ix, new, pk)
+                        if ok != nk:
+                            moves.append((ok, nk, pk))
+                    if ix["spec"].kind == "unique":
+                        for ok, nk, pk in moves:
+                            if ok is not None and ok in struct:
+                                del struct[ok]
+                            if nk is not None:
+                                ex = struct.get(nk)
+                                if ex is not None and str(ex["pk"]) != pk:
+                                    raise ValueError(
+                                        f"duplicate value for unique index "
+                                        f"{ix['name']!r}"
+                                    )
+                                struct[nk] = {"pk": pk}
+                    elif moves:
+                        moves.sort(key=lambda m: (m[1] is None, m[1]))
+                        with struct.deferred_node_writes():
+                            for ok, nk, pk in moves:
+                                if ok is not None and ok in struct:
+                                    del struct[ok]
+                                if nk is not None:
+                                    struct[nk] = {"pk": pk}
+                    if ix.get("counter") is not None:
+                        for pk, eff in effective.items():
+                            if ix["field"] not in eff:
+                                continue
+                            ov = olds[pk].get(ix["field"])
+                            nv = eff[ix["field"]]
+                            if ov != nv:
+                                self._count_add(ix, ov, -1)
+                                self._count_add(ix, nv, +1)
+
+                # Phase 3 — full-text re-index for rows whose search fields moved.
+                if search_touched:
+                    for si in self._search.values():
+                        sf = si["fields"]
+                        for pk, eff in effective.items():
+                            if not any(f in eff for f in sf):
+                                continue
+                            new = {**olds[pk], **eff}
+                            entry = si["pk2docid"].get(pk)
+                            if entry is not None:
+                                si["index"].delete(int(entry["doc_id"]))
+                            text = " ".join(str(new.get(f, "")) for f in sf)
+                            doc_id = si["index"].add(None, text=text)
+                            si["docid2pk"].append({"pk": pk})
+                            si["pk2docid"][pk] = {"doc_id": doc_id}
+
+                # Phase 4 — write only the fields that actually changed.
+                n = 0
+                for pk, eff in effective.items():
+                    if not eff:
+                        continue
+                    for f, v in eff.items():
+                        self._primary[pk, f] = v
+                    n += 1
+        return n
+
     def reindex(self):
         """Rebuild every secondary index from the primary store (O(n))."""
         with self._db.write_lock():
@@ -938,6 +1139,117 @@ class Collection:
                        else wrapped)
         return out
 
+    def _sort_value_decoder(self, field, desc):
+        """Return a fn ``enc_str -> value`` inverting encode_value for the sort
+        field, matching the Python scalar a record read yields — or None when
+        the dtype isn't losslessly recoverable from the key."""
+        if field in self.dataset._datetime_fields:
+            return lambda enc: _decode_datetime(enc, desc)
+        try:
+            kind = self.dataset.user_schema.fields[field][0].kind
+        except (KeyError, IndexError, AttributeError):
+            return None
+        if kind in ("i", "u"):
+            return lambda enc: _decode_int(enc, desc)
+        if kind == "f":
+            return lambda enc: _decode_float(enc, desc)
+        if kind in ("S", "U"):
+            return lambda enc: _decode_str(enc, desc)
+        return None
+
+    def _pk_field_coercer(self):
+        """How to turn the stored (stringified) pk back into the primary-key
+        field's own dtype, so an index-only projection matches a record read —
+        or None if that dtype can't be recovered from ``str(pk)``."""
+        field = self._key_field
+        if field in self.dataset._datetime_fields:
+            return None
+        try:
+            kind = self.dataset.user_schema.fields[field][0].kind
+        except (KeyError, IndexError, AttributeError):
+            return None
+        if kind in ("S", "U"):
+            return str
+        if kind in ("i", "u"):
+            return lambda s: int(s)
+        if kind == "f":
+            return lambda s: float(s)
+        return None
+
+    def _index_projection(self, ix, value, fields):
+        """If every requested field is derivable from the index entry + its
+        composite key alone, return a fn ``(key, entry) -> dict``; else None.
+
+        A ``Many`` composite key is ``group_enc \\x00 [sort_enc \\x00] pk``, and
+        the entry carries ``pk`` — so for a group query we can serve, with **no
+        Dict lookup and no record read**:
+
+          • the primary key   — from ``entry["pk"]`` (coerced to its dtype);
+          • the group field    — it equals the (coerced) query ``value`` for
+                                 every hit, when the group is order-preserving
+                                 (encode_value is injective; a *hashed* group is
+                                 lossy, so we don't serve it);
+          • the sort field     — decoded from the key for int/float/str/datetime
+                                 dtypes (see _sort_value_decoder).
+
+        Any other requested field forces the normal record-read path (None)."""
+        spec = ix["spec"]
+        if spec.kind != "many":
+            return None
+        fset = set(fields)
+        if not fset:
+            return None
+
+        key_field = self._key_field
+        group_field = ix["field"]
+        servable = set()
+
+        pk_coerce = None
+        if key_field in fset:
+            pk_coerce = self._pk_field_coercer()
+            if pk_coerce is None:
+                return None
+            servable.add(key_field)
+
+        coerced_group = None
+        if group_field in fset:
+            if ix.get("hashed"):
+                return None            # hashed group value isn't recoverable
+            coerced_group = self._coerce_field_value(group_field, value)
+            servable.add(group_field)
+
+        sort_field = spec.sort
+        sort_dec = None
+        if sort_field is not None and sort_field in fset:
+            sort_dec = self._sort_value_decoder(sort_field, spec.desc)
+            if sort_dec is None:
+                return None
+            servable.add(sort_field)
+
+        if fset - servable:
+            return None
+
+        want_pk = key_field in fset
+        want_group = group_field in fset
+        want_sort = sort_field in fset if sort_field is not None else False
+        ordered = list(fields)
+
+        def project(key, entry):
+            rec = {}
+            parts = None
+            for f in ordered:
+                if want_pk and f == key_field:
+                    rec[f] = pk_coerce(str(entry["pk"]))
+                elif want_group and f == group_field:
+                    rec[f] = coerced_group
+                else:                       # sort field
+                    if parts is None:
+                        parts = key.split(_SEP)
+                    rec[f] = sort_dec(parts[1])
+            return rec
+
+        return project
+
     def find(self, index_name, value, start=None, end=None, limit=None,
              fields=None):
         """One-to-many lookup → records for group ``value`` (ordered by the
@@ -959,11 +1271,23 @@ class Collection:
         ix, low_key, high_key = self._many_bounds(index_name, "find",
                                                   value, start, end)
         it = ix["struct"].range(low_key, high_key, inclusive=(True, False))
-        return self._collect(it, limit, fields)
+        project = (self._index_projection(ix, value, fields)
+                   if fields is not None else None)
+        return self._collect(it, limit, fields, project)
 
-    def _collect(self, it, limit, fields):
-        """Materialize (full or projected) records for an index-entry scan."""
+    def _collect(self, it, limit, fields, project=None):
+        """Materialize (full or projected) records for an index-entry scan.
+
+        ``project`` (from :meth:`_index_projection`) serves each hit from the
+        index entry + key alone — no primary-store lookup, no record read —
+        when every requested field lives in the index."""
         out = []
+        if project is not None:
+            for key, entry in it:
+                out.append(self._wrap(entry["pk"], project(key, entry)))
+                if limit is not None and len(out) >= limit:
+                    break
+            return out
         if fields is not None:
             for _key, entry in it:
                 rec = self._primary.get_fields(str(entry["pk"]), fields)
