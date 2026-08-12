@@ -1717,7 +1717,7 @@ class DB:
         return idx
 
     def collection(self, name, model=None, indexes=None, key_size=64,
-                   index_key_size=192, exist_ok=False):
+                   index_key_size=None, exist_ok=False):
         """Create or reopen a Collection: a record store with typed indexes.
 
         Each field's index *kind* is declared and mapped to the right loom
@@ -1733,6 +1733,10 @@ class DB:
                      (``Unique()``, ``Range()``, ``Many(sort=..., desc=...)``).
             key_size:       max primary-key length (default 64).
             index_key_size: max composite-key length for range/many BTrees.
+                    Default None auto-sizes it to the exact width the declared
+                    fields need (group + sort + pk + margin) — narrower keys
+                    give smaller BTree nodes and a smaller file.  Pass an int
+                    to set a floor (it still grows if a field needs more).
 
         Kinds → structures: primary/unique → Dict; range/many → BTree.
 
@@ -1891,7 +1895,7 @@ class DB:
                     self._live_collections.discard(col)
 
     def migrate_collection(self, name, new_model, transforms=None, indexes=None,
-                           key_size=64, index_key_size=192):
+                           key_size=64, index_key_size=None):
         """Migrate a collection to a new record schema (add / drop / rename
         fields), rebuilding it in place.
 
@@ -2227,7 +2231,12 @@ class DB:
         if pk_w is not None:
             key_size = max(key_size, pk_w)
         eff_pk = pk_w if pk_w is not None else key_size   # text pk: caller's budget
+        # index_key_size=None → auto-size to exactly what the fields need (no
+        # fat default floor: a 192-wide slot × 31 keys/node made every BTree
+        # node ~2x larger than a typical composite key warrants).  An explicit
+        # int is honoured as a floor and still grows if a field needs more.
         need_ik = eff_pk + 4
+        ik_floor = index_key_size or 0
         hashed_index = {}
         for idx_name, spec in specs.items():
             if spec.kind in ("primary", "search", "vector"):
@@ -2251,7 +2260,7 @@ class DB:
                         f"{spec.sort!r} must be orderable (bounded), not text/blob/json"
                     )
             need_ik = max(need_ik, vw + sw + eff_pk + 4)
-        index_key_size = max(index_key_size, need_ik)
+        index_key_size = max(ik_floor, need_ik)
 
         primary = self.create_dict(
             f"{name}__primary", dataset, key_size=key_size, max_key_len=key_size
@@ -2266,7 +2275,10 @@ class DB:
             # gets indexed (defaults to the name, but can be shared across
             # several indexes — e.g. one Many by date, one by engagement).
             field = getattr(spec, "field", None) or idx_name
-            ix_ds = self.create_dataset(f"{name}__ix_{idx_name}", pk=f"utf8[{key_size}]")
+            # The index entry stores {"pk": pk}; size it to the pk's own width
+            # (eff_pk), not the primary-key *budget* (key_size, default 64) —
+            # a utf8[32] pk otherwise wastes 32 B per entry across every index.
+            ix_ds = self.create_dataset(f"{name}__ix_{idx_name}", pk=f"utf8[{eff_pk}]")
             if spec.kind == "unique":
                 struct = self.create_dict(
                     f"{name}__ix_{idx_name}__d", ix_ds,

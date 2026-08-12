@@ -134,6 +134,24 @@ class ByteFileDB:
             self.mapped_file.close()
             self.mapped_file = None
             self._map_size = 0
+            # Trim the exponential-growth slack: the file is grown by doubling
+            # (_grow_file_size), so after a bulk write it can be ~2x the live
+            # data.  Everything at/after the allocation high-water is unused
+            # (bump-allocated below it; the freelist only reuses below it too),
+            # so truncating to it reclaims the tail with zero data loss and
+            # makes the on-disk file ≈ the logical size.  Clean-close only; a
+            # crash simply skips it.  Must run after the mmap is closed.
+            if not self.read_only and self.file_handle is not None:
+                hw = max(
+                    int(self._header_data.get(self._allocation_index_key,
+                                              self.header_size)),
+                    self.header_size,
+                )
+                try:
+                    if os.path.getsize(self.filename) > hw:
+                        self.file_handle.truncate(hw)
+                except OSError:
+                    pass
         if self.file_handle:
             self.file_handle.close()
             self.file_handle = None
