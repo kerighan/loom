@@ -79,6 +79,27 @@ class BTree(DataStructure):
     ORDER = 32  # Maximum children per node (keys = ORDER - 1)
     MIN_KEYS = ORDER // 2 - 1  # Minimum keys in non-root node
 
+    # Slots in the first values block. Values are bump-allocated from a chain
+    # of blocks (_allocate_value_addr), each twice the previous, so this is a
+    # starting point and not a limit.
+    #
+    # It used to be a flat 10,000, charged to every btree the moment it was
+    # created, before a single key was inserted. Measured on a 6-collection
+    # schema with 20 indexes: 38 MB of empty file — ~1.5 MB per index at
+    # key_size 282, ~3.2 MB at 454, none of it ever written to. That is the
+    # floor under every small project.
+    #
+    # Starting small costs nothing to read: a value address is absolute and
+    # lives in the btree node, so no lookup ever walks the chain — only
+    # _allocate_value_addr touches it, at the tail, in O(1). Growing to N
+    # entries still allocates under 2N slots (the geometric sum is the same
+    # whatever the first block's size); it just adds one _blocks_dataset row
+    # per doubling, 24 bytes each.
+    #
+    # Existing files keep their own sizing: _load_metadata and from_ref restore
+    # the stored capacities, and this is only read when a btree is created.
+    INITIAL_VALUES_CAPACITY = 128
+
     # Nesting compatibility
     _outer_types_supported = ("Dict", "List")  # Dict[BTree], List[BTree]
     _inner_types_supported = ("List", "Dict", "Set", "Queue")
@@ -374,7 +395,7 @@ class BTree(DataStructure):
                 self.item_schema = self._extract_schema(self._user_dataset)
                 self._shared_datasets = {}
 
-        self._initial_capacity = 10000
+        self._initial_capacity = self.INITIAL_VALUES_CAPACITY
         self.values_block_addr = int(
             self._values_dataset.allocate_block(self._initial_capacity)
         )
