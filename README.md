@@ -988,6 +988,39 @@ this size is now close to its live data.
 > Assign each entity a stable id up front (its own key, a hash, etc.) and keep
 > it for the node's lifetime.
 
+### loom-accel — Cython accelerators (`pip install loom[cython]`)
+
+Optional Cython extensions that release the GIL during the hot read paths:
+scatter-gather from mmap, batch hash-probe on the Dict's hash table, B+tree
+key-only walk, and a fused pipeline that chains all four stages in a single
+`nogil` block (~5 ms window on a 12k-row scan).
+
+Benchmark: **50 000 posts** (1 000 users), `Many(sort=created_at, desc=True)`,
+projected scan on 5 inline fields.  `PYTHONPATH=. python benchmarks/benchmark_accel.py`.
+
+| Operation | Pure Python | + loom-accel | Speedup |
+|---|---:|---:|---:|
+| Collection `find(fields=)` | 163 000 rows/s | **379 000 rows/s** | **2.3×** |
+| Collection `find(as_columns=True)` | 163 000 rows/s | **644 000 rows/s** | **4.0×** |
+| Collection `range(fields=)` | 203 000 rows/s | **359 000 rows/s** | **1.8×** |
+| BTree `range_keys` (key-only walk) | 1 284 000 keys/s | **2 079 000 keys/s** | **1.6×** |
+| Dict `get_fields_many` (batch resolve) | 313 000 rows/s | **667 000 rows/s** | **2.1×** |
+
+The gains are largest on projected scans (`find(fields=...)`) because the entire
+index walk + hash resolve + record gather runs in C with no GIL.  `as_columns=True`
+adds another 1.7× by skipping the per-row dict/Record construction entirely,
+returning `{field: list}` columns that aggregation code can consume directly.
+
+The speedup compounds with dataset size — on a 96k-row production file the
+same projected scan went from 17.6 µs/row (original) to 1.5 µs/row
+(`as_columns`), an **11.7× end-to-end improvement**.
+
+> **Install:** `pip install loom-accel` (or `pip install loom[cython]`).
+> Requires Cython at build time (numpy headers already present).
+> loom detects it at import time and swaps in the fast paths automatically;
+> without it, every path falls back to the pure-Python implementation with
+> identical results.
+
 ### Vector search — FlatIndex and IVFIndex
 
 Benchmarks: **100 000 vectors, dim=384**, cosine similarity, 200 random queries.  
