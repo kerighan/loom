@@ -304,6 +304,8 @@ class Collection:
         self._vector = vector or {}
         self._indexed_fields = set()
         for ix in indexes.values():
+            # convert sources to a frozenset for fast set intersection
+            ix["sources"] = frozenset(ix["sources"])
             self._indexed_fields.update(ix["sources"])
         # fields feeding any full-text index (→ re-index on update)
         self._search_fields = set()
@@ -517,17 +519,17 @@ class Collection:
                                 for key, val in entries:
                                     struct[key] = val
                     if ix.get("counter") is not None:
-                        # one counter write per group, not per record
-                        deltas, values = {}, {}
+                        # one counter write per group, not per record;
+                        # deduplicate by raw value first so _group_key
+                        # (which may hash) is called once per unique value
+                        deltas_by_val = {}
                         for record in records:
                             v = record.get(ix["field"])
-                            if v is None:
-                                continue
+                            if v is not None:
+                                deltas_by_val[v] = deltas_by_val.get(v, 0) + 1
+                        for v, delta in deltas_by_val.items():
                             gk = self._group_key(ix, v)
-                            deltas[gk] = deltas.get(gk, 0) + 1
-                            values[gk] = v
-                        for gk, d in deltas.items():
-                            self._count_add_key(ix, gk, values[gk], d)
+                            self._count_add_key(ix, gk, v, delta)
         return pks
 
     def update(self, pk, **changes):
@@ -538,10 +540,11 @@ class Collection:
         if self._key_field in changes and str(changes[self._key_field]) != pk:
             raise ValueError("cannot change the primary key via update()")
         new = {**old, **changes}
+        changed_fields = set(changes)
         with self._db.write_lock():
             with self._db.batch(defer_save=True):
                 for ix in self._indexes.values():
-                    if not any(f in changes for f in ix["sources"]):
+                    if not changed_fields & ix["sources"]:
                         continue
                     old_key = self._index_key(ix, old, pk)
                     new_key = self._index_key(ix, new, pk)
@@ -756,15 +759,15 @@ class Collection:
                     )
 
         affected = [ix for ix in self._indexes.values()
-                    if any(f in changed_fields for f in ix["sources"])]
+                    if changed_fields & ix["sources"]]
         need = set(changed_fields)
         for ix in affected:
             need.add(ix["field"])
             sort = getattr(ix["spec"], "sort", None)
             if sort is not None:
                 need.add(sort)
-        search_touched = bool(self._search) and any(
-            f in changed_fields for f in self._search_fields)
+        search_touched = bool(self._search) and bool(
+            changed_fields & self._search_fields)
         if search_touched:
             for si in self._search.values():
                 need.update(si["fields"])
@@ -773,15 +776,18 @@ class Collection:
         with self._db.write_lock():
             with self._db.batch(defer_save=True):
                 # Phase 1 — read olds, compute the *effective* (non-no-op)
-                # change per row.  Raises before any mutation if a pk is absent.
-                olds, effective = {}, {}
+                # change per row, and cache the merged new dict.
+                olds, effective, news = {}, {}, {}
                 for pk, c in per.items():
                     old = self._primary.get_fields(pk, need)
                     if old is None:
                         raise KeyError(pk)
                     olds[pk] = old
-                    effective[pk] = {f: v for f, v in c.items()
-                                     if _values_differ(v, old.get(f))}
+                    eff = {f: v for f, v in c.items()
+                           if _values_differ(v, old.get(f))}
+                    effective[pk] = eff
+                    if eff:
+                        news[pk] = {**old, **eff}
 
                 # Phase 2 — index moves, batched per index in key order.
                 for ix in affected:
@@ -789,10 +795,10 @@ class Collection:
                     srcs = ix["sources"]
                     moves = []
                     for pk, eff in effective.items():
-                        if not any(f in eff for f in srcs):
+                        if not set(eff) & srcs:
                             continue
                         old = olds[pk]
-                        new = {**old, **eff}
+                        new = news[pk]
                         ok = self._index_key(ix, old, pk)
                         nk = self._index_key(ix, new, pk)
                         if ok != nk:
@@ -830,11 +836,11 @@ class Collection:
                 # Phase 3 — full-text re-index for rows whose search fields moved.
                 if search_touched:
                     for si in self._search.values():
-                        sf = si["fields"]
+                        sf = frozenset(si["fields"])
                         for pk, eff in effective.items():
-                            if not any(f in eff for f in sf):
+                            if not set(eff) & sf:
                                 continue
-                            new = {**olds[pk], **eff}
+                            new = news[pk]
                             entry = si["pk2docid"].get(pk)
                             if entry is not None:
                                 si["index"].delete(int(entry["doc_id"]))
