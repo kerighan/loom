@@ -45,8 +45,13 @@ from itertools import islice
 import mmh3
 import numpy as np
 
-from loom.dataset import as_record
+from loom.dataset import as_record, _micros_to_dt
 from loom.errors import CollectionDroppedError
+
+try:
+    from loom_accel import fused_scan as _accel_fused
+except ImportError:
+    _accel_fused = None
 
 
 def _hash_value(value):
@@ -1294,8 +1299,129 @@ class Collection:
 
         return project
 
+    def _can_fused(self, ix):
+        """True when the Cython fused pipeline can replace the whole scan."""
+        if _accel_fused is None:
+            return False
+        bt = ix["struct"]
+        if bt._node_layout() is None:
+            return False
+        if bt._dirty_nodes is not None:
+            return False
+        if bt._int_keys:
+            return False
+        d = self._primary
+        if getattr(d, "_hash_keys", False) or d._hash_key_fn is not None:
+            return False
+        return True
+
+    def _fused_collect(self, ix, low_key, high_key, fields, limit):
+        """Run the Cython fused pipeline and materialise into Records."""
+        bt = ix["struct"]
+        layout = bt._node_layout()
+        _, _, leaf_off, nk_off, key_off, key_w, child_off = layout
+        ds_node = bt._node_dataset
+        d = self._primary
+        p_init = getattr(d, "_p_init", d.P_INIT)
+        n_t = d.p_last - p_init + 1
+        ta = np.array(d.table_addrs[:n_t], dtype=np.int64)
+        caps = np.array([d._get_capacity(p_init + t)
+                         for t in range(n_t)], dtype=np.int64)
+        prs = np.array([d._get_probe_range(p_init + t)
+                        for t in range(n_t)], dtype=np.int32)
+        ht = d._hash_table
+        vo = ht.schema.fields["valid"][1]
+        ds_data = d._values_dataset
+
+        pk_list, block = _accel_fused(
+            ds_node.db.mapped_file, bt.root_addr, ds_node.record_size,
+            leaf_off, nk_off, key_off, key_w, child_off,
+            low_key.encode("utf-8"), high_key.encode("utf-8"), True, False,
+            ht.db.mapped_file, n_t, ta, caps, prs, ht.record_size, vo,
+            ds_data.db.mapped_file, ds_data.record_size,
+        )
+        if limit is not None:
+            pk_list = pk_list[:limit]
+            block = block[:limit]
+        if not pk_list:
+            return []
+        recs = ds_data.read_fields_many(None, fields, _block=block)
+        return [self._wrap(pk.decode("utf-8"), rec)
+                for pk, rec in zip(pk_list, recs)]
+
+    def _fused_collect_columns(self, ix, low_key, high_key, fields, limit):
+        """Fused pipeline → dict of columns (no Record wrapping)."""
+        bt = ix["struct"]
+        layout = bt._node_layout()
+        _, _, leaf_off, nk_off, key_off, key_w, child_off = layout
+        ds_node = bt._node_dataset
+        d = self._primary
+        p_init = getattr(d, "_p_init", d.P_INIT)
+        n_t = d.p_last - p_init + 1
+        ta = np.array(d.table_addrs[:n_t], dtype=np.int64)
+        caps = np.array([d._get_capacity(p_init + t)
+                         for t in range(n_t)], dtype=np.int64)
+        prs = np.array([d._get_probe_range(p_init + t)
+                        for t in range(n_t)], dtype=np.int32)
+        ht = d._hash_table
+        vo = ht.schema.fields["valid"][1]
+        ds_data = d._values_dataset
+
+        pk_list, block = _accel_fused(
+            ds_node.db.mapped_file, bt.root_addr, ds_node.record_size,
+            leaf_off, nk_off, key_off, key_w, child_off,
+            low_key.encode("utf-8"), high_key.encode("utf-8"), True, False,
+            ht.db.mapped_file, n_t, ta, caps, prs, ht.record_size, vo,
+            ds_data.db.mapped_file, ds_data.record_size,
+        )
+        if limit is not None:
+            pk_list = pk_list[:limit]
+            block = block[:limit]
+        if not pk_list:
+            return {f: [] for f in fields}
+        arr = block.view(ds_data.schema).reshape(-1)
+        cols = {}
+        for f in fields:
+            col = arr[f]
+            if f in ds_data._text_fields:
+                codec = ds_data._blob_codec_of[f]
+                cols[f] = [
+                    "" if (int(v["offset"]) == 0 and int(v["n_slots"]) == 0)
+                    else ds_data.blob_store.read(
+                        int(v["offset"]), compression=codec
+                    ).decode("utf-8")
+                    for v in col
+                ]
+            elif f in ds_data._json_fields:
+                import json as _json
+                codec = ds_data._blob_codec_of[f]
+                cols[f] = [
+                    None if (int(v["offset"]) == 0 and int(v["n_slots"]) == 0)
+                    else _json.loads(ds_data.blob_store.read(
+                        int(v["offset"]), compression=codec
+                    ).decode("utf-8"))
+                    for v in col
+                ]
+            elif f in ds_data._blob_fields:
+                codec = ds_data._blob_codec_of[f]
+                cols[f] = [
+                    None if (int(v["offset"]) == 0 and int(v["n_slots"]) == 0)
+                    else ds_data.blob_store.read(int(v["offset"]), compression=codec)
+                    for v in col
+                ]
+            elif f in ds_data._utf8_fields:
+                cols[f] = [v.decode("utf-8") for v in col.tolist()]
+            elif f in ds_data._datetime_fields:
+                cols[f] = [_micros_to_dt(v) for v in col.tolist()]
+            elif f in ds_data._array_fields:
+                cols[f] = [np.array(v) for v in col]
+            else:
+                cols[f] = col.tolist()
+        cols[self._key_field] = [pk.decode("utf-8") for pk in pk_list]
+        return cols
+
     def find(self, index_name, value, start=None, end=None, limit=None,
-             fields=None):
+             fields=None, as_columns=False):
         """One-to-many lookup → records for group ``value`` (ordered by the
         index's sort field).
 
@@ -1311,9 +1437,21 @@ class Collection:
         ``fields=["name", ...]`` projects each hit onto just those fields:
         one row read per record, and unrequested text/json/blob fields never
         touch the blob store — much cheaper than materializing full records
-        when the schema carries heavy text."""
+        when the schema carries heavy text.
+
+        ``as_columns=True`` returns a ``{field: list}`` dict of columns rather
+        than a list of Record objects — faster when the caller consumes fields
+        independently (aggregation, counting, filtering by column)."""
         ix, low_key, high_key = self._many_bounds(index_name, "find",
                                                   value, start, end)
+        # ── fused Cython pipeline (single nogil block) ──────────────────
+        if (fields is not None and self._can_fused(ix)
+                and self._index_projection(ix, value, fields) is None):
+            if as_columns:
+                return self._fused_collect_columns(
+                    ix, low_key, high_key, fields, limit)
+            return self._fused_collect(ix, low_key, high_key, fields, limit)
+        # ── standard path ───────────────────────────────────────────────
         it = self._walk(ix, low_key, high_key, inclusive=(True, False))
         project = (self._index_projection(ix, value, fields)
                    if fields is not None else None)

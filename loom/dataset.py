@@ -1111,7 +1111,7 @@ class Dataset:
                 result[field] = _to_native(value)
         return result
 
-    def read_fields_many(self, addresses, fields):
+    def read_fields_many(self, addresses, fields, _block=None):
         """``read_fields`` for many records at once — one gather, decoded by column.
 
         Same dicts as ``[read_fields(a, fields) for a in addresses]``, in the
@@ -1127,8 +1127,11 @@ class Dataset:
         outside the row, so there is nothing to gather.
 
         Args:
-            addresses: Sequence of record addresses
+            addresses: Sequence of record addresses (ignored when _block given)
             fields: Iterable of field names to materialize
+            _block: Optional pre-gathered (N, record_size) uint8 ndarray —
+                    supplied by the fused Cython pipeline which already did the
+                    scatter-gather; skips the address resolution and the gather.
 
         Returns:
             List of dicts, one per address, keys in `fields` order
@@ -1137,11 +1140,18 @@ class Dataset:
         for field in fields:
             if field not in self.user_schema.names:
                 raise ValueError(f"Field '{field}' not in schema")
-        addresses = list(addresses)
-        if not addresses:
+
+        if _block is not None:
+            block = _block
+        else:
+            addresses = list(addresses)
+            if not addresses:
+                return []
+            block = self.db.gather(addresses, self.record_size)
+
+        if block.shape[0] == 0:
             return []
 
-        block = self.db.gather(addresses, self.record_size)
         # Validate every prefix byte in one pass, then report the first bad row
         # with the same error read_fields would have raised for it.
         tags = block[:, 0].view("int8")
@@ -1151,11 +1161,13 @@ class Dataset:
             i = int(bad[0])
             deleted = int(np.frombuffer(self._deleted_prefix, dtype="int8")[0])
             if int(tags[i]) == deleted:
-                raise DeletedRecordError(addresses[i])
-            raise WrongDatasetError(addresses[i], self.identifier, int(tags[i]))
+                raise DeletedRecordError(addresses[i] if addresses else i)
+            raise WrongDatasetError(
+                addresses[i] if addresses else i, self.identifier, int(tags[i]))
 
         arr = block.view(self.schema).reshape(-1)
-        out = [{} for _ in addresses]
+        n = block.shape[0]
+        out = [{} for _ in range(n)]
         for field in fields:
             col = arr[field]
             if field in self._text_fields:
