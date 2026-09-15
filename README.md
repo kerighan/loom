@@ -585,6 +585,34 @@ posts.delete("p1")                             # removed from every index
   group + month window (830 candidates) 28 ms. If an unfiltered corpus
   outgrows the flat scan, the standalone `FlatIndex`/`IVFIndex` are the ANN
   path.
+- **Multi-index queries.** `query()` filters by N indexes at once. It uses
+  `counted=True` cardinalities (O(1)) to pick the **smallest** group, extracts
+  only its pks, materialises them with the filter fields in the projection, and
+  post-filters the rest on the already-read records:
+
+  ```python
+  # structured multi-filter: collection + country + model in one call
+  posts.query(country="FR", model="gpt-4", status="completed",
+              fields=["id", "country", "model", "status"])
+
+  # full-text + structured in one call
+  posts.query(country="FR", search=("body", "carbon neutral"),
+              fields=["id", "title"])
+
+  # range filter (tuple = (low, high), None = open bound)
+  posts.query(category="tech", engagement=(8000, None),
+              fields=["id", "engagement"])
+
+  # columnar output (faster for aggregation — no per-row dict)
+  cols = posts.query(country="FR", model="gpt-4",
+                     fields=["id", "score"], as_columns=True)
+  ```
+
+  On a 96k-row production file: `find(tag) + Python filter` scans 96k rows
+  (574 ms); `query(tag, country, status)` reads only the 12k-row country group
+  and post-filters (60 ms) — **x9.5** when the lead group is much smaller than
+  the naive scan.
+
 - **Persistence.** The index declaration is saved with the collection, so
   `db.collection("posts")` (no model) reopens it and restores every index
   automatically.
