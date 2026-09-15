@@ -24,6 +24,11 @@ from loom.datastructures.template import DataStructureTemplate
 from loom.ref import Ref
 from loom.dataset import as_record
 
+try:
+    from loom_accel import range_keys as _accel_range_keys
+except ImportError:
+    _accel_range_keys = None
+
 # Order-preserving encoding for integer keys (int_keys=True): map signed int64
 # to a 20-digit zero-padded unsigned decimal so lexicographic == numeric order.
 _BT_INT_OFFSET = 1 << 63
@@ -1640,6 +1645,14 @@ class BTree(DataStructure):
             else:
                 yield self._dkey(key), value_data
 
+    def _can_accel_range_keys(self, reverse):
+        """True when the Cython nogil walk can replace the Python generator."""
+        return (_accel_range_keys is not None
+                and not reverse
+                and not self._int_keys
+                and self._dirty_nodes is None
+                and self._node_layout() is not None)
+
     def range_keys(self, start=None, end=None, inclusive=(True, True),
                    reverse=False):
         """Iterate over keys only in a key range — values are never read.
@@ -1649,6 +1662,9 @@ class BTree(DataStructure):
         from the key itself: no value materialization, no nested-structure
         wrapping, just the in-order key walk (O(log n + k)).  Measured on a
         12k-entry group: 0.46 us per entry against range()'s 2.76.
+
+        When loom-accel is installed the forward walk is done entirely in C
+        with the GIL released.
 
         Yields:
             keys in sorted (or, with reverse=True, reverse-sorted) order
@@ -1676,6 +1692,23 @@ class BTree(DataStructure):
                         if key <= start:
                             break
                 yield self._dkey(key)
+            return
+
+        # ── Cython fast path (forward, string keys, fast layout, clean) ─────
+        if self._can_accel_range_keys(reverse=False):
+            layout = self._node_layout()
+            _zero, _prefix, leaf_off, nk_off, key_off, key_w, child_off = layout
+            ds = self._node_dataset
+            buf = ds.db.mapped_file
+            sb = start.encode("utf-8") if start is not None else b""
+            eb = end.encode("utf-8") if end is not None else b""
+            raw_keys = _accel_range_keys(
+                buf, self.root_addr, ds.record_size,
+                leaf_off, nk_off, key_off, key_w, child_off,
+                sb, eb, start_inc, end_inc,
+            )
+            for rk in raw_keys:
+                yield rk.decode("utf-8")
             return
 
         if start is not None:

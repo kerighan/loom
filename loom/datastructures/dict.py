@@ -8,6 +8,11 @@ from loom.datastructures.template import DataStructureTemplate
 from loom.dataset import _to_native, as_record
 from loom.ref import Ref
 
+try:
+    from loom_accel import resolve_addrs as _accel_resolve
+except ImportError:
+    _accel_resolve = None
+
 
 class _HashSkipFilter:
     """In-RAM per-table membership filter, keyed on the 128-bit murmur hash.
@@ -1173,12 +1178,20 @@ class Dict(DataStructure):
         """``get_fields`` for many keys at once — one gather, not N row reads.
 
         Returns a list aligned with `keys`; a key that is absent yields
-        `default`.  Resolving a key to its address is still one (cache-first)
-        hash probe per key; what is batched is the record read behind it.
+        `default`.  When loom-accel is installed and the Dict is in binary
+        (MurmurHash128) mode, all key→address resolutions are done in a single
+        C loop with the GIL released; otherwise they fall back to the per-key
+        Python ``_resolve_value_addr``.
         """
         if self._is_nested:
             raise TypeError("get_fields is not supported on nested dicts")
         keys = list(keys)
+        # --- fast path: loom-accel batch resolve (binary murmur128 mode) ----
+        if (_accel_resolve is not None
+                and not getattr(self, "_hash_keys", False)
+                and self._hash_key_fn is None):
+            return self._get_fields_many_accel(keys, fields, default)
+        # --- fallback: per-key Python resolve --------------------------------
         addrs, at = [], []
         for i, key in enumerate(keys):
             try:
@@ -1189,6 +1202,52 @@ class Dict(DataStructure):
         out = [default] * len(keys)
         for i, rec in zip(at, self._values_dataset.read_fields_many(addrs, fields)):
             out[i] = rec
+        return out
+
+    def _get_fields_many_accel(self, keys, fields, default):
+        """Accelerated batch resolve + gather (requires loom-accel)."""
+        n = len(keys)
+        # The hash halves are unsigned 64-bit but stored as int64 in the mmap
+        # (numpy structured dtype reads them back as int64).  Reinterpret via
+        # uint64 view so values > 2^63 don't overflow Python int → int64.
+        hi_arr = np.empty(n, dtype=np.uint64)
+        lo_arr = np.empty(n, dtype=np.uint64)
+        for i, key in enumerate(keys):
+            h = mmh3.hash128(key if isinstance(key, str) else str(key),
+                             signed=False)
+            hi_arr[i] = h >> 64
+            lo_arr[i] = h & 0xFFFF_FFFF_FFFF_FFFF
+        hi_arr = hi_arr.view(np.int64)
+        lo_arr = lo_arr.view(np.int64)
+
+        p_init = getattr(self, "_p_init", self.P_INIT)
+        n_tables = self.p_last - p_init + 1
+        ta = np.array(self.table_addrs[:n_tables], dtype=np.int64)
+        caps = np.array([self._get_capacity(p_init + t)
+                         for t in range(n_tables)], dtype=np.int64)
+        prs = np.array([self._get_probe_range(p_init + t)
+                        for t in range(n_tables)], dtype=np.int32)
+
+        ht = self._hash_table
+        valid_offset = ht.schema.fields["valid"][1]
+        buf = ht.db.mapped_file
+
+        result_addrs = _accel_resolve(
+            buf, hi_arr, lo_arr, hi_arr,  # key_hash == hi
+            n_tables, ta, caps, prs,
+            ht.record_size, valid_offset,
+        )
+
+        # Separate found from missing
+        found_mask = result_addrs >= 0
+        found_indices = np.flatnonzero(found_mask)
+        found_addrs = result_addrs[found_mask].tolist()
+
+        out = [default] * n
+        if found_addrs:
+            recs = self._values_dataset.read_fields_many(found_addrs, fields)
+            for idx, rec in zip(found_indices.tolist(), recs):
+                out[idx] = rec
         return out
 
     def get_ref(self, key):

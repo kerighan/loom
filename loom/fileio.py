@@ -8,6 +8,11 @@ import numpy as np
 
 from loom.errors import ReadOnlyError
 
+try:
+    from loom_accel import gather as _accel_gather
+except ImportError:
+    _accel_gather = None
+
 
 class ByteFileDB:
     # Double-buffer header layout:
@@ -294,6 +299,8 @@ class ByteFileDB:
         end = int(addrs.max()) + size
         if end > self._map_size:
             self._refresh_map(end)
+        if _accel_gather is not None:
+            return _accel_gather(self.mapped_file, addrs, size)
         base = np.frombuffer(self.mapped_file, dtype=np.uint8)
         return base[addrs[:, None] + np.arange(size, dtype=np.int64)]
 

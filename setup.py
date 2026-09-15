@@ -20,6 +20,9 @@ setup(
         "dev": [
             "pytest",
         ],
+        "cython": [
+            "loom-accel>=0.1.0",
+        ],
     },
     classifiers=[
         "Development Status :: 3 - Alpha",
