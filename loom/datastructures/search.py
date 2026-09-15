@@ -447,49 +447,54 @@ class SearchIndex(DataStructure):
         if not self._dirty:
             return
         blobs = self._db.blob_store
+        db_file = self._db._db  # ByteFileDB — batch header writes
 
-        if self._store_docs:
-            # documents: one contiguous allocation, serialize all records into
-            # one buffer and write it in a single db.write, then record the
-            # (addr, length) per doc.
-            ds = self._dataset
-            rs = ds.record_size
-            base = ds.allocate_block(len(self._buf_recs))
-            buf = bytearray()
-            for _doc_id, record, _dl in self._buf_recs:
-                buf += ds._serialize(**record)
-            ds.db.write(base, bytes(buf))
-            self._docmeta.append_many(
-                {"addr": base + i * rs, "dl": dl}
-                for i, (_d, _r, dl) in enumerate(self._buf_recs)
-            )
-        else:
-            # no doc-store: only per-doc lengths (for BM25)
-            self._docmeta.append_many({"dl": dl} for _d, _r, dl in self._buf_recs)
-        total_add = sum(dl for _d, _r, dl in self._buf_recs)
-
-        # postings: append-encode each term's blob (rewrite once), bulk-insert
-        records = []
-        for term, items in self._buf_post.items():
-            if term in self._postings:
-                rec = self._postings[term]
-                off0, ns0 = int(rec["off"]), int(rec["nslots"])
-                old = blobs.read(off0) if ns0 else b""
-                add_bytes, last = self._encode(items, int(rec["last"]))
-                off, ns = blobs.write(old + add_bytes)
-                if ns0:
-                    blobs.delete(off0, ns0)
-                df = int(rec["df"]) + len(items)
+        # Defer all header saves until the end: the postings loop does
+        # thousands of blob writes + Dict set_batch, each of which used to
+        # pickle the full header dict.  One save at the end instead of N.
+        db_file.begin_batch()
+        try:
+            if self._store_docs:
+                ds = self._dataset
+                rs = ds.record_size
+                base = ds.allocate_block(len(self._buf_recs))
+                buf = bytearray()
+                for _doc_id, record, _dl in self._buf_recs:
+                    buf += ds._serialize(**record)
+                ds.db.write(base, bytes(buf))
+                self._docmeta.append_many(
+                    {"addr": base + i * rs, "dl": dl}
+                    for i, (_d, _r, dl) in enumerate(self._buf_recs)
+                )
             else:
-                add_bytes, last = self._encode(items, 0)
-                off, ns = blobs.write(add_bytes)
-                df = len(items)
-            records.append((term, {"df": df, "last": last, "off": off, "nslots": ns}))
-        self._postings.set_batch(records)
+                self._docmeta.append_many({"dl": dl} for _d, _r, dl in self._buf_recs)
+            total_add = sum(dl for _d, _r, dl in self._buf_recs)
 
-        if self._scored:
-            self._meta["total_len"] = {"v": int(self._meta["total_len"]["v"]) + total_add}
-        self._meta["next_id"] = {"v": self._next_id}
+            # postings: append-encode each term's blob (rewrite once)
+            records = []
+            for term, items in self._buf_post.items():
+                if term in self._postings:
+                    rec = self._postings[term]
+                    off0, ns0 = int(rec["off"]), int(rec["nslots"])
+                    old = blobs.read(off0) if ns0 else b""
+                    add_bytes, last = self._encode(items, int(rec["last"]))
+                    off, ns = blobs.write(old + add_bytes)
+                    if ns0:
+                        blobs.delete(off0, ns0)
+                    df = int(rec["df"]) + len(items)
+                else:
+                    add_bytes, last = self._encode(items, 0)
+                    off, ns = blobs.write(add_bytes)
+                    df = len(items)
+                records.append((term, {"df": df, "last": last, "off": off, "nslots": ns}))
+            self._postings.set_batch(records)
+
+            if self._scored:
+                self._meta["total_len"] = {"v": int(self._meta["total_len"]["v"]) + total_add}
+            self._meta["next_id"] = {"v": self._next_id}
+        finally:
+            db_file.end_batch()
+
         self._buf_recs = []
         self._buf_post = {}
         self._dirty = False
@@ -671,20 +676,34 @@ class SearchIndex(DataStructure):
         persistent List costs ~10 µs while an array lookup is ~0.1 µs — on a
         broad query this is most of the latency.  Doc lengths are immutable
         (deletes are tombstones), so the cache only ever *extends*: a full
-        block-wise build the first time, then per-item reads for the tail
+        block-wise build the first time (via ``slice_array`` — one gather
+        instead of N individual reads), then per-item reads for the tail
         when new documents were flushed since (doc_id >= len(cache)).
         """
         n = len(self._docmeta)
         old = self._doclens
         if old is None or len(old) == 0:
-            arr = np.fromiter(
-                (rec["dl"] for rec in self._docmeta), dtype=np.int64, count=n
-            )
+            try:
+                sa = self._docmeta.slice_array(0, n)
+                arr = sa["dl"].astype(np.int64).copy() if sa is not None else np.empty(0, dtype=np.int64)
+            except (ValueError, AttributeError):
+                # fallback: deletions present or no slice_array
+                arr = np.fromiter(
+                    (rec["dl"] for rec in self._docmeta), dtype=np.int64, count=n
+                )
         else:
-            tail = np.empty(n - len(old), dtype=np.int64)
-            for i in range(len(old), n):
-                tail[i - len(old)] = self._docmeta[i]["dl"]
-            arr = np.concatenate([old, tail])
+            need = n - len(old)
+            if need > 0:
+                try:
+                    sa = self._docmeta.slice_array(len(old), n)
+                    tail = sa["dl"].astype(np.int64).copy() if sa is not None else np.empty(0, dtype=np.int64)
+                except (ValueError, AttributeError):
+                    tail = np.empty(need, dtype=np.int64)
+                    for i in range(need):
+                        tail[i] = self._docmeta[len(old) + i]["dl"]
+                arr = np.concatenate([old, tail])
+            else:
+                arr = old
         self._doclens = arr
         return arr
 
