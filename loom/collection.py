@@ -53,6 +53,11 @@ try:
 except ImportError:
     _accel_fused = None
 
+try:
+    from loom_accel import sorted_intersect_many as _accel_intersect
+except ImportError:
+    _accel_intersect = None
+
 
 def _hash_value(value):
     """Fixed-width 128-bit murmur hash (32 hex chars) of a value — used as the
@@ -1566,6 +1571,199 @@ class Collection:
             if limit is not None and len(out) >= limit:
                 break
         return out
+
+    # ── pk-set extraction (for query() intersection) ──────────────────────
+
+    def _pk_set(self, index_name, value, start=None, end=None):
+        """Return a sorted numpy int64 array of pk *hashes* for one filter.
+
+        For a Many index this walks the keys (or entries) and collects pks.
+        For a range index it scans the bounded key range.
+        Pks are returned as their murmur128 hi half (int64) for fast
+        sorted intersection — the final materialisation resolves them back.
+        """
+        ix = self._indexes[index_name]
+        spec = ix["spec"]
+        if spec.kind == "many":
+            _, lo, hi = self._many_bounds(index_name, "query", value, start, end)
+            pks = [pk for _key, pk in self._walk(ix, lo, hi, inclusive=(True, False))]
+        elif spec.kind == "range":
+            low = self._coerce_field_value(ix["field"], value[0] if isinstance(value, tuple) else value)
+            high = self._coerce_field_value(ix["field"], value[1] if isinstance(value, tuple) else None)
+            lo = None if low is None else encode_value(low)
+            hi = None if high is None else encode_value(high) + "\x01"
+            pks = [pk for _key, pk in self._walk(ix, lo, hi, inclusive=(True, False))]
+        else:
+            raise ValueError(
+                f"query() needs a 'many' or 'range' index for {index_name!r}, "
+                f"got {spec.kind!r}"
+            )
+        return pks
+
+    def _search_pk_set(self, index_name, query_text, mode=None):
+        """Return the list of pks matching a full-text query."""
+        si = self._search.get(index_name)
+        if si is None:
+            raise KeyError(f"no full-text index {index_name!r}")
+        doc_ids = si["index"].search(
+            query_text, return_ids=True, mode=mode or "boolean"
+        )
+        d2p = si["docid2pk"]
+        return [str(d2p[int(did)]["pk"]) for did in doc_ids]
+
+    def _count_estimate(self, ix_name, value):
+        """Cheap group-size estimate: counted index → O(1), else None."""
+        ix = self._indexes.get(ix_name)
+        if ix is None:
+            return None
+        spec = ix["spec"]
+        if spec.kind == "many" and getattr(spec, "counted", False):
+            try:
+                return self.count(ix_name, value)
+            except Exception:
+                return None
+        return None
+
+    def query(self, fields=None, as_columns=False, limit=None, search=None,
+              **filters):
+        """Multi-index intersection query — filter by N indexes at once.
+
+        Each keyword argument is ``index_name=value``: the cheapest index is
+        walked to collect pks, and the remaining filters are verified on the
+        materialised records.  This avoids scanning N full pk sets when only
+        one index is selective.
+
+        Strategy: use counted-index cardinalities (O(1)) to pick the
+        **smallest** group, extract its pks, materialise their records (with
+        the filter fields included in the projection), and post-filter the
+        rest in Python on the already-read records.  When the lead set is
+        1/20th of the total, this reads 1/20th of the records instead of all
+        of them — and the post-filter costs nothing because the fields are
+        already in hand.
+
+        ``search`` takes a ``(index_name, query_text)`` tuple (or a
+        ``(index_name, query_text, mode)`` triple) to add a full-text filter
+        to the intersection — structured + text in one call::
+
+            col.query(country="FR", model="gpt-4",
+                      search=("body", "carbon neutral"),
+                      fields=["id", "title"])
+
+        For a range index, pass a tuple ``(low, high)`` as the value (either
+        may be None for an open bound)::
+
+            col.query(category="tech", engagement=(8000, None),
+                      fields=["id", "engagement"])
+
+        ``fields``, ``as_columns``, ``limit`` behave like ``find()``.
+        """
+        if not filters and search is None:
+            raise ValueError("query() needs at least one filter or search term")
+
+        # ── resolve index names (accept field names too) ────────────────
+        field_to_ix = {}
+        for ix_name, ix in self._indexes.items():
+            field_to_ix.setdefault(ix["field"], ix_name)
+
+        resolved = []  # [(ix_name, field, value, estimated_count)]
+        for name, value in filters.items():
+            ix_name = name if name in self._indexes else field_to_ix.get(name)
+            if ix_name is None:
+                raise KeyError(
+                    f"no index named {name!r} and no index on field {name!r}; "
+                    f"available indexes: {list(self._indexes)}"
+                )
+            field = self._indexes[ix_name]["field"]
+            est = self._count_estimate(ix_name, value)
+            resolved.append((ix_name, field, value, est if est is not None else float("inf")))
+
+        # ── pick the lead index (smallest estimated group) ──────────────
+        resolved.sort(key=lambda r: r[3])
+        lead_ix, lead_field, lead_value, _ = resolved[0]
+        post_filters = resolved[1:]  # these will be checked on the records
+
+        # ── full-text: if present, it might be the most selective ───────
+        search_pks = None
+        if search is not None:
+            if isinstance(search, (list, tuple)):
+                s_name, s_query = search[0], search[1]
+                s_mode = search[2] if len(search) > 2 else None
+            else:
+                raise TypeError("search must be (index_name, query) or "
+                                "(index_name, query, mode)")
+            search_pks = set(self._search_pk_set(s_name, s_query, s_mode))
+
+        # ── extract pks from the lead index ─────────────────────────────
+        lead_pks = self._pk_set(lead_ix, lead_value)
+        if search_pks is not None:
+            lead_pks = [pk for pk in lead_pks if pk in search_pks]
+
+        if not lead_pks:
+            if as_columns:
+                return {f: [] for f in (fields or [])}
+            return []
+
+        # ── materialise with filter fields in the projection ────────────
+        filter_fields = {f for _, f, _, _ in post_filters}
+        if fields is not None:
+            read_fields = list(dict.fromkeys(list(fields) + list(filter_fields)))
+        else:
+            read_fields = None  # full records
+
+        if read_fields is not None:
+            recs = self._primary.get_fields_many(lead_pks, read_fields)
+        else:
+            recs = [self._primary.get(pk) for pk in lead_pks]
+
+        # ── post-filter on the remaining criteria ───────────────────────
+        result_pks, result_recs = [], []
+        for pk, rec in zip(lead_pks, recs):
+            if rec is None:
+                continue
+            ok = True
+            for _, fld, val, _ in post_filters:
+                rv = rec.get(fld)
+                if isinstance(val, tuple) and len(val) == 2:
+                    lo, hi = val
+                    if lo is not None and rv < lo:
+                        ok = False; break
+                    if hi is not None and rv > hi:
+                        ok = False; break
+                elif rv != val:
+                    ok = False; break
+            if ok:
+                result_pks.append(pk)
+                result_recs.append(rec)
+
+        if limit is not None:
+            result_pks = result_pks[:limit]
+            result_recs = result_recs[:limit]
+
+        if not result_pks:
+            if as_columns:
+                return {f: [] for f in (fields or [])}
+            return []
+
+        # ── format output ───────────────────────────────────────────────
+        if as_columns and fields is not None:
+            cols = {f: [] for f in fields}
+            cols[self._key_field] = []
+            for pk, rec in zip(result_pks, result_recs):
+                cols[self._key_field].append(pk)
+                for f in fields:
+                    cols[f].append(rec.get(f))
+            return cols
+
+        if fields is not None:
+            # strip extra filter fields from the output records
+            if filter_fields - set(fields):
+                return [self._wrap(pk, {f: rec[f] for f in fields if f in rec})
+                        for pk, rec in zip(result_pks, result_recs)]
+            return [self._wrap(pk, rec)
+                    for pk, rec in zip(result_pks, result_recs)]
+
+        return [self._wrap(pk, rec)
+                for pk, rec in zip(result_pks, result_recs)]
 
     @staticmethod
     def _make_predicate(where):
