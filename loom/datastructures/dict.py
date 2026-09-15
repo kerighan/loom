@@ -1169,6 +1169,28 @@ class Dict(DataStructure):
             return default
         return self._values_dataset.read_fields(addr, fields)
 
+    def get_fields_many(self, keys, fields, default=None):
+        """``get_fields`` for many keys at once — one gather, not N row reads.
+
+        Returns a list aligned with `keys`; a key that is absent yields
+        `default`.  Resolving a key to its address is still one (cache-first)
+        hash probe per key; what is batched is the record read behind it.
+        """
+        if self._is_nested:
+            raise TypeError("get_fields is not supported on nested dicts")
+        keys = list(keys)
+        addrs, at = [], []
+        for i, key in enumerate(keys):
+            try:
+                addrs.append(self._resolve_value_addr(key))
+            except KeyError:
+                continue
+            at.append(i)
+        out = [default] * len(keys)
+        for i, rec in zip(at, self._values_dataset.read_fields_many(addrs, fields)):
+            out[i] = rec
+        return out
+
     def get_ref(self, key):
         """Return a Ref handle to the record stored at `key`.
 

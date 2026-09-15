@@ -271,6 +271,32 @@ class ByteFileDB:
             self._refresh_map(end)
         return self.mapped_file[address:end]
 
+    def gather(self, addresses, size):
+        """Read `size` bytes at each of many scattered addresses, in one copy.
+
+        Returns an (N, size) uint8 array.  One C-level gather out of the mmap
+        replaces N Python-level slices, which is what a projected index scan
+        spends its time in.  The result is a *copy*, so it survives a later
+        _refresh_map (which unmaps the mmap this read came from) — never hand
+        out a view of self.mapped_file.
+
+        Args:
+            addresses: Iterable of record addresses
+            size: Bytes to read at each address (the fixed record size)
+
+        Returns:
+            np.ndarray of shape (len(addresses), size), dtype uint8
+        """
+        assert self.mapped_file, "DB is not open. Call open() first."
+        addrs = np.asarray(addresses, dtype=np.int64)
+        if addrs.size == 0:
+            return np.empty((0, size), dtype=np.uint8)
+        end = int(addrs.max()) + size
+        if end > self._map_size:
+            self._refresh_map(end)
+        base = np.frombuffer(self.mapped_file, dtype=np.uint8)
+        return base[addrs[:, None] + np.arange(size, dtype=np.int64)]
+
     def _refresh_map(self, min_end):
         """Remap when a read lands beyond the current mmap.
 

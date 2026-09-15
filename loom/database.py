@@ -2210,6 +2210,33 @@ class DB:
             return dt.itemsize          # bytes; the value's utf8 never exceeds this
         return 20
 
+    @classmethod
+    def _index_key_width(cls, ds, spec, field, pk_w, hashed, hash_w=32):
+        """Max utf8 BYTES ``Collection._index_key`` can produce for this index,
+        or None when the index cannot be sized (unbounded field).
+
+        Shared by the auto-sizing below and by ``Collection._pk_in_key``, so the
+        writer's budget and the reader's trust in the key can never disagree.
+
+        The subtlety is ``desc``: _desc_str complements every codepoint into the
+        astral plane, where a character costs **4 utf8 bytes instead of 1**.
+        Size a desc sort part as if it were ASCII and the composite key is
+        silently clipped in its utf8[key_size] slot — and since the pk is what
+        the key ends with, that is exactly the part lost.  The node cache hides
+        it until the file is reopened.
+        """
+        vw = hash_w if hashed else cls._field_enc_width(ds, field)
+        if vw is None:
+            return None
+        sw = 0
+        if spec.kind == "many" and getattr(spec, "sort", None) is not None:
+            sw = cls._field_enc_width(ds, spec.sort)
+            if sw is None:
+                return None
+            if spec.desc:
+                sw *= 4
+        return vw + sw + pk_w + 4       # + the _SEP separators, + slack
+
     def _build_collection(self, name, model, specs, primary_field,
                           key_size, index_key_size, cfg_key):
         from loom.collection import Collection
@@ -2250,16 +2277,14 @@ class DB:
                     f"orderable (bounded) field, not {fld!r} (text/blob/json)"
                 )
             hashed_index[idx_name] = hashed
-            vw = _HASH_W if hashed else vw
-            sw = 0
-            if spec.kind == "many" and spec.sort is not None:
-                sw = self._field_enc_width(dataset, spec.sort)
-                if sw is None:
-                    raise ValueError(
-                        f"collection {name!r}: many index {idx_name!r} sort field "
-                        f"{spec.sort!r} must be orderable (bounded), not text/blob/json"
-                    )
-            need_ik = max(need_ik, vw + sw + eff_pk + 4)
+            if (spec.kind == "many" and spec.sort is not None
+                    and self._field_enc_width(dataset, spec.sort) is None):
+                raise ValueError(
+                    f"collection {name!r}: many index {idx_name!r} sort field "
+                    f"{spec.sort!r} must be orderable (bounded), not text/blob/json"
+                )
+            need_ik = max(need_ik, self._index_key_width(
+                dataset, spec, fld, eff_pk, hashed, _HASH_W))
         index_key_size = max(ik_floor, need_ik)
 
         primary = self.create_dict(

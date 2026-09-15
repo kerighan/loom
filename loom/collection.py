@@ -40,6 +40,7 @@ import struct
 from contextlib import nullcontext
 from datetime import date, datetime
 from functools import lru_cache
+from itertools import islice
 
 import mmh3
 import numpy as np
@@ -1176,15 +1177,58 @@ class Collection:
             return lambda s: float(s)
         return None
 
+    def _pk_in_key(self, ix):
+        """Can this index's stored keys be trusted to still END with the pk?
+
+        ``_index_key`` appends the pk last, so a scan can read it off the key
+        and skip the index entry entirely.  That only holds while no key was
+        clipped into the BTree's fixed utf8[key_size] slot — and a collection
+        created before ``DB._index_key_width`` accounted for desc sort parts (4
+        utf8 bytes per character, not 1) may well hold clipped keys.  Reading a
+        clipped pk would resolve to a *different* record, so those files keep
+        the old path and take the pk from the index entry.
+
+        Cached on the index dict: it is a property of the schema, not of a call.
+        """
+        cached = ix.get("pk_in_key")
+        if cached is None:
+            from loom.database import DB
+            spec = ix["spec"]
+            pk_w = DB._field_enc_width(self.dataset, self._key_field)
+            if spec.kind not in ("many", "range") or pk_w is None:
+                cached = False
+            else:
+                need = DB._index_key_width(self.dataset, spec, ix["field"],
+                                           pk_w, bool(ix.get("hashed")))
+                cached = (need is not None
+                          and need <= getattr(ix["struct"], "_key_size", 0))
+            ix["pk_in_key"] = cached
+        return cached
+
+    def _walk(self, ix, *args, **kwargs):
+        """Yield ``(key, pk)`` over an index range.
+
+        Off the key alone when :meth:`_pk_in_key` allows it — the index entry's
+        own record is then never read, 2.76 -> 0.46 us per hit on a 12k-row
+        group — and off the entry otherwise.
+        """
+        bt = ix["struct"]
+        if self._pk_in_key(ix):
+            for key in bt.range_keys(*args, **kwargs):
+                yield key, key.rsplit(_SEP, 1)[-1]
+        else:
+            for key, entry in bt.range(*args, **kwargs):
+                yield key, str(entry["pk"])
+
     def _index_projection(self, ix, value, fields):
         """If every requested field is derivable from the index entry + its
         composite key alone, return a fn ``(key, entry) -> dict``; else None.
 
-        A ``Many`` composite key is ``group_enc \\x00 [sort_enc \\x00] pk``, and
-        the entry carries ``pk`` — so for a group query we can serve, with **no
-        Dict lookup and no record read**:
+        A ``Many`` composite key is ``group_enc \\x00 [sort_enc \\x00] pk``, so
+        for a group query we can serve, from the key alone and with **no index
+        entry, no Dict lookup and no record read**:
 
-          • the primary key   — from ``entry["pk"]`` (coerced to its dtype);
+          • the primary key   — the key's last part (coerced to its dtype);
           • the group field    — it equals the (coerced) query ``value`` for
                                  every hit, when the group is order-preserving
                                  (encode_value is injective; a *hashed* group is
@@ -1234,12 +1278,12 @@ class Collection:
         want_sort = sort_field in fset if sort_field is not None else False
         ordered = list(fields)
 
-        def project(key, entry):
+        def project(key, pk):
             rec = {}
             parts = None
             for f in ordered:
                 if want_pk and f == key_field:
-                    rec[f] = pk_coerce(str(entry["pk"]))
+                    rec[f] = pk_coerce(pk)
                 elif want_group and f == group_field:
                     rec[f] = coerced_group
                 else:                       # sort field
@@ -1270,38 +1314,44 @@ class Collection:
         when the schema carries heavy text."""
         ix, low_key, high_key = self._many_bounds(index_name, "find",
                                                   value, start, end)
-        it = ix["struct"].range(low_key, high_key, inclusive=(True, False))
+        it = self._walk(ix, low_key, high_key, inclusive=(True, False))
         project = (self._index_projection(ix, value, fields)
                    if fields is not None else None)
         return self._collect(it, limit, fields, project)
 
-    def _collect(self, it, limit, fields, project=None):
-        """Materialize (full or projected) records for an index-entry scan.
+    def _collect(self, pairs, limit, fields, project=None):
+        """Materialize (full or projected) records for a ``(key, pk)`` scan.
 
         ``project`` (from :meth:`_index_projection`) serves each hit from the
-        index entry + key alone — no primary-store lookup, no record read —
-        when every requested field lives in the index."""
-        out = []
-        if project is not None:
-            for key, entry in it:
-                out.append(self._wrap(entry["pk"], project(key, entry)))
-                if limit is not None and len(out) >= limit:
-                    break
-            return out
-        if fields is not None:
-            for _key, entry in it:
-                rec = self._primary.get_fields(str(entry["pk"]), fields)
-                if rec is not None:
-                    out.append(self._wrap(entry["pk"], rec))
-                    if limit is not None and len(out) >= limit:
-                        break
-            return out
-        for _key, entry in it:
-            rec = self._primary.get(str(entry["pk"]))
-            if rec is not None:
-                out.append(self._wrap(entry["pk"], rec))
-                if limit is not None and len(out) >= limit:
-                    break
+        key alone — no primary-store lookup, no record read — when every
+        requested field lives in the index.  Otherwise the hits are read in
+        batches (:meth:`Dict.get_fields_many`): one gather out of the mmap
+        per batch instead of one row read per hit.
+
+        A hit whose record is missing from the primary store is a stale index
+        entry — skipped, and not counted against ``limit``, which is why a
+        bounded scan tops its batch up rather than slicing the walk once."""
+        batch_size = 8192 if limit is None else min(limit, 8192)
+        out, it = [], iter(pairs)
+        while True:
+            want = batch_size if limit is None else min(batch_size, limit - len(out))
+            if want <= 0:
+                break
+            batch = list(islice(it, want))
+            if not batch:
+                break
+            pks = [pk for _key, pk in batch]
+            if project is not None:
+                out.extend(self._wrap(pk, project(key, pk)) for key, pk in batch)
+            elif fields is not None:
+                for pk, rec in zip(pks, self._primary.get_fields_many(pks, fields)):
+                    if rec is not None:
+                        out.append(self._wrap(pk, rec))
+            else:
+                for pk in pks:
+                    rec = self._primary.get(pk)
+                    if rec is not None:
+                        out.append(self._wrap(pk, rec))
         return out
 
     def range(self, index_name, low=None, high=None, limit=None, desc=False,
@@ -1321,7 +1371,7 @@ class Collection:
         high = self._coerce_field_value(ix["field"], high)
         start = None if low is None else encode_value(low)
         end = None if high is None else encode_value(high) + "\x01"
-        it = ix["struct"].range(start, end, inclusive=(True, False), reverse=desc)
+        it = self._walk(ix, start, end, inclusive=(True, False), reverse=desc)
         return self._collect(it, limit, fields)
 
     def latest(self, index_name, fields=None):
