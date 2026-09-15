@@ -39,6 +39,21 @@ from .base import DataStructure
 from .dict import Dict
 from .list import List
 
+try:
+    from loom_accel import (
+        encode_postings_scored as _accel_encode_scored,
+        encode_postings_boolean as _accel_encode_boolean,
+        decode_varints as _accel_decode,
+        bm25_score as _accel_bm25,
+        tfidf_score as _accel_tfidf,
+    )
+except ImportError:
+    _accel_encode_scored = None
+    _accel_encode_boolean = None
+    _accel_decode = None
+    _accel_bm25 = None
+    _accel_tfidf = None
+
 
 # ── accent folding ────────────────────────────────────────────────────────────
 
@@ -145,14 +160,14 @@ def _iter_varint(buf: bytes):
 
 
 def _decode_varints(buf: bytes):
-    """Decode every varint in ``buf`` at once (vectorised numpy).
+    """Decode every varint in ``buf`` at once.
 
-    LEB128 decode without a per-byte Python loop: locate terminator bytes
-    (high bit clear), shift each byte's 7 payload bits by its position within
-    its varint, and sum per group with add.reduceat.  ~10x faster than
-    _iter_varint on long posting lists.  Values must fit in 64 bits (they do:
-    doc-id gaps and capped term frequencies).
+    Uses the Cython single-pass decoder when available (loom-accel), falling
+    back to a vectorised numpy implementation (~10× faster than the Python
+    generator ``_iter_varint``).
     """
+    if _accel_decode is not None:
+        return _accel_decode(np.frombuffer(buf, dtype=np.uint8))
     a = np.frombuffer(buf, dtype=np.uint8)
     ends = np.flatnonzero(a < 0x80)          # terminator byte of each varint
     if len(ends) == 0:
@@ -161,7 +176,6 @@ def _decode_varints(buf: bytes):
     starts = np.empty(len(ends), dtype=np.intp)
     starts[0] = 0
     starts[1:] = ends[:-1] + 1
-    # position of each byte inside its own varint (0-based)
     pos = np.arange(len(a), dtype=np.uint64) - np.repeat(
         starts.astype(np.uint64), ends - starts + 1
     )
@@ -409,6 +423,13 @@ class SearchIndex(DataStructure):
         return ids
 
     def _encode(self, items, last):
+        if self._scored and _accel_encode_scored is not None:
+            ids = np.array([d for d, _ in items], dtype=np.int64)
+            tfs = np.array([t for _, t in items], dtype=np.int64)
+            return _accel_encode_scored(ids, tfs, last)
+        if not self._scored and _accel_encode_boolean is not None:
+            ids = np.array(list(items), dtype=np.int64)
+            return _accel_encode_boolean(ids, last)
         out = bytearray()
         if self._scored:
             for doc_id, tf in items:
@@ -682,6 +703,32 @@ class SearchIndex(DataStructure):
         if mode == "bm25" and (doclens is None or len(doclens) < len(self._docmeta)):
             doclens = self._build_doclens()
 
+        # ── Cython fast path: sorted arrays + two-pointer merge per term ─
+        use_accel = (mode == "bm25" and _accel_bm25 is not None
+                     or mode == "tfidf" and _accel_tfidf is not None)
+        if use_accel:
+            cand_arr = np.array(sorted(candidates), dtype=np.int64)
+            scores_arr = np.zeros(len(cand_arr), dtype=np.float64)
+            for term in sorted(terms):
+                tf_map = self._term_tf(term)
+                df = len(tf_map)
+                if df == 0:
+                    continue
+                # posting ids/tfs are sorted (cumsum of gaps)
+                p_ids = np.array([i for i, _ in sorted(tf_map.items())],
+                                 dtype=np.int64)
+                p_tfs = np.array([tf_map[i] for i in p_ids], dtype=np.int64)
+                if mode == "bm25":
+                    idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
+                    _accel_bm25(cand_arr, p_ids, p_tfs, doclens,
+                                idf, k1, b, avgdl, scores_arr)
+                else:
+                    idf = math.log(N / df)
+                    _accel_tfidf(cand_arr, p_ids, p_tfs, idf, scores_arr)
+            pairs = list(zip(cand_arr.tolist(), scores_arr.tolist()))
+            return sorted(pairs, key=lambda kv: (-kv[1], kv[0]))
+
+        # ── Python fallback ──────────────────────────────────────────────
         scores = {i: 0.0 for i in candidates}
         for term in sorted(terms):
             tf_map = self._term_tf(term)
