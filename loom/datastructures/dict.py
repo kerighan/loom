@@ -13,6 +13,11 @@ try:
 except ImportError:
     _accel_resolve = None
 
+try:
+    from loom_accel import fast_deserialize_records as _accel_deserialize
+except ImportError:
+    _accel_deserialize = None
+
 
 class _HashSkipFilter:
     """In-RAM per-table membership filter, keyed on the 128-bit murmur hash.
@@ -1161,6 +1166,61 @@ class Dict(DataStructure):
             raise TypeError("d[key, field] field access is not supported on nested dicts")
         self._values_dataset.write_field(self._resolve_value_addr(key), field, value)
 
+    def _fast_deser_specs(self):
+        """Lazily build the field specs list for _accel_deserialize, or None."""
+        cached = getattr(self, "_deser_specs_cache", False)
+        if cached is not False:
+            return cached
+        if _accel_deserialize is None or self._is_nested:
+            self._deser_specs_cache = None
+            return None
+        vds = self._values_dataset
+        specs = []
+        for fname in vds.user_schema.names:
+            if fname == "_key":
+                continue
+            dt, offset = vds.schema.fields[fname]
+            if fname in vds._utf8_fields:
+                specs.append((fname, offset, 'S', vds._utf8_fields[fname]))
+            elif dt.kind == 'u' and dt.itemsize == 8:
+                specs.append((fname, offset, 'u8', 0))
+            elif dt.kind == 'i' and dt.itemsize == 8:
+                if fname in vds._datetime_fields:
+                    self._deser_specs_cache = None
+                    return None
+                specs.append((fname, offset, 'i8', 0))
+            elif dt.kind == 'u' and dt.itemsize == 4:
+                specs.append((fname, offset, 'u4', 0))
+            elif dt.kind == 'i' and dt.itemsize == 4:
+                specs.append((fname, offset, 'i4', 0))
+            elif dt.kind == 'f' and dt.itemsize == 8:
+                specs.append((fname, offset, 'f8', 0))
+            elif dt.kind == 'f' and dt.itemsize == 4:
+                specs.append((fname, offset, 'f4', 0))
+            elif dt.kind == 'b':
+                specs.append((fname, offset, 'b', 0))
+            else:
+                # text, json, blob, array, datetime, U — can't fast-deser
+                self._deser_specs_cache = None
+                return None
+        self._deser_specs_cache = (
+            specs,
+            int(np.frombuffer(vds._valid_prefix, dtype="int8")[0]),
+        )
+        return self._deser_specs_cache
+
+    def _fast_read(self, addr):
+        """Deserialize one record via Cython, or None if not applicable."""
+        info = self._fast_deser_specs()
+        if info is None:
+            return None
+        specs, prefix = info
+        vds = self._values_dataset
+        addrs = np.array([addr], dtype=np.int64)
+        recs = _accel_deserialize(vds.db.mapped_file, addrs, vds.record_size,
+                                  prefix, specs)
+        return recs[0]
+
     def get_fields(self, key, fields, default=None):
         """Read a subset of the record's fields at `key` — one row read,
         only the requested fields materialized (see Dataset.read_fields).
@@ -1570,6 +1630,9 @@ class Dict(DataStructure):
             if cached_value is not None:
                 if self._is_nested:
                     return cached_value
+                fast = self._fast_read(int(cached_value))
+                if fast is not None:
+                    return fast
                 value_data = self._values_dataset[int(cached_value)]
                 if self._store_key and "_key" in value_data:
                     value_data = {k: v for k, v in value_data.items() if k != "_key"}
@@ -1583,6 +1646,11 @@ class Dict(DataStructure):
                 key, key_hash, for_insert=False
             )
             value_addr = int(entry["value_addr"])
+            fast = self._fast_read(value_addr) if not self._is_nested else None
+            if fast is not None:
+                if self._cache:
+                    self._cache[cache_k] = int(value_addr)
+                return fast
             value_data = self._values_dataset[value_addr]
 
             if self._is_nested:
