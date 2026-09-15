@@ -18,6 +18,13 @@ try:
 except ImportError:
     _accel_deserialize = None
 
+try:
+    from loom_accel import batch_hash_keys as _accel_hash_keys
+    from loom_accel import batch_probe_for_insert as _accel_probe_insert
+except ImportError:
+    _accel_hash_keys = None
+    _accel_probe_insert = None
+
 
 class _HashSkipFilter:
     """In-RAM per-table membership filter, keyed on the 128-bit murmur hash.
